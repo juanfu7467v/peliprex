@@ -7,7 +7,7 @@ ENV PORT=8080
 
 WORKDIR /app
 
-# 1. Dependencias de sistema
+# 1. Dependencias de sistema necesarias para compilación de librerías
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -16,16 +16,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Instalar dependencias de Python (Sintaxis robusta)
+# 2. Instalar dependencias de Python
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip
-# Usamos -r de forma explícita y separada
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# 3. Directorio de datos
+# 3. Crear directorio de datos para la caché persistente
 RUN mkdir -p /data && chmod 777 /data
 
-# 4. Copiar código
+# 4. Copiar el resto del código
 COPY . .
 
 # 5. Puerto
