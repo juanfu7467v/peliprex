@@ -1,0 +1,8 @@
+requirements.txt
+fastapi
+uvicorn
+telethon>=1.31.1
+python-multipart
+httpx
+aiohttp
+requests
