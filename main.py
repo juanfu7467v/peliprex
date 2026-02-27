@@ -7,6 +7,9 @@ import random
 import json
 import httpx
 import time
+import io
+import hashlib
+import textwrap
 from urllib.parse import quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -14,6 +17,13 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+
+# --- Pillow (para estandarizar a JPG + tamaño uniforme) ---
+try:
+    from PIL import Image, ImageOps, ImageDraw, ImageFont
+    _PIL_OK = True
+except Exception:
+    _PIL_OK = False
 
 # ---------------------------------------------------------------------------
 # CONFIGURACIÓN
@@ -46,7 +56,7 @@ GEMINI_API_URL     = (
     f"{GEMINI_MODEL}:generateContent"
 )
 
-# --- IMAGEN PLACEHOLDER ---
+# --- IMAGEN PLACEHOLDER (se mantiene, pero ya no debería salir al usuario final) ---
 PLACEHOLDER_IMAGE_BASE = (
     "https://blogger.googleusercontent.com/img/b/R29vZ2xl/"
     "AVvXsEh4rh5wpJEnn2Ju-9BAVNsMIKx4AsSvOhyphenhyphenyepiiNTezVnUXgT9qLnEk2YQnwov"
@@ -75,6 +85,25 @@ STREAM_CHUNK_SIZE = max(64 * 1024, min(1024 * 1024, int(os.getenv("STREAM_CHUNK_
 # ---------------------------------------------------------------------------
 THUMB_CACHE_TTL     = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX     = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
+
+# ✅ Estandarización: tamaño uniforme tipo w500 (ancho 500)
+THUMB_STD_W = int(os.getenv("THUMB_STD_W", "500"))
+# Alto uniforme (poster 2:3 para que “no se vea ancho” incluso si viene 16:9)
+THUMB_STD_H = int(os.getenv("THUMB_STD_H", str(int(THUMB_STD_W * 1.5))))
+THUMB_STD_SIZE = (THUMB_STD_W, THUMB_STD_H)
+
+# ✅ Seguridad SSRF: allowlist de hosts de imágenes externas que sí se pueden proxyear/convertir
+_THUMB_ALLOWED_HOST_SUFFIXES = [
+    "image.tmdb.org",
+    "img.youtube.com",
+    "i.ytimg.com",
+    "static.tvmaze.com",
+    "blogger.googleusercontent.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "wikimedia.org",
+    "wikipedia.org",
+]
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
@@ -319,6 +348,62 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
         return int(ch_vals[0])
     except Exception:
         return 0
+
+def _is_allowed_thumb_url(u: str | None) -> bool:
+    try:
+        if not u:
+            return False
+        p = urlparse(u)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = (p.hostname or "").lower().strip()
+        if not host:
+            return False
+        for suf in _THUMB_ALLOWED_HOST_SUFFIXES:
+            if host == suf or host.endswith("." + suf):
+                return True
+        return False
+    except Exception:
+        return False
+
+def _is_internal_thumb_url(u: str | None) -> bool:
+    try:
+        if not u:
+            return False
+        if u.startswith("/thumb/"):
+            return True
+        if PUBLIC_URL and u.startswith(PUBLIC_URL + "/thumb/"):
+            return True
+        pu = urlparse(u)
+        return pu.path.startswith("/thumb/")
+    except Exception:
+        return False
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
+
+def _thumb_proxy_url(external_url: str, title: str) -> str:
+    # Reusa el MISMO endpoint /thumb/{message_id}, con message_id=0 como “proxy”
+    # y fallback coherente con título (t=).
+    u_enc = quote_plus(external_url or "")
+    t_enc = quote_plus((title or "Película").strip() or "Película")
+    return _build_public_url(f"/thumb/0?u={u_enc}&t={t_enc}")
+
+def _thumb_titlecard_url(title: str) -> str:
+    t_enc = quote_plus((title or "Película").strip() or "Película")
+    return _build_public_url(f"/thumb/0?t={t_enc}")
+
+def _standardize_imagen_url(imagen_url: str | None, title: str) -> str:
+    # ✅ Ningún contenido sin imagen
+    # ✅ Uniforme “w500” (servido por /thumb)
+    # ✅ Siempre JPG (convertido en /thumb)
+    u = (imagen_url or "").strip()
+    if not u:
+        return _thumb_titlecard_url(title)
+    if _is_internal_thumb_url(u):
+        return u
+    # Si es externa, siempre pasamos por proxy para estandarizar y convertir a JPG
+    return _thumb_proxy_url(u, title)
 
 # ---------------------------------------------------------------------------
 # ✅ FIX MINIATURAS: _thumb_url_for_message valida que el ID sea numérico
@@ -629,8 +714,9 @@ def _build_tmdb_query_from_title(title: str) -> tuple[str, str | None]:
     q = re.sub(r"\s+", " ", q).strip()
     return (q or raw), year
 
+# ✅ Placeholder coherente (se genera como JPG, tamaño uniforme, desde /thumb/0?t=...)
 def _placeholder_image_for_title(title: str) -> str:
-    return PLACEHOLDER_IMAGE_BASE
+    return _thumb_titlecard_url(title or "Película")
 
 def _nn_str(v, default: str = "") -> str:
     if v is None:
@@ -729,13 +815,19 @@ def _to_peliculas_json_schema(items: list[dict]) -> list[dict]:
     out: list[dict] = []
     for it in (items or []):
         titulo       = it.get("titulo") or it.get("title") or it.get("nombre") or "Película"
-        imagen_url   = it.get("imagen_url") or PLACEHOLDER_IMAGE_BASE
         pelicula_url = it.get("pelicula_url") or it.get("stream_url") or it.get("url") or ""
         desc         = (it.get("descripcion") or it.get("sinopsis") or "").strip()
 
+        imagen_raw = it.get("imagen_url") or ""
+        if (not imagen_raw) or _is_placeholder_image(imagen_raw):
+            imagen_raw = _placeholder_image_for_title(str(titulo))
+
+        # ✅ Estandariza SIEMPRE: uniforme w500 + JPG + nunca vacío
+        imagen_url = _standardize_imagen_url(imagen_raw, str(titulo))
+
         obj = {
             "titulo":       _nn_str(titulo,       "Película"),
-            "imagen_url":   _nn_str(imagen_url,   PLACEHOLDER_IMAGE_BASE),
+            "imagen_url":   _nn_str(imagen_url,   _placeholder_image_for_title(str(titulo))),
             "pelicula_url": _nn_str(pelicula_url, ""),
         }
         if desc and desc != "Sin descripción disponible.":
@@ -1781,9 +1873,199 @@ async def catalog():
 # ---------------------------------------------------------------------------
 # ENDPOINT /thumb/{message_id}
 # ---------------------------------------------------------------------------
-@app.get("/thumb/{message_id}")
-async def thumb_image(message_id: int, request: Request, ch: int = 0):
+def _pil_fit_to_std_jpeg(data: bytes) -> bytes | None:
+    if not _PIL_OK:
+        return None
     try:
+        im = Image.open(io.BytesIO(data))
+        im = ImageOps.exif_transpose(im)
+        im = im.convert("RGB")
+        im = ImageOps.fit(im, THUMB_STD_SIZE, method=Image.LANCZOS, centering=(0.5, 0.5))
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True, progressive=True)
+        return out.getvalue()
+    except Exception:
+        return None
+
+def _pil_generate_titlecard_jpeg(title: str) -> bytes | None:
+    if not _PIL_OK:
+        return None
+    try:
+        t = (title or "Película").strip() or "Película"
+
+        # Color determinístico por título (coherente, no genérico random)
+        h = int(_sha1(t)[:8], 16)
+        base = (
+            20 + (h % 50),
+            20 + ((h >> 8) % 50),
+            30 + ((h >> 16) % 50),
+        )
+        accent = (
+            120 + (h % 80),
+            70 + ((h >> 8) % 80),
+            90 + ((h >> 16) % 80),
+        )
+
+        im = Image.new("RGB", THUMB_STD_SIZE, base)
+        draw = ImageDraw.Draw(im)
+
+        # Banda superior (estilo póster simple)
+        draw.rectangle([(0, 0), (THUMB_STD_W, int(THUMB_STD_H * 0.22))], fill=accent)
+
+        # Fuente
+        font_title = None
+        try:
+            font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 40)
+        except Exception:
+            try:
+                font_title = ImageFont.truetype("DejaVuSans.ttf", 40)
+            except Exception:
+                font_title = ImageFont.load_default()
+
+        font_small = None
+        try:
+            font_small = ImageFont.truetype("DejaVuSans.ttf", 18)
+        except Exception:
+            font_small = ImageFont.load_default()
+
+        # Wrap de texto
+        max_chars = 18
+        lines = textwrap.wrap(t, width=max_chars)[:4]
+        text = "\n".join(lines) if lines else "Película"
+
+        # Medir y centrar
+        try:
+            bbox = draw.multiline_textbbox((0, 0), text, font=font_title, spacing=8, align="center")
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        except Exception:
+            tw, th = (THUMB_STD_W - 80, 200)
+
+        x = (THUMB_STD_W - tw) // 2
+        y = int(THUMB_STD_H * 0.32)
+
+        # Sombra + texto
+        shadow = (0, 0, 0)
+        draw.multiline_text((x + 2, y + 2), text, font=font_title, fill=shadow, spacing=8, align="center")
+        draw.multiline_text((x, y), text, font=font_title, fill=(245, 245, 245), spacing=8, align="center")
+
+        # Footer
+        footer = "Miniatura generada automáticamente"
+        try:
+            fb = draw.textbbox((0, 0), footer, font=font_small)
+            fw = fb[2] - fb[0]
+        except Exception:
+            fw = 200
+        draw.text(((THUMB_STD_W - fw) // 2, THUMB_STD_H - 40), footer, font=font_small, fill=(230, 230, 230))
+
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True, progressive=True)
+        return out.getvalue()
+    except Exception:
+        return None
+
+async def _fetch_external_image_bytes(u: str) -> bytes | None:
+    try:
+        if not _is_allowed_thumb_url(u):
+            return None
+        timeout = httpx.Timeout(connect=2.0, read=3.5, write=2.0, pool=1.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+            r = await http.get(u)
+            if r.status_code != 200:
+                return None
+            ct = (r.headers.get("content-type") or "").lower()
+            if "image" not in ct:
+                return None
+            data = r.content
+            if not data:
+                return None
+            # Límite simple por seguridad/performance (8 MB)
+            if len(data) > 8 * 1024 * 1024:
+                return None
+            return data
+    except Exception:
+        return None
+
+@app.get("/thumb/{message_id}")
+async def thumb_image(message_id: int, request: Request, ch: int = 0, u: str | None = None, t: str | None = None):
+    try:
+        # -------------------------------------------------------------------
+        # ✅ MODO PROXY / GENERADOR (MISMO endpoint, sin cambiar rutas):
+        # - /thumb/0?u=<url>&t=<titulo>  -> baja imagen externa allowlist, la convierte a JPG y la ajusta a 500
+        # - /thumb/0?t=<titulo>          -> genera miniatura coherente con el título
+        # -------------------------------------------------------------------
+        if message_id == 0:
+            title_for_card = (t or "Película").strip() or "Película"
+            u_clean = (u or "").strip()
+
+            proxy_key = ""
+            if u_clean:
+                proxy_key = f"proxy:{_sha1(u_clean)}:{_sha1(title_for_card)}"
+            else:
+                proxy_key = f"title:{_sha1(title_for_card)}"
+
+            cache_key = f"{ch}:{proxy_key}"
+            now = time.monotonic()
+
+            thumb_cache = getattr(app.state, "thumb_cache", None)
+            if not isinstance(thumb_cache, dict):
+                thumb_cache = {}
+                app.state.thumb_cache = thumb_cache
+
+            entry = thumb_cache.get(cache_key)
+            if isinstance(entry, dict):
+                ts = entry.get("ts") or 0.0
+                if (now - ts) < THUMB_CACHE_TTL and entry.get("data"):
+                    return Response(
+                        content=entry["data"],
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=3600"},
+                    )
+
+            async with app.state.thumb_cache_lock:
+                entry2 = thumb_cache.get(cache_key)
+                now2 = time.monotonic()
+                if isinstance(entry2, dict):
+                    ts2 = entry2.get("ts") or 0.0
+                    if (now2 - ts2) < THUMB_CACHE_TTL and entry2.get("data"):
+                        return Response(
+                            content=entry2["data"],
+                            media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=3600"},
+                        )
+
+                data_final = None
+
+                # 1) Intentar proxy de imagen externa
+                if u_clean:
+                    ext_bytes = await _fetch_external_image_bytes(u_clean)
+                    if ext_bytes and _PIL_OK:
+                        data_final = _pil_fit_to_std_jpeg(ext_bytes)
+
+                # 2) Si no se pudo, generar miniatura coherente por título
+                if not data_final:
+                    data_final = _pil_generate_titlecard_jpeg(title_for_card)
+                    if not data_final:
+                        # fallback extremo (mantiene endpoint vivo)
+                        data_final = b""
+
+                if not data_final:
+                    raise HTTPException(status_code=404, detail="Thumb no disponible")
+
+                thumb_cache[cache_key] = {"ts": time.monotonic(), "ct": "image/jpeg", "data": data_final}
+                _thumb_cache_prune(thumb_cache)
+
+                return Response(
+                    content=data_final,
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"},
+                )
+
+        # -------------------------------------------------------------------
+        # ✅ MODO ORIGINAL TELEGRAM: /thumb/{message_id}?ch=...
+        # Ahora: siempre convierte a JPG y ajusta a tamaño uniforme (w500)
+        # y si no hay thumb, genera titlecard coherente con el caption.
+        # -------------------------------------------------------------------
         entities = getattr(app.state, "entities", [app.state.entity])
         entity   = (
             entities[ch]
@@ -1805,10 +2087,8 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
             if (now - ts) < THUMB_CACHE_TTL and entry.get("data"):
                 return Response(
                     content=entry["data"],
-                    media_type=entry.get("ct") or "image/jpeg",
-                    headers={
-                        "Cache-Control": "public, max-age=3600",
-                    },
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"},
                 )
 
         async with app.state.thumb_cache_lock:
@@ -1819,30 +2099,37 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
                 if (now2 - ts2) < THUMB_CACHE_TTL and entry2.get("data"):
                     return Response(
                         content=entry2["data"],
-                        media_type=entry2.get("ct") or "image/jpeg",
-                        headers={
-                            "Cache-Control": "public, max-age=3600",
-                        },
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=3600"},
                     )
 
             message = await client.get_messages(entity, ids=message_id)
-            if not message or not message.media:
+            if not message:
                 raise HTTPException(status_code=404, detail="Thumb no encontrado")
 
-            data = await client.download_media(message.media, file=bytes, thumb=-1)
-            if not data:
+            title_from_msg = _extract_title_from_caption(message.text or "") if (message.text or "") else "Película"
+
+            data_final = None
+
+            if message.media:
+                data = await client.download_media(message.media, file=bytes, thumb=-1)
+                if data and _PIL_OK:
+                    data_final = _pil_fit_to_std_jpeg(data)
+
+            # Si no hay thumb, o no se pudo convertir, generamos una miniatura coherente por título
+            if not data_final:
+                data_final = _pil_generate_titlecard_jpeg(title_from_msg)
+
+            if not data_final:
                 raise HTTPException(status_code=404, detail="Thumb no disponible")
 
-            ct = _guess_image_content_type(data)
-            thumb_cache[cache_key] = {"ts": time.monotonic(), "ct": ct, "data": data}
+            thumb_cache[cache_key] = {"ts": time.monotonic(), "ct": "image/jpeg", "data": data_final}
             _thumb_cache_prune(thumb_cache)
 
             return Response(
-                content=data,
-                media_type=ct,
-                headers={
-                    "Cache-Control": "public, max-age=3600",
-                },
+                content=data_final,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=3600"},
             )
 
     except HTTPException:
