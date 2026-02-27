@@ -77,7 +77,7 @@ THUMB_CACHE_TTL     = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX     = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
 # ---------------------------------------------------------------------------
-# OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
+# CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
 SEARCH_CHANNEL_CACHE_TTL = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
 SEARCH_CHANNEL_CACHE_LIMIT = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
@@ -321,25 +321,25 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
         return 0
 
 # ---------------------------------------------------------------------------
-# ✅ FIX: _thumb_url_for_message valida que message_id sea entero
-# Si recibe un string no numérico (ej: ID de YouTube "JZGPUgpdK8o"),
-# retorna None en lugar de generar una URL inválida para /thumb/
+# ✅ FIX: _thumb_url_for_message valida que message_id sea entero real
+# Si recibe un ID de YouTube (texto como "JZGPUgpdK8o"), devuelve None
+# para que el flujo use _youtube_thumb_from_stream_url correctamente
 # ---------------------------------------------------------------------------
-def _thumb_url_for_message(message_id, stream_url: str | None = None, ch: int | None = None) -> str | None:
+def _thumb_url_for_message(message_id: int | None, stream_url: str | None = None, ch: int | None = None) -> str | None:
     if not message_id:
         return None
-    # Validar que sea un entero válido de Telegram (no un video_id de YouTube)
+    # Validar que message_id sea realmente un entero de Telegram
+    # (no un ID de YouTube como "JZGPUgpdK8o" que es texto alfanumérico)
     try:
-        int_id = int(message_id)
+        int(message_id)
     except (ValueError, TypeError):
-        # Es un ID no numérico (ej: "JZGPUgpdK8o" de YouTube) → no generar URL /thumb/
         return None
     ch_final = 0
     if ch is not None:
         ch_final = int(ch)
     elif stream_url:
         ch_final = _extract_ch_from_stream_url(stream_url)
-    return _build_public_url(f"/thumb/{int_id}?ch={ch_final}")
+    return _build_public_url(f"/thumb/{message_id}?ch={ch_final}")
 
 def _is_placeholder_image(url: str | None) -> bool:
     u = (url or "").strip()
@@ -643,7 +643,7 @@ def _nn_num(v, default=0):
     return v if v is not None else default
 
 # ---------------------------------------------------------------------------
-# NUEVO: FETCH + CACHÉ DE RECIENTES POR CANAL
+# FETCH + CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
 async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) -> list[dict]:
     if entity is None:
@@ -1164,7 +1164,7 @@ async def _tvmaze_fetch(
         return None
 
 # ---------------------------------------------------------------------------
-# GEMINI AI
+# GEMINI AI: completa metadatos faltantes (SOLO EN /search, LIMITADO A 10)
 # ---------------------------------------------------------------------------
 _GEMINI_CALL_COUNTER = {"count": 0}
 
@@ -1673,7 +1673,7 @@ async def search(
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /catalog (SIN IA)
+# ENDPOINT /catalog
 # ---------------------------------------------------------------------------
 @app.get("/catalog")
 async def catalog():
