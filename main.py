@@ -7,6 +7,9 @@ import random
 import json
 import httpx
 import time
+import io                    # 🔧 NUEVO
+import subprocess            # 🔧 NUEVO
+import tempfile              # 🔧 NUEVO
 from urllib.parse import quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -14,6 +17,15 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+
+# 🔧 NUEVO: Pillow con fallback gracioso
+try:
+    from PIL import Image as _PIL_Image
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_Image = None
+    _PIL_AVAILABLE = False
+    print("⚠️  Pillow no disponible. Instalar con: pip install Pillow")
 
 # ---------------------------------------------------------------------------
 # CONFIGURACIÓN
@@ -78,6 +90,10 @@ STREAM_CHUNK_SIZE = max(
 # ---------------------------------------------------------------------------
 THUMB_CACHE_TTL = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
+
+# 🔧 NUEVO: Tamaño estándar de miniaturas
+TARGET_THUMB_WIDTH  = 500
+TARGET_THUMB_HEIGHT = 750
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
@@ -322,6 +338,49 @@ def _detect_mime_type(data: bytes) -> str:
     return "image/jpeg"
 
 
+# ---------------------------------------------------------------------------
+# 🔧 NUEVO: Recortar/redimensionar imagen a 500x750 con cover mode
+# ---------------------------------------------------------------------------
+def _crop_cover_to_poster(image_data: bytes) -> bytes:
+    """
+    Redimensiona y recorta image_data al tamaño estándar TARGET_THUMB_WIDTH x TARGET_THUMB_HEIGHT
+    usando modo 'cover': escala para cubrir toda el área y luego recorta al centro.
+    Siempre devuelve JPEG. Si Pillow no está disponible, devuelve los bytes originales.
+    """
+    if not _PIL_AVAILABLE or not image_data:
+        return image_data
+    try:
+        img = _PIL_Image.open(io.BytesIO(image_data))
+        # Convertir a RGB (elimina canal alfa si existe)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        target_w, target_h = TARGET_THUMB_WIDTH, TARGET_THUMB_HEIGHT
+        src_w, src_h = img.size
+
+        if src_w == 0 or src_h == 0:
+            return image_data
+
+        # Cover: escalar para que ninguna dimensión quede por debajo del objetivo
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(int(src_w * scale), target_w)
+        new_h = max(int(src_h * scale), target_h)
+
+        img = img.resize((new_w, new_h), _PIL_Image.LANCZOS)
+
+        # Recorte centrado
+        left = (new_w - target_w) // 2
+        top  = (new_h - target_h) // 2
+        img  = img.crop((left, top, left + target_w, top + target_h))
+
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=88, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        print(f"⚠️  Error en _crop_cover_to_poster: {e}")
+        return image_data
+
+
 def _build_public_url(path: str) -> str:
     if PUBLIC_URL:
         return f"{PUBLIC_URL}{path}"
@@ -365,6 +424,9 @@ def _is_placeholder_image(url) -> bool:
     return (not u) or (u == PLACEHOLDER_IMAGE_BASE)
 
 
+# ---------------------------------------------------------------------------
+# 🔧 MODIFICADO: YouTube thumbnail apunta al proxy /ytthumb/{vid}
+# ---------------------------------------------------------------------------
 def _youtube_thumb_from_stream_url(stream_url):
     try:
         if not stream_url:
@@ -374,14 +436,111 @@ def _youtube_thumb_from_stream_url(stream_url):
             qs = parse_qs(parsed.query or "")
             vid = (qs.get("v") or [None])[0]
             if vid:
-                return f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
+                # 🔧 Apunta al proxy interno que recorta a 500x750
+                return _build_public_url(f"/ytthumb/{vid}")
         if "youtu.be/" in stream_url:
             vid = stream_url.rstrip("/").split("/")[-1]
             if vid:
-                return f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
+                # 🔧 Apunta al proxy interno que recorta a 500x750
+                return _build_public_url(f"/ytthumb/{vid}")
         return None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# 🔧 NUEVO: Extrae un frame real del video Telegram cuando no hay miniatura
+# ---------------------------------------------------------------------------
+async def _extract_video_frame(message) -> bytes | None:
+    """
+    Descarga los primeros ~10 MB del video y extrae un frame con ffmpeg.
+    Devuelve los bytes JPEG del frame, o None si falla.
+    Solo se llama cuando no hay miniatura disponible en Telegram ni en TMDB.
+    """
+    FRAME_DOWNLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB máximo
+
+    vf_path  = None
+    out_path = None
+    try:
+        # --- 1. Descargar porción inicial del video ---
+        chunks = []
+        total  = 0
+        async for chunk in client.iter_download(
+            message.media,
+            offset=0,
+            limit=FRAME_DOWNLOAD_LIMIT,
+            chunk_size=512 * 1024,
+        ):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= FRAME_DOWNLOAD_LIMIT:
+                break
+
+        if not chunks:
+            return None
+
+        video_data = b"".join(chunks)
+
+        # --- 2. Escribir a archivo temporal ---
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_data)
+            vf_path = vf.name
+
+        out_path = vf_path + "_frame.jpg"
+
+        # --- 3. Ejecutar ffmpeg para extraer frame ---
+        def _run_ffmpeg():
+            try:
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-i",      vf_path,
+                        "-ss",     "00:00:02",   # Frame en el segundo 2
+                        "-vframes", "1",
+                        out_path,
+                    ],
+                    capture_output=True,
+                    timeout=10,
+                )
+                return result
+            except FileNotFoundError:
+                print("⚠️  ffmpeg no encontrado. Instalar con: apt-get install -y ffmpeg")
+                return None
+            except subprocess.TimeoutExpired:
+                return None
+
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run_ffmpeg),
+            timeout=12.0,
+        )
+
+        if result is None:
+            return None
+
+        if os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                frame_data = f.read()
+            if frame_data:
+                print(f"   🎞️  Frame extraído correctamente del video (msg {message.id})")
+                return frame_data
+
+        return None
+
+    except asyncio.TimeoutError:
+        print(f"⚠️  Timeout extrayendo frame del video (msg {getattr(message, 'id', '?')})")
+        return None
+    except Exception as e:
+        print(f"⚠️  Error en _extract_video_frame (msg {getattr(message, 'id', '?')}): {e}")
+        return None
+    finally:
+        # --- 4. Limpieza de archivos temporales ---
+        for p in [vf_path, out_path]:
+            if p:
+                try:
+                    if os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1841,7 +2000,58 @@ async def catalog():
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /thumb/{message_id}
+# 🔧 NUEVO ENDPOINT: /ytthumb/{video_id}
+# Proxy que descarga la miniatura de YouTube y la recorta a 500x750
+# ---------------------------------------------------------------------------
+@app.get("/ytthumb/{video_id}")
+async def youtube_thumbnail_proxy(video_id: str):
+    cache_key = f"yt:{video_id}"
+
+    # Verificar caché
+    thumb_cache = getattr(app.state, "thumb_cache", {})
+    async with app.state.thumb_cache_lock:
+        cached = thumb_cache.get(cache_key)
+        if cached:
+            ts, data, mime = cached
+            if time.monotonic() - ts < THUMB_CACHE_TTL:
+                return Response(content=data, media_type=mime)
+
+    # Intentar descargar miniatura en diferentes calidades
+    thumb_data = None
+    for quality in ["maxresdefault", "sddefault", "hqdefault", "mqdefault", "default"]:
+        url = f"https://img.youtube.com/vi/{video_id}/{quality}.jpg"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                r = await http.get(url)
+                # YouTube devuelve imagen 120x90 "no disponible" para maxres/sd si no existe
+                # La filtramos por tamaño mínimo de contenido
+                if r.status_code == 200 and len(r.content) > 5000:
+                    thumb_data = r.content
+                    break
+        except Exception:
+            continue
+
+    if not thumb_data:
+        return Response(
+            status_code=302,
+            headers={"Location": PLACEHOLDER_IMAGE_BASE},
+        )
+
+    # 🔧 Recortar a 500x750
+    processed = _crop_cover_to_poster(thumb_data)
+    mime      = "image/jpeg"
+
+    # Guardar en caché
+    async with app.state.thumb_cache_lock:
+        _thumb_cache_prune(thumb_cache)
+        thumb_cache[cache_key] = (time.monotonic(), processed, mime)
+
+    return Response(content=processed, media_type=mime)
+
+
+# ---------------------------------------------------------------------------
+# 🔧 ENDPOINT /thumb/{message_id} — MODIFICADO
+# Añade: extracción de frame si no hay miniatura + recorte 500x750 en todo caso
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
@@ -1871,12 +2081,35 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             )
 
         thumb_data = None
+
+        # --- Intento 1: foto del mensaje ---
         if hasattr(message, 'photo') and message.photo:
             thumb_data = await client.download_media(message.photo, bytes)
-        elif message.document and message.document.thumbs:
+
+        # --- Intento 2: miniatura embebida del documento ---
+        if not thumb_data and message.document and message.document.thumbs:
             thumb_data = await client.download_media(
                 message.document.thumbs[-1], bytes
             )
+
+        # --- 🔧 Intento 3 (NUEVO): extraer frame real del video ---
+        if not thumb_data:
+            is_video = (
+                message.document is not None
+                and message.file is not None
+                and message.file.mime_type is not None
+                and "video" in message.file.mime_type.lower()
+            )
+            if is_video:
+                print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
+                try:
+                    thumb_data = await asyncio.wait_for(
+                        _extract_video_frame(message),
+                        timeout=25.0,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"   ⚠️  Timeout extrayendo frame del video msg {message_id}")
+                    thumb_data = None
 
         if not thumb_data:
             return Response(
@@ -1884,7 +2117,9 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 headers={"Location": PLACEHOLDER_IMAGE_BASE},
             )
 
-        mime = _detect_mime_type(thumb_data)
+        # --- 🔧 NUEVO: Aplicar recorte cover 500x750 a TODAS las miniaturas ---
+        thumb_data = _crop_cover_to_poster(thumb_data)
+        mime       = "image/jpeg"
 
         async with app.state.thumb_cache_lock:
             _thumb_cache_prune(thumb_cache)
