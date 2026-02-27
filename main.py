@@ -67,23 +67,17 @@ CACHE_SAVE_EVERY      = 10
 
 # ---------------------------------------------------------------------------
 # STREAMING (FIX DEFINITIVO)
-# - Honor real de Range bytes=start-end
-# - Chunks más frecuentes para evitar pausas/timeout
-# - Headers correctos 200/206/416
 # ---------------------------------------------------------------------------
 STREAM_CHUNK_SIZE = max(64 * 1024, min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024)))))
 
 # ---------------------------------------------------------------------------
 # THUMBNAILS (FIX IMAGEN_URL DEFINITIVO)
-# Endpoint /thumb/{message_id} para miniatura REAL del video/documento Telegram
-# Cache RAM para evitar descargar thumb repetido
 # ---------------------------------------------------------------------------
 THUMB_CACHE_TTL     = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX     = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL PARA BÚSQUEDAS POR CATEGORÍA
-# (No cambia lógica/salida: solo evita pegarle a Telegram cada vez cuando no hay q)
 # ---------------------------------------------------------------------------
 SEARCH_CHANNEL_CACHE_TTL = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
 SEARCH_CHANNEL_CACHE_LIMIT = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
@@ -114,7 +108,6 @@ _REQUIRED_CHANNELS = [
     '@archivotvcinepiuraperu',
     '@adult_swim_peliculas_a',
     '@peliculascristian',
-    # NUEVOS CANALES A INTEGRAR
     '@kdramaevery',
     '@kdram3',
     '@Kdamasfinalizadosymas',
@@ -143,102 +136,77 @@ BACKUP_CHANNELS = _dedupe_channels(_REQUIRED_CHANNELS)
 # MAPA DE GÉNEROS → CANALES (ACTUALIZADO CON NUEVOS CANALES)
 # ---------------------------------------------------------------------------
 GENRE_CHANNEL_MAP: dict[str, list[str]] = {
-    # ── Anime ───────────────────────────────────────────────────────────────
     "anime":           ["@peliculasdeanimes1349", "@AnimesFinalizadosHD",
                         "@Shin_sekai_animes_en_emision_1", "@pelis123anime4611", "@animadasssss"],
-    # ── Animación ───────────────────────────────────────────────────────────
     "animacion":       ["@animadasssss", "@dibupelis", "@peliculasdeanimes1349",
                         "@Infantiles_Videos", "@kidsvideos"],
     "animación":       ["@animadasssss", "@dibupelis", "@peliculasdeanimes1349",
                         "@Infantiles_Videos", "@kidsvideos"],
-    # ── Terror / Horror ─────────────────────────────────────────────────────
     "terror":          ["@pelisdeterror2"],
     "horror":          ["@pelisdeterror2"],
     "miedo":           ["@pelisdeterror2"],
-    # ── Religión / Cristiana ────────────────────────────────────────────────
     "cristiana":       ["@PeliculasCristianasBpB", "@Peliculas_Cristianas_Caprichos", "@peliculascristian"],
     "cristiano":       ["@PeliculasCristianasBpB", "@Peliculas_Cristianas_Caprichos", "@peliculascristian"],
     "religion":        ["@PeliculasCristianasBpB", "@Peliculas_Cristianas_Caprichos", "@peliculascristian"],
     "religión":        ["@PeliculasCristianasBpB", "@Peliculas_Cristianas_Caprichos", "@peliculascristian"],
-    # ── Infantil / Kids ─────────────────────────────────────────────────────
     "infantil":        ["@Infantiles_Videos", "@kidsvideos", "@dibupelis", "@animadasssss"],
     "niños":           ["@Infantiles_Videos", "@kidsvideos", "@dibupelis"],
     "ninos":           ["@Infantiles_Videos", "@kidsvideos", "@dibupelis"],
     "kids":            ["@Infantiles_Videos", "@kidsvideos", "@dibupelis"],
     "familia":         ["@Infantiles_Videos", "@kidsvideos", "@peliculasdetodogeneroo"],
-    # ── Clásicas / Vintage ──────────────────────────────────────────────────
     "clasica":         ["@oldiemovies"],
     "clásica":         ["@oldiemovies"],
     "vintage":         ["@oldiemovies"],
     "antigua":         ["@oldiemovies"],
-    # ── Adultos ─────────────────────────────────────────────────────────────
     "adultos":         ["@peliculasadul", "@adult_swim_peliculas_a"],
     "adulto":          ["@peliculasadul", "@adult_swim_peliculas_a"],
-    # ── Acción / Aventura ───────────────────────────────────────────────────
     "accion":          ["@PEELYE", "@peliculasdetodogeneroo", "@MundoPelisgratis15"],
     "acción":          ["@PEELYE", "@peliculasdetodogeneroo", "@MundoPelisgratis15"],
     "aventura":        ["@PEELYE", "@peliculasdetodogeneroo", "@MundoPelisgratis15"],
-    # ── Drama ───────────────────────────────────────────────────────────────
     "drama":           ["@peliculasdetodogeneroo", "@MundoPelisgratis15", "@archivotvcinepiuraperu"],
-    # ── Comedia ─────────────────────────────────────────────────────────────
     "comedia":         ["@peliculasdetodogeneroo", "@MundoPelisgratis15"],
-    # ── Romance ─────────────────────────────────────────────────────────────
     "romance":         ["@peliculasdetodogeneroo", "@MundoPelisgratis15"],
     "romantica":       ["@peliculasdetodogeneroo", "@MundoPelisgratis15"],
     "romántica":       ["@peliculasdetodogeneroo", "@MundoPelisgratis15"],
-    # ── Ciencia Ficción ─────────────────────────────────────────────────────
     "ciencia ficcion": ["@PEELYE", "@peliculasdetodogeneroo"],
     "ciencia ficción": ["@PEELYE", "@peliculasdetodogeneroo"],
     "sci-fi":          ["@PEELYE", "@peliculasdetodogeneroo"],
     "scifi":           ["@PEELYE", "@peliculasdetodogeneroo"],
     "ficcion":         ["@PEELYE", "@peliculasdetodogeneroo"],
     "ficción":         ["@PEELYE", "@peliculasdetodogeneroo"],
-    # ── Suspenso / Thriller ─────────────────────────────────────────────────
     "suspenso":        ["@peliculasdetodogeneroo", "@PEELYE"],
     "thriller":        ["@peliculasdetodogeneroo", "@PEELYE"],
-    # ── Documental ──────────────────────────────────────────────────────────
     "documental":      ["@archivotvcinepiuraperu", "@peliculasdetodogeneroo"],
     "documentary":     ["@archivotvcinepiuraperu", "@peliculasdetodogeneroo"],
     "documentales":    ["@archivotvcinepiuraperu", "@peliculasdetodogeneroo"],
-    # ── LGBT / Pride ────────────────────────────────────────────────────────
     "lgbt":            ["@peliculaspridelezz"],
     "lgbtq":           ["@peliculaspridelezz"],
     "pride":           ["@peliculaspridelezz"],
-    # ── Musical ─────────────────────────────────────────────────────────────
     "musical":         ["@peliculasdetodogeneroo"],
-    # ── Western ─────────────────────────────────────────────────────────────
     "western":         ["@oldiemovies", "@peliculasdetodogeneroo"],
-    # ── Fantasía ────────────────────────────────────────────────────────────
     "fantasia":        ["@peliculasdetodogeneroo", "@PEELYE"],
     "fantasía":        ["@peliculasdetodogeneroo", "@PEELYE"],
     "fantastica":      ["@peliculasdetodogeneroo", "@PEELYE"],
     "fantástica":      ["@peliculasdetodogeneroo", "@PEELYE"],
-    # ── Policial / Crimen ───────────────────────────────────────────────────
     "policial":        ["@peliculasdetodogeneroo", "@PEELYE"],
     "crimen":          ["@peliculasdetodogeneroo", "@PEELYE"],
     "criminal":        ["@peliculasdetodogeneroo", "@PEELYE"],
-    # ── Guerra ──────────────────────────────────────────────────────────────
     "guerra":          ["@peliculasdetodogeneroo", "@PEELYE"],
-    # ── Historia ────────────────────────────────────────────────────────────
     "historia":        ["@archivotvcinepiuraperu", "@peliculasdetodogeneroo"],
     "historica":       ["@archivotvcinepiuraperu", "@peliculasdetodogeneroo"],
     "histórica":       ["@archivotvcinepiuraperu", "@peliculasdetodogeneroo"],
-    # ── Misterio ────────────────────────────────────────────────────────────
     "misterio":        ["@peliculasdetodogeneroo", "@pelisdeterror2"],
     "mystery":         ["@peliculasdetodogeneroo", "@pelisdeterror2"],
-    # ── K-Drama (NUEVOS CANALES) ───────────────────────────────────────────
     "kdrama":          ["@kdramaevery", "@kdram3", "@Kdamasfinalizadosymas",
                         "@kdramasubstitulado", "@k_dramas9", "@dramaesp"],
     "k-drama":         ["@kdramaevery", "@kdram3", "@Kdamasfinalizadosymas",
                         "@kdramasubstitulado", "@k_dramas9", "@dramaesp"],
     "drama coreano":   ["@kdramaevery", "@kdram3", "@Kdamasfinalizadosymas",
                         "@kdramasubstitulado", "@k_dramas9", "@dramaesp"],
-    # ── Deportes (NUEVO CANAL) ─────────────────────────────────────────────
     "deportes":        ["@SportsTV90", "@peliculasynoticias"],
     "sports":          ["@SportsTV90", "@peliculasynoticias"],
     "futbol":          ["@SportsTV90", "@peliculasynoticias"],
     "fútbol":          ["@SportsTV90", "@peliculasynoticias"],
-    # ── General ─────────────────────────────────────────────────────────────
     "general":         ["@peliculasdetodogeneroo", "@MundoPelisgratis15", "@PEELYE"],
 }
 
@@ -246,10 +214,6 @@ GENRE_CHANNEL_MAP: dict[str, list[str]] = {
 # HELPER: canales para un género dado
 # ---------------------------------------------------------------------------
 def _get_genre_channels(genre: str) -> list[str]:
-    """
-    Retorna la lista de canales asociados a un género.
-    Intenta coincidencia exacta, luego sin acentos, luego parcial.
-    """
     g = (genre or "").strip().lower()
     channels = GENRE_CHANNEL_MAP.get(g, [])
     if not channels:
@@ -319,7 +283,6 @@ def _thumb_cache_prune(cache: dict):
     try:
         if len(cache) <= THUMB_CACHE_MAX:
             return
-        # Eliminar los más antiguos
         items = list(cache.items())
         items.sort(key=lambda kv: (kv[1].get("ts") or 0.0))
         to_remove = len(cache) - THUMB_CACHE_MAX
@@ -335,7 +298,6 @@ def _guess_image_content_type(data: bytes) -> str:
         return "image/jpeg"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
-    # WebP: RIFF....WEBP
     if data[:4] == b"RIFF" and b"WEBP" in data[:16]:
         return "image/webp"
     return "image/jpeg"
@@ -405,12 +367,9 @@ async def lifespan(app: FastAPI):
     app.state.meta_cache_dirty     = False
     app.state.catalog_pool_cache   = {"ts": 0.0, "pool": []}
 
-    # NUEVO: caché de recientes por canal (para búsquedas por categoría sin q)
-    app.state.search_channel_media_cache = {}   # ch_index -> {"ts": float, "items": list[dict]}
-    app.state.search_channel_cache_locks = {}   # ch_index -> asyncio.Lock()
-
-    # NUEVO: cache de thumbnails
-    app.state.thumb_cache = {}                 # (ch, message_id) -> {"ts": float, "ct": str, "data": bytes}
+    app.state.search_channel_media_cache = {}
+    app.state.search_channel_cache_locks = {}
+    app.state.thumb_cache = {}
     app.state.thumb_cache_lock = asyncio.Lock()
 
     app.state.meta_cache = await _load_persistent_cache()
@@ -445,7 +404,6 @@ async def lifespan(app: FastAPI):
         loaded = sum(1 for e in app.state.entities if e is not None)
         print(f"✅ Todos los canales cargados: {loaded} disponibles")
 
-        # NUEVO: warm-up en background del caché por canal para acelerar categorías
         async def _warmup_search_cache():
             try:
                 sem_w = asyncio.Semaphore(SEARCH_CHANNEL_WARMUP_CONCURRENCY)
@@ -455,7 +413,6 @@ async def lifespan(app: FastAPI):
                         return
                     async with sem_w:
                         try:
-                            # Precargar recientes (equivale a búsquedas sin q)
                             await _get_recent_media_cached(i, e, force_refresh=True)
                         except Exception:
                             pass
@@ -674,7 +631,7 @@ def _nn_num(v, default=0):
     return v if v is not None else default
 
 # ---------------------------------------------------------------------------
-# NUEVO: FETCH + CACHÉ DE RECIENTES POR CANAL (para búsquedas sin q)
+# FETCH + CACHÉ DE RECIENTES POR CANAL (para búsquedas sin q)
 # ---------------------------------------------------------------------------
 async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) -> list[dict]:
     if entity is None:
@@ -702,10 +659,6 @@ async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) ->
     return results
 
 async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = False) -> list[dict]:
-    """
-    Devuelve los recientes del canal (misma lógica que búsqueda sin q),
-    pero usando caché RAM con TTL para responder rápido.
-    """
     now = time.monotonic()
 
     cache = getattr(app.state, "search_channel_media_cache", None)
@@ -730,7 +683,6 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
         locks[ch_index] = lock
 
     async with lock:
-        # Re-check dentro del lock (evita stampede)
         now2 = time.monotonic()
         if not force_refresh:
             entry2 = cache.get(ch_index)
@@ -746,7 +698,6 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
                 timeout=SEARCH_CHANNEL_FETCH_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            # Si timeout y hay caché viejo, lo devolvemos para no bloquear
             old = cache.get(ch_index)
             if isinstance(old, dict) and (old.get("items") or []):
                 return old.get("items") or []
@@ -779,7 +730,6 @@ def _to_peliculas_json_schema(items: list[dict]) -> list[dict]:
         if desc and desc != "Sin descripción disponible.":
             obj["descripcion"] = desc
 
-        # Nuevos campos opcionales (solo si tienen valor significativo)
         _fecha  = it.get("fecha_lanzamiento")
         _dur    = it.get("duracion")
         _idioma = it.get("idioma_original")
@@ -817,11 +767,6 @@ def _apply_advanced_filters(
     desde:    int | None = None,
     hasta:    int | None = None,
 ) -> list[dict]:
-    """
-    Filtra la lista de películas enriquecidas por:
-    año exacto, rango de años, género e idioma original.
-    Se aplica DESPUÉS del enriquecimiento con TMDB / KG / TVMaze / Gemini.
-    """
     if not results:
         return results
 
@@ -836,13 +781,11 @@ def _apply_advanced_filters(
 
     filtered: list[dict] = []
     for r in results:
-        # Filtro año exacto
         if year:
             r_year = str(r.get("año") or "")
             if not r_year.startswith(year):
                 continue
 
-        # Filtro rango de años
         if desde or hasta:
             r_year_str = str(r.get("año") or "")
             try:
@@ -855,7 +798,6 @@ def _apply_advanced_filters(
             except (ValueError, TypeError):
                 pass
 
-        # Filtro género
         if genre_norm:
             r_gen_raw = (r.get("generos") or "").lower()
             _tmp2 = unicodedata.normalize("NFD", r_gen_raw)
@@ -863,7 +805,6 @@ def _apply_advanced_filters(
             if not (genre_norm in r_gen_raw or genre_norm_na in r_gen_na):
                 continue
 
-        # Filtro idioma
         if lang_upper:
             r_lang = (r.get("idioma_original") or "").upper()
             if lang_upper not in r_lang:
@@ -1221,15 +1162,9 @@ async def _gemini_complete_metadata(
     year:          str | None,
     existing_meta: dict,
 ) -> dict | None:
-    """
-    Usa Google Gemini para completar metadatos faltantes de una película/serie.
-    Solo se invoca cuando TMDB / Google KG / TVMaze no tienen información suficiente.
-    NO se usa en /catalog. Máximo 10 llamadas totales.
-    """
     if not GEMINI_API_KEY:
         return None
 
-    # Límite de 10 películas para usar IA
     if _GEMINI_CALL_COUNTER["count"] >= 10:
         print(f"   ⚠️  Límite de IA (10) alcanzado, no se usa Gemini para '{title}'")
         return None
@@ -1280,7 +1215,6 @@ async def _gemini_complete_metadata(
         ) or ""
         text = text.strip()
 
-        # Limpiar bloques de código markdown si Gemini los incluye
         text = re.sub(r"```(?:json)?\s*", "", text)
         text = re.sub(r"```\s*$",          "", text).strip()
 
@@ -1308,11 +1242,6 @@ def _merge_metadata_with_kg(
     fallback_title: str,
     fallback_year:  str | None,
 ) -> dict:
-    """
-    Prioridades:
-    - Imagen:   TMDb → Google KG → TVMaze
-    - Resto:    KG   → TMDb      → TVMaze
-    """
     text_sources  = [s for s in [kg, tmdb, tvmaze] if isinstance(s, dict)]
     image_sources = [s for s in [tmdb, kg, tvmaze]  if isinstance(s, dict)]
 
@@ -1374,13 +1303,11 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
 
 # ---------------------------------------------------------------------------
 # ENRIQUECIMIENTO PRINCIPAL
-# ✅ Google KG + TMDb en PARALELO → TVMaze solo si falta info
-# ✅ GEMINI IA solo si se llama desde /search (limitado a 10)
 # ---------------------------------------------------------------------------
 async def enrich_results_with_tmdb(
     results: list[dict],
     max_new: int | None = None,
-    use_gemini: bool = False,  # NUEVO: controlar si se usa Gemini (solo True en /search)
+    use_gemini: bool = False,
 ) -> list[dict]:
     request_cache: dict[str, dict] = {}
     semaphore     = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -1397,11 +1324,9 @@ async def enrich_results_with_tmdb(
             query_title, year    = _build_tmdb_query_from_title(title_raw)
             ck                   = _cache_key_from_query(query_title, year)
 
-            # 1) Request cache (dentro de esta petición HTTP)
             meta = request_cache.get(ck)
 
             if not meta:
-                # 2) Caché persistente/RAM
                 meta = await _meta_cache_get(ck)
 
                 need_repair = isinstance(meta, dict) and (
@@ -1412,12 +1337,11 @@ async def enrich_results_with_tmdb(
                 )
 
                 if (not meta) or need_repair:
-                    # Respetar límite de nuevos
                     if new_counter["n"] >= limit_new:
                         pelicula_url = r.get("stream_url") or ""
-                        # ✅ Imagen real por defecto: thumb Telegram si existe
                         thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
-                        img_final = thumb or _youtube_thumb_from_stream_url(pelicula_url) or _placeholder_image_for_title(fallback_title)
+                        yt_thumb = _youtube_thumb_from_stream_url(pelicula_url)
+                        img_final = thumb or yt_thumb or _placeholder_image_for_title(fallback_title)
                         return {
                             "titulo":                fallback_title or "Película",
                             "imagen_url":            img_final,
@@ -1440,12 +1364,10 @@ async def enrich_results_with_tmdb(
                     kg = tmdb = tvmaze = None
 
                     async with semaphore:
-                        # PASO 1+2: Google KG y TMDb EN PARALELO
                         kg_coro   = (_google_kg_search(http, query_title, year) if GOOGLE_KG_API_KEY else _noop())
                         tmdb_coro = (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
                         kg, tmdb  = await asyncio.gather(kg_coro, tmdb_coro)
 
-                        # Evaluar completitud
                         combined_has_image    = bool(
                             (isinstance(tmdb, dict) and tmdb.get("imagen_url")) or
                             (isinstance(kg,   dict) and kg.get("imagen_url"))
@@ -1459,7 +1381,6 @@ async def enrich_results_with_tmdb(
                             (isinstance(tmdb, dict) and tmdb.get("año"))
                         )
 
-                        # PASO 3: TVMaze solo si falta algo crítico
                         if not (combined_has_image and combined_has_synopsis and combined_has_year):
                             tvmaze = await _tvmaze_fetch(http, query_title, year)
 
@@ -1469,8 +1390,6 @@ async def enrich_results_with_tmdb(
                         fallback_year=fallback_year_title or year,
                     )
 
-                    # PASO 4: Gemini IA — solo si se solicita (use_gemini=True)
-                    # y si faltan campos críticos (sinopsis o géneros)
                     if use_gemini and GEMINI_API_KEY and not (meta.get("sinopsis") and meta.get("generos")):
                         gemini_data = await _gemini_complete_metadata(
                             http, fallback_title, year, meta
@@ -1491,14 +1410,8 @@ async def enrich_results_with_tmdb(
 
                 request_cache[ck] = meta
 
-            # Salida
             pelicula_url = r.get("stream_url") or ""
 
-            # ✅ FIX imagen_url definitivo:
-            # 1) meta.imagen_url si existe y no es genérica
-            # 2) miniatura real del propio Telegram (si tenemos message_id)
-            # 3) miniatura YouTube si aplica
-            # 4) placeholder (último recurso, pero en Telegram casi nunca se usa)
             meta_img = meta.get("imagen_url") if isinstance(meta, dict) else None
             if _is_placeholder_image(meta_img):
                 meta_img = None
@@ -1568,7 +1481,6 @@ def _format_results_without_apis(final_results: list[dict]) -> list[dict]:
 
         pelicula_url = r.get("stream_url") or ""
 
-        # ✅ Imagen real si hay id Telegram
         thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
         yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
         img_final = thumb_img or yt_img or _placeholder_image_for_title(titulo)
@@ -1604,7 +1516,6 @@ async def search(
     hasta:    int | None = Query(None,  description="Año máximo (ej: 2023)"),
     canal:    str | None = Query(None,  description="Canal específico de Telegram (ej: @animadasssss)"),
 ):
-    # Validaciones
     has_any = any([q, year, genre, language, desde, hasta, canal])
     if not has_any:
         raise HTTPException(
@@ -1626,14 +1537,12 @@ async def search(
             f"language={language} desde={desde} hasta={hasta} canal={canal}"
         )
 
-        # Esperar a que los canales estén listos (máx. X s en cold start)
         deadline = time.monotonic() + CHANNELS_READY_MAX_WAIT_SEARCH
         while not getattr(app.state, "channels_ready", False) and time.monotonic() < deadline:
             await asyncio.sleep(0.2)
 
         entities = getattr(app.state, "entities", [])
 
-        # Determinar canales objetivo para búsqueda avanzada
         target_channel_names: set[str] = set()
         if canal:
             c = canal.strip()
@@ -1644,7 +1553,6 @@ async def search(
             for ch in _get_genre_channels(genre):
                 target_channel_names.add(ch.lower())
 
-        # Construir lista con índices originales (necesarios para streaming)
         entities_indexed = list(enumerate(entities))
 
         if target_channel_names:
@@ -1662,14 +1570,11 @@ async def search(
             else:
                 print(f"⚠️  Sin coincidencia de canales para '{genre}', usando todos")
 
-        # Búsqueda en canales
         async def search_in_channel(ch_index: int, entity) -> list:
             if entity is None:
                 return []
             results = []
             try:
-                # Si hay texto de búsqueda → buscar por texto (comportamiento original)
-                # Si no hay texto → obtener mensajes recientes del canal (AHORA CACHEADO)
                 if q:
                     msg_iter = client.iter_messages(entity, search=q.strip())
 
@@ -1693,7 +1598,6 @@ async def search(
                             if len(results) >= 50:
                                 break
                 else:
-                    # OPTIMIZACIÓN: usar caché RAM por canal (mismo resultado/lógica)
                     results = await _get_recent_media_cached(ch_index, entity)
 
                 print(f"   📺 Canal [{ch_index}] ({entity.title}): {len(results)} resultado(s)")
@@ -1709,7 +1613,6 @@ async def search(
             if isinstance(item, list):
                 all_results.extend(item)
 
-        # Deduplicar por título normalizado
         seen, unique = set(), []
         for result in all_results:
             key = normalize_title(result["title"])
@@ -1721,13 +1624,11 @@ async def search(
 
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
 
-        # Fallback YouTube (solo cuando hay texto de búsqueda)
         if not final_results and q:
             print("🟦 Sin resultados en Telegram. Usando respaldo YouTube...")
             yt_results = await youtube_fallback(q.strip())
             if yt_results:
                 try:
-                    # En /search SÍ permitimos Gemini (use_gemini=True)
                     enriched = await asyncio.wait_for(
                         enrich_results_with_tmdb(yt_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
                         timeout=4.0,
@@ -1739,7 +1640,6 @@ async def search(
                     enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
                 return _to_peliculas_json_schema(enriched)
 
-        # Enriquecer con TMDB / KG / TVMaze / Gemini (use_gemini=True en /search)
         try:
             enriched = await asyncio.wait_for(
                 enrich_results_with_tmdb(final_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
@@ -1749,7 +1649,6 @@ async def search(
             print("⚠️  /search enrichment timeout — devolviendo formato básico")
             enriched = _format_results_without_apis(final_results)
 
-        # Aplicar filtros avanzados post-enriquecimiento
         if any([year, genre, language, desde, hasta]):
             enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
             print(f"🔎 Filtros avanzados aplicados → {len(enriched)} resultado(s)")
@@ -1777,7 +1676,6 @@ async def catalog():
             base_pool = cached_pool
             print(f"🧊 /catalog pool desde RAM (TTL ok): {len(base_pool)} items base")
         else:
-            # Fuente 1: peliculas.json
             json_pool: list[dict] = []
             try:
                 with open("peliculas.json", "r", encoding="utf-8") as f:
@@ -1796,7 +1694,6 @@ async def catalog():
             except Exception as e:
                 print(f"⚠️  Error leyendo peliculas.json: {e}")
 
-            # Fuente 2: canales de Telegram
             fetch_sem = asyncio.Semaphore(CATALOG_FETCH_CONCURRENCY)
 
             async def fetch_from_channel(ch_index: int, entity) -> list:
@@ -1857,7 +1754,6 @@ async def catalog():
         print(f"🎲 /catalog → {len(final_results)} películas aleatorias → enriqueciendo (max_new={MAX_ENRICH_NEW})...")
 
         try:
-            # En /catalog NO usamos Gemini (use_gemini=False)
             enriched = await asyncio.wait_for(
                 enrich_results_with_tmdb(final_results, max_new=MAX_ENRICH_NEW, use_gemini=False),
                 timeout=4.5,
@@ -1887,7 +1783,6 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
             else app.state.entity
         )
 
-        # Cache key
         cache_key = f"{ch}:{message_id}"
         now = time.monotonic()
 
@@ -1896,7 +1791,6 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
             thumb_cache = {}
             app.state.thumb_cache = thumb_cache
 
-        # 1) Cache fast-path (sin lock)
         entry = thumb_cache.get(cache_key)
         if isinstance(entry, dict):
             ts = entry.get("ts") or 0.0
@@ -1909,9 +1803,7 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
                     },
                 )
 
-        # 2) Con lock para evitar descargas duplicadas
         async with app.state.thumb_cache_lock:
-            # re-check
             entry2 = thumb_cache.get(cache_key)
             now2 = time.monotonic()
             if isinstance(entry2, dict):
@@ -1929,11 +1821,8 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
             if not message or not message.media:
                 raise HTTPException(status_code=404, detail="Thumb no encontrado")
 
-            # Telethon: descargar thumb (si existe)
-            # thumb=-1 intenta el mejor disponible
             data = await client.download_media(message.media, file=bytes, thumb=-1)
             if not data:
-                # Si no hay thumb, devolvemos 404 (evita genéricos)
                 raise HTTPException(status_code=404, detail="Thumb no disponible")
 
             ct = _guess_image_content_type(data)
@@ -1958,12 +1847,6 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
 # ENDPOINT /stream/{message_id}  ✅ FIX STREAMING DEFINITIVO
 # ---------------------------------------------------------------------------
 def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | None:
-    """
-    Soporta: Range: bytes=start-end
-    - Si end falta → hasta fin
-    - Si start falta (suffix) → últimos N bytes
-    Devuelve (start, end) inclusivo, o None si no hay range.
-    """
     if not range_header:
         return None
     try:
@@ -1971,7 +1854,6 @@ def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, 
         if not rh.startswith("bytes="):
             return None
         spec = rh.replace("bytes=", "", 1).strip()
-        # Solo soportamos 1 rango (lo normal para reproductores)
         if "," in spec:
             spec = spec.split(",", 1)[0].strip()
 
@@ -1984,7 +1866,6 @@ def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, 
         if start_s == "" and end_s == "":
             return None
 
-        # suffix: bytes=-N
         if start_s == "" and end_s.isdigit():
             length = int(end_s)
             if length <= 0:
@@ -1995,7 +1876,6 @@ def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, 
             end = file_size - 1
             return (start, end)
 
-        # normal: bytes=start-end or bytes=start-
         if not start_s.isdigit():
             return None
         start = int(start_s)
@@ -2007,7 +1887,6 @@ def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, 
                 return None
             end = int(end_s)
 
-        # clamp
         if start < 0:
             start = 0
         if end >= file_size:
@@ -2044,7 +1923,6 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
         content_type = message.file.mime_type or "video/mp4"
 
         if byte_range is None:
-            # ✅ Respuesta completa (200) SIN Content-Range
             start = 0
             end = file_size - 1
             content_length = file_size
@@ -2078,12 +1956,10 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 media_type=content_type,
             )
 
-        # ✅ Respuesta parcial (206) HONRANDO start-end
         start, end = byte_range
         content_length = (end - start) + 1
 
         if content_length <= 0:
-            # 416
             return Response(
                 status_code=416,
                 content=b"",
