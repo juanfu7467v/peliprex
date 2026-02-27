@@ -33,8 +33,7 @@ GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
 # --- TMDB ---
 TMDB_API_KEY       = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_API_BASE      = "https://api.themoviedb.org/3"
-# 🔧 CAMBIO 1: Usar w342 para asegurar proporción de póster vertical (2:3)
-TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w342"
+TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w500"
 
 # --- TVMaze (gratuita, sin API key) ---
 TVMAZE_API_BASE    = "https://api.tvmaze.com"
@@ -69,27 +68,30 @@ CACHE_SAVE_EVERY      = 10
 # ---------------------------------------------------------------------------
 # STREAMING (FIX DEFINITIVO)
 # ---------------------------------------------------------------------------
-STREAM_CHUNK_SIZE = max(64 * 1024, min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024)))))
+STREAM_CHUNK_SIZE = max(
+    64 * 1024,
+    min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024))))
+)
 
 # ---------------------------------------------------------------------------
 # THUMBNAILS
 # ---------------------------------------------------------------------------
-THUMB_CACHE_TTL     = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
-THUMB_CACHE_MAX     = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
+THUMB_CACHE_TTL = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
+THUMB_CACHE_MAX = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
-SEARCH_CHANNEL_CACHE_TTL           = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
-SEARCH_CHANNEL_CACHE_LIMIT         = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
-SEARCH_CHANNEL_WARMUP_CONCURRENCY  = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
-SEARCH_CHANNEL_FETCH_TIMEOUT       = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
-CHANNELS_READY_MAX_WAIT_SEARCH     = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
+SEARCH_CHANNEL_CACHE_TTL          = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
+SEARCH_CHANNEL_CACHE_LIMIT        = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
+SEARCH_CHANNEL_WARMUP_CONCURRENCY = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
+SEARCH_CHANNEL_FETCH_TIMEOUT      = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
+CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 3: MÍNIMO DE RESULTADOS POR CATEGORÍA
+# ✅ NUEVO: MÍNIMO DE RESULTADOS POR CATEGORÍA
 # ---------------------------------------------------------------------------
-MINIMUM_GENRE_RESULTS = 15
+MIN_CATEGORY_RESULTS = 15
 
 # ---------------------------------------------------------------------------
 # CANALES DE RESPALDO
@@ -301,14 +303,14 @@ def _cache_key_from_query(query_title: str, year) -> str:
 def _thumb_cache_prune(cache: dict):
     try:
         if len(cache) > THUMB_CACHE_MAX:
-            keys_to_remove = list(cache.keys())[:len(cache) - THUMB_CACHE_MAX]
-            for key in keys_to_remove:
-                cache.pop(key, None)
+            excess = len(cache) - THUMB_CACHE_MAX
+            for k in list(cache.keys())[:excess]:
+                del cache[k]
     except Exception:
         pass
 
 
-def _detect_content_type(data: bytes) -> str:
+def _detect_mime_type(data: bytes) -> str:
     if not data:
         return "image/jpeg"
     if data.startswith(b"\xff\xd8\xff"):
@@ -363,7 +365,7 @@ def _is_placeholder_image(url) -> bool:
     return (not u) or (u == PLACEHOLDER_IMAGE_BASE)
 
 
-def _youtube_thumb_from_stream_url(stream_url) -> str | None:
+def _youtube_thumb_from_stream_url(stream_url):
     try:
         if not stream_url:
             return None
@@ -372,58 +374,14 @@ def _youtube_thumb_from_stream_url(stream_url) -> str | None:
             qs = parse_qs(parsed.query or "")
             vid = (qs.get("v") or [None])[0]
             if vid:
-                # 🔧 CAMBIO 1: Usar mqdefault para miniaturas más cuadradas/verticales
-                return f"https://img.youtube.com/vi/{vid}/mqdefault.jpg"
+                return f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
         if "youtu.be/" in stream_url:
             vid = stream_url.rstrip("/").split("/")[-1]
             if vid:
-                return f"https://img.youtube.com/vi/{vid}/mqdefault.jpg"
+                return f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
         return None
     except Exception:
         return None
-
-
-# ---------------------------------------------------------------------------
-# 🔧 CAMBIO 2: MINIATURA REPRESENTATIVA COMO ÚLTIMO RECURSO
-# Busca en YouTube una imagen relacionada con el título del contenido
-# ---------------------------------------------------------------------------
-async def _get_representative_thumbnail(title: str, year=None) -> str:
-    """
-    Obtiene una miniatura representativa del contenido buscando en YouTube.
-    Se usa ÚNICAMENTE como último recurso cuando ninguna otra fuente provee imagen.
-    Retorna PLACEHOLDER_IMAGE_BASE si no encuentra nada.
-    """
-    if not YOUTUBE_API_KEY or not title:
-        return PLACEHOLDER_IMAGE_BASE
-    try:
-        year_hint = f" {year}" if year else ""
-        query = f"{title}{year_hint} película trailer oficial".strip()
-        url = "https://www.googleapis.com/youtube/v3/search"
-        params = {
-            "part":       "snippet",
-            "q":          query,
-            "key":        YOUTUBE_API_KEY,
-            "type":       "video",
-            "maxResults": 1,
-        }
-        async with httpx.AsyncClient(timeout=3.0) as http:
-            r = await http.get(url, params=params)
-            r.raise_for_status()
-            data  = r.json()
-        items = data.get("items") or []
-        if not items:
-            return PLACEHOLDER_IMAGE_BASE
-        first    = items[0]
-        video_id = ((first.get("id") or {}).get("videoId")) or ""
-        if not video_id:
-            return PLACEHOLDER_IMAGE_BASE
-        # Usar mqdefault (320x180) que tiene mejor proporción que hqdefault
-        thumb = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
-        print(f"   🖼️  Miniatura representativa para '{title}': {thumb}")
-        return thumb
-    except Exception as e:
-        print(f"⚠️  _get_representative_thumbnail error ({title}): {e}")
-        return PLACEHOLDER_IMAGE_BASE
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +451,10 @@ async def lifespan(app: FastAPI):
                             pass
 
                 entities = getattr(app.state, "entities", [])
-                await asyncio.gather(*[_warm_one(i, e) for i, e in enumerate(entities)],
-                                     return_exceptions=True)
+                await asyncio.gather(
+                    *[_warm_one(i, e) for i, e in enumerate(entities)],
+                    return_exceptions=True
+                )
                 print("⚡ Warm-up de caché por canal completado")
             except Exception as ex:
                 print(f"⚠️  Warm-up caché por canal falló: {ex}")
@@ -563,7 +523,7 @@ def _extract_title_from_caption(caption: str) -> str:
         else:
             first_line = first_line[:_MAX_TITLE_LEN].strip()
 
-    return first_line or "Película"
+    return first_line.strip() or "Película"
 
 
 def extract_chapter_number(result: dict) -> int:
@@ -622,26 +582,6 @@ async def youtube_fallback(youtube_query: str) -> list:
 # ---------------------------------------------------------------------------
 _ROMAN_RE = r"(?:I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|XVI|XVII|XVIII|XIX|XX)"
 
-
-def _strip_decorations(title: str) -> str:
-    t = (title or "").strip()
-    t = re.sub(r'\[([^\]]*)\]\(https?://[^\)]*\)', r'\1', t)
-    t = re.sub(r'\]\s*\(https?://[^\)]*\)', '', t)
-    t = re.sub(r'https?://\S+', '', t)
-    t = re.sub(r'[\[\]]', '', t)
-    t = re.sub(r"[*_`]+", "", t)
-    t = re.sub(r"^#+\s*", "", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def _extract_year_from_title(title: str):
-    if not title:
-        return None
-    m = re.search(r"(?:\(|\b)(19\d{2}|20\d{2})(?:\)|\b)", title)
-    return m.group(1) if m else None
-
-
 _NOISE_PATTERNS = [
     r"\bdoblaje\s+latino\b",
     r"\bcastellano\b",
@@ -657,6 +597,24 @@ _NOISE_PATTERNS = [
     r"\bsub\s+espa[ñn]ol\b",
     r"\bsub\s+español\b",
 ]
+
+
+def _strip_decorations(title: str) -> str:
+    t = (title or "").strip()
+    t = re.sub(r'\]\s*\(https?://[^\)]*\)', '', t)
+    t = re.sub(r'https?://\S+', '', t)
+    t = re.sub(r'[\[\]]', '', t)
+    t = re.sub(r"[*_`]+", "", t)
+    t = re.sub(r"^[#]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _extract_year_from_title(title: str):
+    if not title:
+        return None
+    m = re.search(r"(?:\(|\b)(19\d{2}|20\d{2})(?:\)|\b)", title)
+    return m.group(1) if m else None
 
 
 def _remove_bracketed_text(s: str) -> str:
@@ -750,7 +708,8 @@ async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) ->
 
 
 async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = False) -> list:
-    now   = time.monotonic()
+    now = time.monotonic()
+
     cache = getattr(app.state, "search_channel_media_cache", None)
     if not isinstance(cache, dict):
         return []
@@ -761,12 +720,11 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
             ts    = entry.get("ts") or 0.0
             items = entry.get("items") or []
             if items and (now - ts) < SEARCH_CHANNEL_CACHE_TTL:
-                return items
+                return list(items)
 
     locks = getattr(app.state, "search_channel_cache_locks", {})
     if ch_index not in locks:
         locks[ch_index] = asyncio.Lock()
-        app.state.search_channel_cache_locks = locks
 
     async with locks[ch_index]:
         if not force_refresh:
@@ -775,26 +733,26 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
                 ts    = entry.get("ts") or 0.0
                 items = entry.get("items") or []
                 if items and (now - ts) < SEARCH_CHANNEL_CACHE_TTL:
-                    return items
+                    return list(items)
+
         try:
             items = await asyncio.wait_for(
                 _fetch_recent_media_from_channel(ch_index, entity, SEARCH_CHANNEL_CACHE_LIMIT),
                 timeout=SEARCH_CHANNEL_FETCH_TIMEOUT,
             )
-        except asyncio.TimeoutError:
-            items = (cache.get(ch_index) or {}).get("items") or []
-        except Exception:
+        except (asyncio.TimeoutError, Exception) as e:
+            print(f"⚠️  Error/timeout fetching channel [{ch_index}]: {e}")
             items = []
 
         cache[ch_index] = {"ts": time.monotonic(), "items": items}
-        return items
+        return list(items)
 
 
 # ---------------------------------------------------------------------------
-# FORMATO JSON SCHEMA PELICULAS
+# NORMALIZACIÓN DEL ESQUEMA JSON DE RESPUESTA
 # ---------------------------------------------------------------------------
 def _to_peliculas_json_schema(items: list) -> list:
-    out: list = []
+    out = []
     for it in (items or []):
         titulo       = it.get("titulo") or it.get("title") or it.get("nombre") or "Película"
         imagen_url   = it.get("imagen_url") or PLACEHOLDER_IMAGE_BASE
@@ -840,7 +798,7 @@ def _to_peliculas_json_schema(items: list) -> list:
 # FILTROS AVANZADOS POST-ENRIQUECIMIENTO
 # ---------------------------------------------------------------------------
 def _apply_advanced_filters(
-    results,
+    results:  list,
     year=None,
     genre=None,
     language=None,
@@ -905,7 +863,11 @@ async def _noop():
 # ---------------------------------------------------------------------------
 # GOOGLE KNOWLEDGE GRAPH
 # ---------------------------------------------------------------------------
-async def _google_kg_search(http: httpx.AsyncClient, query_title: str, year) -> dict | None:
+async def _google_kg_search(
+    http,
+    query_title: str,
+    year,
+):
     if not GOOGLE_KG_API_KEY:
         return None
     try:
@@ -916,30 +878,24 @@ async def _google_kg_search(http: httpx.AsyncClient, query_title: str, year) -> 
             return d.get(key, default) if isinstance(d, dict) else default
 
         def _first_dict(x):
-            if isinstance(x, dict):
-                return x
+            if isinstance(x, dict): return x
             if isinstance(x, list):
                 for it in x:
-                    if isinstance(it, dict):
-                        return it
+                    if isinstance(it, dict): return it
             return None
 
         def _coerce_text(x) -> str:
-            if x is None:
-                return ""
-            if isinstance(x, str):
-                return x
+            if x is None:          return ""
+            if isinstance(x, str): return x
             if isinstance(x, dict):
                 for k in ("@value", "name", "articleBody"):
                     v = x.get(k)
-                    if _is_str(v):
-                        return v
+                    if _is_str(v): return v
                 return str(x)
             if isinstance(x, list):
                 for it in x:
                     t = _coerce_text(it)
-                    if _is_str(t):
-                        return t
+                    if _is_str(t): return t
                 return ""
             return str(x)
 
@@ -948,24 +904,18 @@ async def _google_kg_search(http: httpx.AsyncClient, query_title: str, year) -> 
             return s.strip() if isinstance(s, str) else ""
 
         def _extract_types(x) -> list:
-            if isinstance(x, list):
-                return [t for t in x if isinstance(t, str)]
-            if isinstance(x, str):
-                return [x]
+            if isinstance(x, list): return [t for t in x if isinstance(t, str)]
+            if isinstance(x, str):  return [x]
             return []
 
         def _extract_image_url(image_field):
             img = image_field
-            if isinstance(img, list):
-                img = _first_dict(img) or {}
-            if not isinstance(img, dict):
-                return None
+            if isinstance(img, list): img = _first_dict(img) or {}
+            if not isinstance(img, dict): return None
             c1 = _strip_text(img.get("contentUrl"))
-            if _is_str(c1):
-                return c1
+            if _is_str(c1): return c1
             c2 = _strip_text(img.get("url"))
-            if _is_str(c2):
-                return c2
+            if _is_str(c2): return c2
             return None
 
         def _extract_article_body(best: dict) -> str:
@@ -983,20 +933,16 @@ async def _google_kg_search(http: httpx.AsyncClient, query_title: str, year) -> 
             names = []
 
             def _add(g):
-                if g is None:
-                    return
+                if g is None: return
                 if isinstance(g, str) and g.strip():
-                    names.append(g.strip())
-                    return
+                    names.append(g.strip()); return
                 if isinstance(g, dict):
                     for k in ("name", "@value"):
                         s = g.get(k)
                         if isinstance(s, str) and s.strip():
-                            names.append(s.strip())
-                            return
+                            names.append(s.strip()); return
                 if isinstance(g, list):
-                    for it in g:
-                        _add(it)
+                    for it in g: _add(it)
 
             _add(raw)
             return ", ".join(n for n in names if n) or None
@@ -1019,27 +965,22 @@ async def _google_kg_search(http: httpx.AsyncClient, query_title: str, year) -> 
         best = None
         for item in items:
             res = item.get("result") if isinstance(item, dict) else None
-            if not isinstance(res, dict):
-                continue
+            if not isinstance(res, dict): continue
             sd = _strip_text(res.get("startDate"))
             if year and _is_str(sd) and sd.startswith(year):
-                best = res
-                break
+                best = res; break
         if best is None:
             for item in items:
                 res = item.get("result") if isinstance(item, dict) else None
-                if isinstance(res, dict):
-                    best = res
-                    break
+                if isinstance(res, dict): best = res; break
         if not isinstance(best, dict) or not best:
             return None
 
-        name             = _strip_text(best.get("name")) or query_title
-        short_desc       = _strip_text(best.get("description"))
-        article_body     = _extract_article_body(best)
-        sinopsis         = (article_body or short_desc).strip() or None
-        if not _is_str(sinopsis):
-            sinopsis = None
+        name         = _strip_text(best.get("name")) or query_title
+        short_desc   = _strip_text(best.get("description"))
+        article_body = _extract_article_body(best)
+        sinopsis     = (article_body or short_desc).strip() or None
+        if not _is_str(sinopsis): sinopsis = None
 
         imagen_url        = _extract_image_url(best.get("image"))
         start_date_raw    = best.get("startDate")
@@ -1079,14 +1020,12 @@ async def _google_kg_search(http: httpx.AsyncClient, query_title: str, year) -> 
 
 # ---------------------------------------------------------------------------
 # TMDB
-# 🔧 CAMBIO 1: Usar SOLO poster_path (formato vertical tipo póster)
-#              Se elimina el fallback a backdrop_path (panorámico/landscape)
 # ---------------------------------------------------------------------------
 async def _tmdb_search_and_details(
-    http: httpx.AsyncClient,
+    http,
     query_title: str,
     year,
-) -> dict | None:
+):
     if not TMDB_API_KEY:
         return None
     try:
@@ -1127,6 +1066,7 @@ async def _tmdb_search_and_details(
             details       = d.json()
             title         = details.get("title") or details.get("original_title") or query_title
             poster_path   = details.get("poster_path")
+            backdrop_path = details.get("backdrop_path")
             overview      = details.get("overview")
             release_date  = details.get("release_date")
             runtime       = details.get("runtime")
@@ -1141,6 +1081,7 @@ async def _tmdb_search_and_details(
             details       = d.json()
             title         = details.get("name") or details.get("original_name") or query_title
             poster_path   = details.get("poster_path")
+            backdrop_path = details.get("backdrop_path")
             overview      = details.get("overview")
             release_date  = details.get("first_air_date")
             run_list      = details.get("episode_run_time") or []
@@ -1151,17 +1092,14 @@ async def _tmdb_search_and_details(
             genres_list   = details.get("genres") or []
             tagline       = details.get("tagline")
 
-        genres = ", ".join(g.get("name") for g in genres_list if g.get("name")) or None
-
-        # 🔧 CAMBIO 1: Solo usar poster_path (vertical, 2:3 ratio tipo póster TMDB)
-        # NO usar backdrop_path que es panorámico (16:9 landscape)
-        image_url = f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else None
-
+        genres    = ", ".join(g.get("name") for g in genres_list if g.get("name")) or None
+        poster    = poster_path or backdrop_path
+        image_url = f"{TMDB_IMAGE_BASE}{poster}" if poster else None
         year_out  = (release_date[:4] if release_date else None) or year
 
         print(
             f"   🎬 TMDb → '{title}' [{media_type}] "
-            f"año={year_out} img={'✓' if image_url else '✗'} (solo poster)"
+            f"año={year_out} img={'✓' if image_url else '✗'}"
         )
         return {
             "source":                "tmdb",
@@ -1188,10 +1126,10 @@ async def _tmdb_search_and_details(
 # TVMaze — gratuita, sin API key
 # ---------------------------------------------------------------------------
 async def _tvmaze_fetch(
-    http: httpx.AsyncClient,
+    http,
     query_title: str,
     year,
-) -> dict | None:
+):
     try:
         r = await http.get(
             f"{TVMAZE_API_BASE}/search/shows",
@@ -1207,8 +1145,7 @@ async def _tvmaze_fetch(
             for item in items:
                 show = item.get("show") or {}
                 if (show.get("premiered") or "").startswith(year):
-                    best_show = show
-                    break
+                    best_show = show; break
         if best_show is None and items:
             best_show = items[0].get("show") or {}
         if not best_show:
@@ -1266,11 +1203,11 @@ _GEMINI_CALL_COUNTER = {"count": 0}
 
 
 async def _gemini_complete_metadata(
-    http: httpx.AsyncClient,
+    http,
     title: str,
     year,
     existing_meta: dict,
-) -> dict | None:
+):
     if not GEMINI_API_KEY:
         return None
 
@@ -1324,9 +1261,8 @@ async def _gemini_complete_metadata(
         ) or ""
         text = text.strip()
 
-        # Limpiar bloques de código markdown si los hay
-        text = re.sub(r"```json\s*", "", text)
-        text = re.sub(r"\s*```",     "", text).strip()
+        text = re.sub(r"```(?:json)?", "", text)
+        text = re.sub(r"```\s*$",      "", text).strip()
 
         result = json.loads(text)
         if not isinstance(result, dict):
@@ -1359,15 +1295,13 @@ def _merge_metadata_with_kg(
     def pick(key: str):
         for src in text_sources:
             v = src.get(key)
-            if v is not None and v != "":
-                return v
+            if v is not None and v != "": return v
         return None
 
     def pick_image():
         for src in image_sources:
             v = src.get("imagen_url")
-            if v is not None and v != "":
-                return v
+            if v is not None and v != "": return v
         return None
 
     tmdb_id    = (tmdb.get("tmdb_id")      if isinstance(tmdb,   dict) else None) or \
@@ -1398,8 +1332,7 @@ def _merge_metadata_with_kg(
 # ---------------------------------------------------------------------------
 async def _meta_cache_get(cache_key: str):
     meta_cache = getattr(app.state, "meta_cache", None)
-    if not isinstance(meta_cache, dict):
-        return None
+    if not isinstance(meta_cache, dict): return None
     return meta_cache.get(cache_key)
 
 
@@ -1420,7 +1353,6 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
 
 # ---------------------------------------------------------------------------
 # ENRIQUECIMIENTO PRINCIPAL
-# 🔧 CAMBIO 2: Miniatura representativa como último recurso
 # ---------------------------------------------------------------------------
 async def enrich_results_with_tmdb(
     results: list,
@@ -1458,16 +1390,7 @@ async def enrich_results_with_tmdb(
                     if new_counter["n"] >= limit_new:
                         pelicula_url = r.get("stream_url") or ""
                         thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
-                        yt_img = _youtube_thumb_from_stream_url(pelicula_url)
-                        # 🔧 CAMBIO 2: Buscar miniatura representativa si no hay imagen
-                        if thumb:
-                            img_final = thumb
-                        elif yt_img:
-                            img_final = yt_img
-                        else:
-                            img_final = await _get_representative_thumbnail(
-                                fallback_title, fallback_year_title or year
-                            )
+                        img_final = thumb or _youtube_thumb_from_stream_url(pelicula_url) or _placeholder_image_for_title(fallback_title)
                         return {
                             "titulo":                fallback_title or "Película",
                             "imagen_url":            img_final,
@@ -1545,19 +1468,12 @@ async def enrich_results_with_tmdb(
             thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
             yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
 
-            # 🔧 CAMBIO 2: Prioridad de imagen:
-            # 1. Imagen TMDB/KG/TVMaze (poster vertical)
-            # 2. Miniatura Telegram (thumbnail del video)
-            # 3. Miniatura YouTube (del URL si es YouTube)
-            # 4. Búsqueda en YouTube por título (representativa)
-            imagen_url = meta_img or thumb_img or yt_img
-            if not imagen_url or _is_placeholder_image(imagen_url):
-                rep_title = (meta.get("titulo") if isinstance(meta, dict) else None) or fallback_title
-                rep_year  = (meta.get("año")    if isinstance(meta, dict) else None) or year
-                imagen_url = await _get_representative_thumbnail(rep_title, rep_year)
+            imagen_url = meta_img or thumb_img or yt_img or _placeholder_image_for_title(
+                meta.get("titulo") if isinstance(meta, dict) else fallback_title
+            )
 
-            descripcion  = (meta.get("sinopsis") if isinstance(meta, dict) else None) or "Sin descripción disponible."
-            year_out     = (meta.get("año") if isinstance(meta, dict) else None) or fallback_year_title or year or "N/A"
+            descripcion = (meta.get("sinopsis") if isinstance(meta, dict) else None) or "Sin descripción disponible."
+            year_out    = (meta.get("año") if isinstance(meta, dict) else None) or fallback_year_title or year or "N/A"
 
             return {
                 "titulo":                _nn_str(meta.get("titulo") if isinstance(meta, dict) else None, fallback_title or "Película"),
@@ -1639,92 +1555,6 @@ def _format_results_without_apis(final_results: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 3: COMPLEMENTAR RESULTADOS PARA GARANTIZAR MÍNIMO POR CATEGORÍA
-# ---------------------------------------------------------------------------
-async def _complement_genre_results(
-    current: list,
-    genre: str,
-    entities: list,
-    already_indexed: list,
-    year=None,
-    language=None,
-    desde=None,
-    hasta=None,
-) -> list:
-    """
-    Complementa los resultados de una búsqueda por categoría hasta alcanzar
-    MINIMUM_GENRE_RESULTS. Busca en canales adicionales no usados previamente.
-    No modifica la lógica existente, solo agrega resultados si faltan.
-    """
-    if len(current) >= MINIMUM_GENRE_RESULTS:
-        return current
-
-    needed = MINIMUM_GENRE_RESULTS - len(current)
-    print(f"⚡ Complementando '{genre}': {len(current)}/{MINIMUM_GENRE_RESULTS} → necesito {needed} más")
-
-    already_indexed_set = {i for i, _ in already_indexed}
-    existing_urls       = {r.get("pelicula_url", "") for r in current}
-    existing_titles     = {normalize_title(r.get("titulo", "")) for r in current}
-
-    # Buscar en canales que no se usaron en la búsqueda principal
-    extra_entities = [
-        (i, e) for i, e in enumerate(entities)
-        if e is not None and i not in already_indexed_set
-    ]
-
-    # Si ya se usaron todos los canales, reutilizar los primeros 5
-    if not extra_entities:
-        extra_entities = [(i, e) for i, e in enumerate(entities) if e is not None][:5]
-
-    extra_raw: list = []
-    for ch_i, ch_e in extra_entities:
-        if len(extra_raw) >= needed * 4:
-            break
-        try:
-            ch_results = await asyncio.wait_for(
-                _get_recent_media_cached(ch_i, ch_e),
-                timeout=2.5,
-            )
-            for item in ch_results:
-                url        = item.get("stream_url", "")
-                title_norm = normalize_title(item.get("title", ""))
-                if url not in existing_urls and title_norm not in existing_titles:
-                    extra_raw.append(item)
-                    existing_urls.add(url)
-                    existing_titles.add(title_norm)
-        except Exception as ex:
-            print(f"⚠️  Complemento género, error canal [{ch_i}]: {ex}")
-
-    if not extra_raw:
-        print(f"⚠️  Sin canales adicionales disponibles para complementar '{genre}'")
-        return current
-
-    extra_raw = extra_raw[:needed * 3]
-
-    try:
-        extra_enriched = await asyncio.wait_for(
-            enrich_results_with_tmdb(extra_raw, max_new=needed * 2),
-            timeout=3.5,
-        )
-    except asyncio.TimeoutError:
-        print(f"⚠️  Timeout complementando '{genre}' — usando formato básico")
-        extra_enriched = _format_results_without_apis(extra_raw[:needed])
-
-    # Agregar hasta alcanzar el mínimo (sin re-filtrar por género en el complemento)
-    seen_urls_final = {r.get("pelicula_url", "") for r in current}
-    for item in extra_enriched:
-        if len(current) >= MINIMUM_GENRE_RESULTS:
-            break
-        item_url = item.get("pelicula_url", "")
-        if item_url not in seen_urls_final:
-            current.append(item)
-            seen_urls_final.add(item_url)
-
-    print(f"✅ Categoría '{genre}': {len(current)} resultados finales (mínimo: {MINIMUM_GENRE_RESULTS})")
-    return current
-
-
-# ---------------------------------------------------------------------------
 # ENDPOINT /search
 # ---------------------------------------------------------------------------
 @app.get("/search")
@@ -1752,43 +1582,42 @@ async def search(
             detail="El parámetro 'q' debe tener al menos 3 caracteres",
         )
 
+    _GEMINI_CALL_COUNTER["count"] = 0
+
     try:
-        deadline = time.monotonic() + CHANNELS_READY_MAX_WAIT_SEARCH
-        while not getattr(app.state, "channels_ready", False) and time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
+        # Esperar a que los canales estén listos
+        if not getattr(app.state, "channels_ready", False):
+            waited = 0.0
+            while not getattr(app.state, "channels_ready", False) and waited < CHANNELS_READY_MAX_WAIT_SEARCH:
+                await asyncio.sleep(0.3)
+                waited += 0.3
 
         entities = getattr(app.state, "entities", [app.state.entity])
+        all_entities_indexed = [(i, e) for i, e in enumerate(entities) if e is not None]
 
-        # Determinar qué canales buscar según parámetros
+        # Determinar qué canales buscar
         if canal:
-            canal_lower = canal.strip().lstrip("@").lower()
+            canal_clean = canal.strip().lstrip('@').lower()
             entities_indexed = [
-                (i, e) for i, e in enumerate(entities)
-                if e is not None and (
-                    (getattr(e, "username", None) or "").lower() == canal_lower
-                    or canal_lower in (getattr(e, "username", None) or "").lower()
-                )
+                (i, e) for i, e in all_entities_indexed
+                if (getattr(e, 'username', '') or '').lower() == canal_clean
             ]
             if not entities_indexed:
-                entities_indexed = [(i, e) for i, e in enumerate(entities) if e is not None]
+                entities_indexed = all_entities_indexed[:1]
         elif genre:
             genre_channels = _get_genre_channels(genre)
             if genre_channels:
-                genre_ch_lower = set(ch.lstrip("@").lower() for ch in genre_channels)
+                genre_usernames = [gc.lstrip('@').lower() for gc in genre_channels]
                 entities_indexed = [
-                    (i, e) for i, e in enumerate(entities)
-                    if e is not None and (
-                        (getattr(e, "username", None) or "").lower() in genre_ch_lower
-                    )
+                    (i, e) for i, e in all_entities_indexed
+                    if (getattr(e, 'username', '') or '').lower() in genre_usernames
                 ]
                 if not entities_indexed:
-                    entities_indexed = [(i, e) for i, e in enumerate(entities) if e is not None]
+                    entities_indexed = all_entities_indexed
             else:
-                entities_indexed = [(i, e) for i, e in enumerate(entities) if e is not None]
+                entities_indexed = all_entities_indexed
         else:
-            entities_indexed = [(i, e) for i, e in enumerate(entities) if e is not None]
-
-        _GEMINI_CALL_COUNTER["count"] = 0
+            entities_indexed = all_entities_indexed
 
         async def search_in_channel(ch_index: int, entity) -> list:
             if entity is None:
@@ -1797,6 +1626,7 @@ async def search(
             try:
                 if q:
                     msg_iter = client.iter_messages(entity, search=q.strip())
+
                     async for message in msg_iter:
                         if message.media and (message.video or message.document):
                             caption     = message.text or ""
@@ -1836,13 +1666,54 @@ async def search(
         for result in all_results:
             key = normalize_title(result["title"])
             if key not in seen:
-                seen.add(key)
-                unique.append(result)
+                seen.add(key); unique.append(result)
 
         unique.sort(key=extract_chapter_number)
         final_results = unique[:50]
 
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
+
+        # ✅ NUEVO: Complementar hasta mínimo MIN_CATEGORY_RESULTS cuando se busca por categoría
+        if genre and len(final_results) < MIN_CATEGORY_RESULTS:
+            print(
+                f"⚠️  Categoría '{genre}': solo {len(final_results)} resultado(s). "
+                f"Complementando hasta {MIN_CATEGORY_RESULTS}..."
+            )
+            searched_indices = {i for i, _ in entities_indexed}
+            remaining_entities = [
+                (i, e) for i, e in all_entities_indexed
+                if i not in searched_indices and e is not None
+            ]
+            seen_keys = {normalize_title(r["title"]) for r in final_results}
+
+            async def _fetch_supplement(ch_index: int, entity) -> list:
+                out = []
+                try:
+                    cached = await _get_recent_media_cached(ch_index, entity)
+                    for msg in cached:
+                        key = normalize_title(msg.get("title", ""))
+                        if key not in seen_keys:
+                            out.append(msg)
+                except Exception as ex:
+                    print(f"⚠️  Error complementando canal [{ch_index}]: {ex}")
+                return out
+
+            supplement_tasks = [_fetch_supplement(i, e) for i, e in remaining_entities]
+            supplement_raw   = await asyncio.gather(*supplement_tasks, return_exceptions=True)
+
+            for item in supplement_raw:
+                if isinstance(item, list):
+                    for r in item:
+                        key = normalize_title(r.get("title", ""))
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            final_results.append(r)
+                        if len(final_results) >= MIN_CATEGORY_RESULTS:
+                            break
+                if len(final_results) >= MIN_CATEGORY_RESULTS:
+                    break
+
+            print(f"✅ Complemento aplicado: ahora {len(final_results)} resultado(s)")
 
         if not final_results and q:
             print("🟦 Sin resultados en Telegram. Usando respaldo YouTube...")
@@ -1858,12 +1729,6 @@ async def search(
                     enriched = _format_results_without_apis(yt_results)
                 if any([year, genre, language, desde, hasta]):
                     enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
-                # 🔧 CAMBIO 3: Garantía mínima también en fallback YouTube
-                if genre and len(enriched) < MINIMUM_GENRE_RESULTS:
-                    enriched = await _complement_genre_results(
-                        enriched, genre, entities, entities_indexed,
-                        year, language, desde, hasta
-                    )
                 return _to_peliculas_json_schema(enriched)
 
         try:
@@ -1878,13 +1743,6 @@ async def search(
         if any([year, genre, language, desde, hasta]):
             enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
             print(f"🔎 Filtros avanzados aplicados → {len(enriched)} resultado(s)")
-
-        # 🔧 CAMBIO 3: Garantizar mínimo de MINIMUM_GENRE_RESULTS en búsquedas por categoría
-        if genre and len(enriched) < MINIMUM_GENRE_RESULTS:
-            enriched = await _complement_genre_results(
-                enriched, genre, entities, entities_indexed,
-                year, language, desde, hasta
-            )
 
         return _to_peliculas_json_schema(enriched)
 
@@ -1901,19 +1759,18 @@ async def search(
 @app.get("/catalog")
 async def catalog():
     try:
-        now        = time.monotonic()
-        pool_cache = getattr(app.state, "catalog_pool_cache", None) or {"ts": 0.0, "pool": []}
-        cached_ts  = pool_cache.get("ts")   or 0.0
-        cached_pool= pool_cache.get("pool") or []
+        now         = time.monotonic()
+        pool_cache  = getattr(app.state, "catalog_pool_cache", None) or {"ts": 0.0, "pool": []}
+        cached_ts   = pool_cache.get("ts")   or 0.0
+        cached_pool = pool_cache.get("pool") or []
 
-        if isinstance(cached_pool, list) and (now - cached_ts) < CATALOG_POOL_TTL and cached_pool:
+        if isinstance(cached_pool, list) and len(cached_pool) > 0 and (now - cached_ts) < CATALOG_POOL_TTL:
             pool = cached_pool
         else:
             fetch_sem = asyncio.Semaphore(CATALOG_FETCH_CONCURRENCY)
 
             async def fetch_from_channel(ch_index: int, entity) -> list:
-                if entity is None:
-                    return []
+                if entity is None: return []
                 results = []
                 try:
                     async with fetch_sem:
@@ -1934,50 +1791,50 @@ async def catalog():
                                     ),
                                     "stream_url": direct_link,
                                 })
-                                if len(results) >= 30:
-                                    break
+                                if len(results) >= 30: break
                 except Exception as e:
                     print(f"⚠️  Error en canal [{ch_index}] para /catalog: {e}")
                 return results
 
             deadline = time.monotonic() + 15.0
             while not getattr(app.state, "channels_ready", False) and time.monotonic() < deadline:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
 
-            entities = getattr(app.state, "entities", [app.state.entity])
-            tasks    = [fetch_from_channel(i, e) for i, e in enumerate(entities) if e is not None]
-            raw      = await asyncio.gather(*tasks, return_exceptions=True)
+            entities  = getattr(app.state, "entities", [app.state.entity])
+            all_tasks = [
+                fetch_from_channel(i, e)
+                for i, e in enumerate(entities)
+                if e is not None
+            ]
+            raw = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-            pool_raw: list = []
+            pool      = []
+            seen_keys = set()
             for item in raw:
                 if isinstance(item, list):
-                    pool_raw.extend(item)
+                    for r in item:
+                        key = normalize_title(r.get("title", ""))
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            pool.append(r)
 
-            seen_cat, unique_pool = set(), []
-            for r in pool_raw:
-                key = normalize_title(r.get("title", ""))
-                if key not in seen_cat:
-                    seen_cat.add(key)
-                    unique_pool.append(r)
+            random.shuffle(pool)
+            app.state.catalog_pool_cache = {"ts": time.monotonic(), "pool": pool}
 
-            random.shuffle(unique_pool)
-            pool = unique_pool[:100]
-
-            app.state.catalog_pool_cache = {"ts": now, "pool": pool}
+        sample_size = min(50, len(pool))
+        sample      = random.sample(pool, sample_size) if sample_size > 0 else []
 
         try:
             enriched = await asyncio.wait_for(
-                enrich_results_with_tmdb(pool, max_new=MAX_ENRICH_NEW),
+                enrich_results_with_tmdb(sample, max_new=MAX_ENRICH_NEW),
                 timeout=8.0,
             )
         except asyncio.TimeoutError:
             print("⚠️  /catalog enrichment timeout — devolviendo formato básico")
-            enriched = _format_results_without_apis(pool)
+            enriched = _format_results_without_apis(sample)
 
         return _to_peliculas_json_schema(enriched)
 
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"❌ Error en /catalog: {e}")
         return {"error": str(e)}
@@ -1989,19 +1846,15 @@ async def catalog():
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
     try:
-        cache_key = f"{ch}:{message_id}"
+        thumb_cache = getattr(app.state, "thumb_cache", {})
+        cache_key   = f"{message_id}:{ch}"
 
         async with app.state.thumb_cache_lock:
-            _thumb_cache_prune(app.state.thumb_cache)
-            cached = app.state.thumb_cache.get(cache_key)
+            cached = thumb_cache.get(cache_key)
             if cached:
-                ts, data, ct = cached
+                ts, data, mime = cached
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
-                    return Response(
-                        content=data,
-                        media_type=ct,
-                        headers={"Cache-Control": f"public, max-age={THUMB_CACHE_TTL}"},
-                    )
+                    return Response(content=data, media_type=mime)
 
         entities = getattr(app.state, "entities", [app.state.entity])
         entity   = (
@@ -2009,33 +1862,44 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if (0 <= ch < len(entities) and entities[ch] is not None)
             else app.state.entity
         )
-        if entity is None:
-            raise HTTPException(status_code=404, detail="Canal no disponible")
 
         message = await client.get_messages(entity, ids=message_id)
-        if not message or not message.media:
-            raise HTTPException(status_code=404, detail="Mensaje no encontrado")
+        if not message:
+            return Response(
+                status_code=302,
+                headers={"Location": PLACEHOLDER_IMAGE_BASE},
+            )
 
-        thumb_data = await client.download_media(message, thumb=-1, file=bytes)
+        thumb_data = None
+        if hasattr(message, 'photo') and message.photo:
+            thumb_data = await client.download_media(message.photo, bytes)
+        elif message.document and message.document.thumbs:
+            thumb_data = await client.download_media(
+                message.document.thumbs[-1], bytes
+            )
+
         if not thumb_data:
-            raise HTTPException(status_code=404, detail="Miniatura no disponible")
+            return Response(
+                status_code=302,
+                headers={"Location": PLACEHOLDER_IMAGE_BASE},
+            )
 
-        content_type = _detect_content_type(thumb_data)
+        mime = _detect_mime_type(thumb_data)
 
         async with app.state.thumb_cache_lock:
-            app.state.thumb_cache[cache_key] = (time.monotonic(), thumb_data, content_type)
+            _thumb_cache_prune(thumb_cache)
+            thumb_cache[cache_key] = (time.monotonic(), thumb_data, mime)
 
-        return Response(
-            content=thumb_data,
-            media_type=content_type,
-            headers={"Cache-Control": f"public, max-age={THUMB_CACHE_TTL}"},
-        )
+        return Response(content=thumb_data, media_type=mime)
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"⚠️  Error miniatura [{message_id}] ch={ch}: {e}")
-        raise HTTPException(status_code=500, detail="Error obteniendo miniatura")
+        print(f"⚠️  Error en /thumb/{message_id}: {e}")
+        return Response(
+            status_code=302,
+            headers={"Location": PLACEHOLDER_IMAGE_BASE},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2051,9 +1915,9 @@ def _parse_range_header(range_header, file_size: int):
         spec = rh.replace("bytes=", "", 1).strip()
         if "," in spec:
             spec = spec.split(",", 1)[0].strip()
+
         if "-" not in spec:
             return None
-
         start_s, end_s = spec.split("-", 1)
         start_s = start_s.strip()
         end_s   = end_s.strip()
@@ -2112,10 +1976,9 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
         if file_size <= 0:
             raise HTTPException(status_code=404, detail="Video no encontrado")
 
-        range_header = request.headers.get("range")
-        byte_range   = _parse_range_header(range_header, file_size)
-
-        content_type = message.file.mime_type or "video/mp4"
+        range_header  = request.headers.get("range")
+        byte_range    = _parse_range_header(range_header, file_size)
+        content_type  = message.file.mime_type or "video/mp4"
 
         if byte_range is None:
             start          = 0
@@ -2127,7 +1990,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                         message.media,
                         offset=offset,
                         limit=limit,
-                        chunk_size=STREAM_CHUNK_SIZE
+                        chunk_size=STREAM_CHUNK_SIZE,
                     ):
                         yield chunk
                 except asyncio.CancelledError:
@@ -2142,6 +2005,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 "Cache-Control":     "no-store",
                 "X-Accel-Buffering": "no",
             }
+
             return StreamingResponse(
                 chunk_generator_full(start, content_length),
                 status_code=200,
@@ -2165,7 +2029,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                     message.media,
                     offset=offset,
                     limit=limit,
-                    chunk_size=STREAM_CHUNK_SIZE
+                    chunk_size=STREAM_CHUNK_SIZE,
                 ):
                     yield chunk
             except asyncio.CancelledError:
@@ -2181,6 +2045,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             "Cache-Control":     "no-store",
             "X-Accel-Buffering": "no",
         }
+
         return StreamingResponse(
             chunk_generator_range(start, content_length),
             status_code=206,
