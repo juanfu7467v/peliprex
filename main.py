@@ -7,9 +7,9 @@ import random
 import json
 import httpx
 import time
-import io                    # 🔧 NUEVO
-import subprocess            # 🔧 NUEVO
-import tempfile              # 🔧 NUEVO
+import io
+import subprocess
+import tempfile
 from urllib.parse import quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# 🔧 NUEVO: Pillow con fallback gracioso
+# Pillow con fallback gracioso
 try:
     from PIL import Image as _PIL_Image
     _PIL_AVAILABLE = True
@@ -78,7 +78,7 @@ PERSISTENT_CACHE_PATH = "/data/cache_peliculas.json"
 CACHE_SAVE_EVERY      = 10
 
 # ---------------------------------------------------------------------------
-# STREAMING (FIX DEFINITIVO)
+# STREAMING
 # ---------------------------------------------------------------------------
 STREAM_CHUNK_SIZE = max(
     64 * 1024,
@@ -91,7 +91,7 @@ STREAM_CHUNK_SIZE = max(
 THUMB_CACHE_TTL = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
-# 🔧 NUEVO: Tamaño estándar de miniaturas
+# Tamaño estándar de miniaturas (formato vertical tipo TMDB)
 TARGET_THUMB_WIDTH  = 500
 TARGET_THUMB_HEIGHT = 750
 
@@ -105,7 +105,7 @@ SEARCH_CHANNEL_FETCH_TIMEOUT      = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOU
 CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
 
 # ---------------------------------------------------------------------------
-# ✅ NUEVO: MÍNIMO DE RESULTADOS POR CATEGORÍA
+# MÍNIMO DE RESULTADOS POR CATEGORÍA
 # ---------------------------------------------------------------------------
 MIN_CATEGORY_RESULTS = 15
 
@@ -339,7 +339,7 @@ def _detect_mime_type(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 🔧 NUEVO: Recortar/redimensionar imagen a 500x750 con cover mode
+# RECORTAR/REDIMENSIONAR IMAGEN A 500x750 CON COVER MODE
 # ---------------------------------------------------------------------------
 def _crop_cover_to_poster(image_data: bytes) -> bytes:
     """
@@ -402,7 +402,7 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# ✅ FIX MINIATURAS: _thumb_url_for_message valida que el ID sea numérico
+# FIX MINIATURAS: _thumb_url_for_message valida que el ID sea numérico
 # ---------------------------------------------------------------------------
 def _thumb_url_for_message(message_id, stream_url=None, ch=None):
     if not message_id:
@@ -425,9 +425,15 @@ def _is_placeholder_image(url) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 🔧 MODIFICADO: YouTube thumbnail apunta al proxy /ytthumb/{vid}
+# YouTube thumbnail apunta al proxy /ytthumb/{vid}
 # ---------------------------------------------------------------------------
 def _youtube_thumb_from_stream_url(stream_url):
+    """
+    Para URLs de YouTube, devuelve la URL del proxy interno /ytthumb/{vid}
+    que descarga y recorta la miniatura a 500x750.
+    Las miniaturas de YouTube NO se modifican directamente aquí,
+    solo se redirigen al proxy dedicado.
+    """
     try:
         if not stream_url:
             return None
@@ -436,12 +442,10 @@ def _youtube_thumb_from_stream_url(stream_url):
             qs = parse_qs(parsed.query or "")
             vid = (qs.get("v") or [None])[0]
             if vid:
-                # 🔧 Apunta al proxy interno que recorta a 500x750
                 return _build_public_url(f"/ytthumb/{vid}")
         if "youtu.be/" in stream_url:
             vid = stream_url.rstrip("/").split("/")[-1]
             if vid:
-                # 🔧 Apunta al proxy interno que recorta a 500x750
                 return _build_public_url(f"/ytthumb/{vid}")
         return None
     except Exception:
@@ -449,7 +453,7 @@ def _youtube_thumb_from_stream_url(stream_url):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 NUEVO: Extrae un frame real del video Telegram cuando no hay miniatura
+# EXTRAE UN FRAME REAL DEL VIDEO TELEGRAM CUANDO NO HAY MINIATURA
 # ---------------------------------------------------------------------------
 async def _extract_video_frame(message) -> bytes | None:
     """
@@ -462,7 +466,7 @@ async def _extract_video_frame(message) -> bytes | None:
     vf_path  = None
     out_path = None
     try:
-        # --- 1. Descargar porción inicial del video ---
+        # 1. Descargar porción inicial del video
         chunks = []
         total  = 0
         async for chunk in client.iter_download(
@@ -481,21 +485,21 @@ async def _extract_video_frame(message) -> bytes | None:
 
         video_data = b"".join(chunks)
 
-        # --- 2. Escribir a archivo temporal ---
+        # 2. Escribir a archivo temporal
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(video_data)
             vf_path = vf.name
 
         out_path = vf_path + "_frame.jpg"
 
-        # --- 3. Ejecutar ffmpeg para extraer frame ---
+        # 3. Ejecutar ffmpeg para extraer frame en el segundo 2
         def _run_ffmpeg():
             try:
                 result = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-i",      vf_path,
-                        "-ss",     "00:00:02",   # Frame en el segundo 2
+                        "-i",       vf_path,
+                        "-ss",      "00:00:02",
                         "-vframes", "1",
                         out_path,
                     ],
@@ -533,7 +537,7 @@ async def _extract_video_frame(message) -> bytes | None:
         print(f"⚠️  Error en _extract_video_frame (msg {getattr(message, 'id', '?')}): {e}")
         return None
     finally:
-        # --- 4. Limpieza de archivos temporales ---
+        # 4. Limpieza de archivos temporales
         for p in [vf_path, out_path]:
             if p:
                 try:
@@ -591,7 +595,7 @@ async def lifespan(app: FastAPI):
         backup_entities = await asyncio.gather(
             *[_load_one(ch) for ch in BACKUP_CHANNELS]
         )
-        app.state.entities    = [app.state.entity] + list(backup_entities)
+        app.state.entities       = [app.state.entity] + list(backup_entities)
         app.state.channels_ready = True
         loaded = sum(1 for e in app.state.entities if e is not None)
         print(f"✅ Todos los canales cargados: {loaded} disponibles")
@@ -1832,7 +1836,7 @@ async def search(
 
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
 
-        # ✅ NUEVO: Complementar hasta mínimo MIN_CATEGORY_RESULTS cuando se busca por categoría
+        # Complementar hasta mínimo MIN_CATEGORY_RESULTS cuando se busca por categoría
         if genre and len(final_results) < MIN_CATEGORY_RESULTS:
             print(
                 f"⚠️  Categoría '{genre}': solo {len(final_results)} resultado(s). "
@@ -2000,8 +2004,9 @@ async def catalog():
 
 
 # ---------------------------------------------------------------------------
-# 🔧 NUEVO ENDPOINT: /ytthumb/{video_id}
+# ENDPOINT /ytthumb/{video_id}
 # Proxy que descarga la miniatura de YouTube y la recorta a 500x750
+# (Las miniaturas de YouTube se sirven aquí; NO se alteran en ningún otro lugar)
 # ---------------------------------------------------------------------------
 @app.get("/ytthumb/{video_id}")
 async def youtube_thumbnail_proxy(video_id: str):
@@ -2023,8 +2028,8 @@ async def youtube_thumbnail_proxy(video_id: str):
         try:
             async with httpx.AsyncClient(timeout=5.0) as http:
                 r = await http.get(url)
-                # YouTube devuelve imagen 120x90 "no disponible" para maxres/sd si no existe
-                # La filtramos por tamaño mínimo de contenido
+                # YouTube devuelve imagen 120x90 para calidades no disponibles;
+                # se filtra por tamaño mínimo de contenido para evitar usar esa imagen
                 if r.status_code == 200 and len(r.content) > 5000:
                     thumb_data = r.content
                     break
@@ -2037,7 +2042,7 @@ async def youtube_thumbnail_proxy(video_id: str):
             headers={"Location": PLACEHOLDER_IMAGE_BASE},
         )
 
-    # 🔧 Recortar a 500x750
+    # Recortar a 500x750 (mismo estándar que miniaturas de Telegram)
     processed = _crop_cover_to_poster(thumb_data)
     mime      = "image/jpeg"
 
@@ -2050,8 +2055,13 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 ENDPOINT /thumb/{message_id} — MODIFICADO
-# Añade: extracción de frame si no hay miniatura + recorte 500x750 en todo caso
+# ENDPOINT /thumb/{message_id}
+# Sirve la miniatura de un mensaje de Telegram.
+# Orden de intentos:
+#   1. Foto adjunta al mensaje
+#   2. Miniatura embebida del documento
+#   3. Frame extraído del video con ffmpeg  ← NUEVO (solo para Telegram sin póster en APIs)
+# Todos los resultados se recortan a 500x750 antes de ser cacheados y servidos.
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
@@ -2092,7 +2102,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 message.document.thumbs[-1], bytes
             )
 
-        # --- 🔧 Intento 3 (NUEVO): extraer frame real del video ---
+        # --- Intento 3: extraer frame real del video (solo si no hay miniatura) ---
         if not thumb_data:
             is_video = (
                 message.document is not None
@@ -2117,7 +2127,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 headers={"Location": PLACEHOLDER_IMAGE_BASE},
             )
 
-        # --- 🔧 NUEVO: Aplicar recorte cover 500x750 a TODAS las miniaturas ---
+        # Aplicar recorte cover 500x750 a TODAS las miniaturas de Telegram
         thumb_data = _crop_cover_to_poster(thumb_data)
         mime       = "image/jpeg"
 
