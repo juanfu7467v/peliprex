@@ -7,9 +7,6 @@ import random
 import json
 import httpx
 import time
-import io
-import hashlib
-import textwrap
 from urllib.parse import quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -18,37 +15,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# --- Pillow (para estandarizar a JPG + tamaño uniforme) ---
-try:
-    from PIL import Image, ImageOps, ImageDraw, ImageFont
-    _PIL_OK = True
-except Exception:
-    _PIL_OK = False
-
-# ---------------------------------------------------------------------------
-# CONFIGURACIÓN
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+CONFIGURACIÓN
+---------------------------------------------------------------------------
 API_ID             = int(os.getenv("API_ID", "0"))
 API_HASH           = os.getenv("API_HASH", "")
 SESSION_STRING     = os.getenv("SESSION_STRING", "")
 PUBLIC_URL         = os.getenv("PUBLIC_URL", "").rstrip('/')
 CHANNEL_IDENTIFIER = '@PEELYE'
 
-# --- YOUTUBE BACKUP ---
+--- YOUTUBE BACKUP ---
 YOUTUBE_API_KEY    = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-# --- GOOGLE KNOWLEDGE GRAPH ---
+--- GOOGLE KNOWLEDGE GRAPH ---
 GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
 
-# --- TMDB ---
+--- TMDB ---
 TMDB_API_KEY       = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_API_BASE      = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w500"
 
-# --- TVMaze (gratuita, sin API key) ---
+--- TVMaze (gratuita, sin API key) ---
 TVMAZE_API_BASE    = "https://api.tvmaze.com"
 
-# --- GEMINI AI ---
+--- GEMINI AI ---
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_API_URL     = (
@@ -56,7 +46,7 @@ GEMINI_API_URL     = (
     f"{GEMINI_MODEL}:generateContent"
 )
 
-# --- IMAGEN PLACEHOLDER (se mantiene, pero ya no debería salir al usuario final) ---
+--- IMAGEN PLACEHOLDER ---
 PLACEHOLDER_IMAGE_BASE = (
     "https://blogger.googleusercontent.com/img/b/R29vZ2xl/"
     "AVvXsEh4rh5wpJEnn2Ju-9BAVNsMIKx4AsSvOhyphenhyphenyepiiNTezVnUXgT9qLnEk2YQnwov"
@@ -64,9 +54,9 @@ PLACEHOLDER_IMAGE_BASE = (
     "M5SHHyWVANJ9NPtqYTBbElxiQJqZ-9hOAkQhuOJWQ00MunjG6euBdbjaXGkG/s1536/1000094899.png"
 )
 
-# ---------------------------------------------------------------------------
-# OPTIMIZACIÓN / LÍMITES
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+OPTIMIZACIÓN / LÍMITES
+---------------------------------------------------------------------------
 MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "10"))))
 CATALOG_POOL_TTL          = max(60,         int(os.getenv("CATALOG_POOL_TTL",          "600")))
 CATALOG_FETCH_CONCURRENCY = max(1,  min(10, int(os.getenv("CATALOG_FETCH_CONCURRENCY", "5"))))
@@ -75,48 +65,29 @@ MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",     
 PERSISTENT_CACHE_PATH = "/data/cache_peliculas.json"
 CACHE_SAVE_EVERY      = 10
 
-# ---------------------------------------------------------------------------
-# STREAMING (FIX DEFINITIVO)
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+STREAMING (FIX DEFINITIVO)
+---------------------------------------------------------------------------
 STREAM_CHUNK_SIZE = max(64 * 1024, min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024)))))
 
-# ---------------------------------------------------------------------------
-# THUMBNAILS
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+THUMBNAILS
+---------------------------------------------------------------------------
 THUMB_CACHE_TTL     = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX     = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
-# ✅ Estandarización: tamaño uniforme tipo w500 (ancho 500)
-THUMB_STD_W = int(os.getenv("THUMB_STD_W", "500"))
-# Alto uniforme (poster 2:3 para que “no se vea ancho” incluso si viene 16:9)
-THUMB_STD_H = int(os.getenv("THUMB_STD_H", str(int(THUMB_STD_W * 1.5))))
-THUMB_STD_SIZE = (THUMB_STD_W, THUMB_STD_H)
-
-# ✅ Seguridad SSRF: allowlist de hosts de imágenes externas que sí se pueden proxyear/convertir
-_THUMB_ALLOWED_HOST_SUFFIXES = [
-    "image.tmdb.org",
-    "img.youtube.com",
-    "i.ytimg.com",
-    "static.tvmaze.com",
-    "blogger.googleusercontent.com",
-    "googleusercontent.com",
-    "gstatic.com",
-    "wikimedia.org",
-    "wikipedia.org",
-]
-
-# ---------------------------------------------------------------------------
-# OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
+---------------------------------------------------------------------------
 SEARCH_CHANNEL_CACHE_TTL           = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
 SEARCH_CHANNEL_CACHE_LIMIT         = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
 SEARCH_CHANNEL_WARMUP_CONCURRENCY  = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
 SEARCH_CHANNEL_FETCH_TIMEOUT       = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
 CHANNELS_READY_MAX_WAIT_SEARCH     = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
 
-# ---------------------------------------------------------------------------
-# CANALES DE RESPALDO
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+CANALES DE RESPALDO
+---------------------------------------------------------------------------
 _REQUIRED_CHANNELS = [
     '@animadasssss',
     '@pelisdeterror2',
@@ -161,9 +132,9 @@ def _dedupe_channels(channels: list[str]) -> list[str]:
 
 BACKUP_CHANNELS = _dedupe_channels(_REQUIRED_CHANNELS)
 
-# ---------------------------------------------------------------------------
-# MAPA DE GÉNEROS → CANALES
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+MAPA DE GÉNEROS → CANALES
+---------------------------------------------------------------------------
 GENRE_CHANNEL_MAP: dict[str, list[str]] = {
     "anime":           ["@peliculasdeanimes1349", "@AnimesFinalizadosHD",
                         "@Shin_sekai_animes_en_emision_1", "@pelis123anime4611", "@animadasssss"],
@@ -239,9 +210,9 @@ GENRE_CHANNEL_MAP: dict[str, list[str]] = {
     "general":         ["@peliculasdetodogeneroo", "@MundoPelisgratis15", "@PEELYE"],
 }
 
-# ---------------------------------------------------------------------------
-# HELPER: canales para un género dado
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+HELPER: canales para un género dado
+---------------------------------------------------------------------------
 def _get_genre_channels(genre: str) -> list[str]:
     g = (genre or "").strip().lower()
     channels = GENRE_CHANNEL_MAP.get(g, [])
@@ -258,9 +229,9 @@ def _get_genre_channels(genre: str) -> list[str]:
                 break
     return channels
 
-# ---------------------------------------------------------------------------
-# CACHÉ HÍBRIDA: RAM + JSON PERSISTENTE
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+CACHÉ HÍBRIDA: RAM + JSON PERSISTENTE
+---------------------------------------------------------------------------
 def _ensure_data_dir_exists():
     try:
         os.makedirs(os.path.dirname(PERSISTENT_CACHE_PATH), exist_ok=True)
@@ -305,22 +276,12 @@ def _cache_key_from_query(query_title: str, year: str | None) -> str:
     y    = (year or "").strip()
     return f"{base}::{y}" if y else base
 
-# ---------------------------------------------------------------------------
-# THUMB CACHE HELPERS
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+THUMB CACHE HELPERS
+---------------------------------------------------------------------------
 def _thumb_cache_prune(cache: dict):
     try:
-        if len(cache) <= THUMB_CACHE_MAX:
-            return
-        items = list(cache.items())
-        items.sort(key=lambda kv: (kv[1].get("ts") or 0.0))
-        to_remove = len(cache) - THUMB_CACHE_MAX
-        for i in range(max(0, to_remove)):
-            cache.pop(items[i][0], None)
-    except Exception:
-        pass
-
-def _guess_image_content_type(data: bytes) -> str:
+        if len(cache)  str:
     if not data:
         return "image/jpeg"
     if data.startswith(b"\xff\xd8\xff"):
@@ -349,71 +310,15 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
     except Exception:
         return 0
 
-def _is_allowed_thumb_url(u: str | None) -> bool:
-    try:
-        if not u:
-            return False
-        p = urlparse(u)
-        if p.scheme not in ("http", "https"):
-            return False
-        host = (p.hostname or "").lower().strip()
-        if not host:
-            return False
-        for suf in _THUMB_ALLOWED_HOST_SUFFIXES:
-            if host == suf or host.endswith("." + suf):
-                return True
-        return False
-    except Exception:
-        return False
-
-def _is_internal_thumb_url(u: str | None) -> bool:
-    try:
-        if not u:
-            return False
-        if u.startswith("/thumb/"):
-            return True
-        if PUBLIC_URL and u.startswith(PUBLIC_URL + "/thumb/"):
-            return True
-        pu = urlparse(u)
-        return pu.path.startswith("/thumb/")
-    except Exception:
-        return False
-
-def _sha1(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
-
-def _thumb_proxy_url(external_url: str, title: str) -> str:
-    # Reusa el MISMO endpoint /thumb/{message_id}, con message_id=0 como “proxy”
-    # y fallback coherente con título (t=).
-    u_enc = quote_plus(external_url or "")
-    t_enc = quote_plus((title or "Película").strip() or "Película")
-    return _build_public_url(f"/thumb/0?u={u_enc}&t={t_enc}")
-
-def _thumb_titlecard_url(title: str) -> str:
-    t_enc = quote_plus((title or "Película").strip() or "Película")
-    return _build_public_url(f"/thumb/0?t={t_enc}")
-
-def _standardize_imagen_url(imagen_url: str | None, title: str) -> str:
-    # ✅ Ningún contenido sin imagen
-    # ✅ Uniforme “w500” (servido por /thumb)
-    # ✅ Siempre JPG (convertido en /thumb)
-    u = (imagen_url or "").strip()
-    if not u:
-        return _thumb_titlecard_url(title)
-    if _is_internal_thumb_url(u):
-        return u
-    # Si es externa, siempre pasamos por proxy para estandarizar y convertir a JPG
-    return _thumb_proxy_url(u, title)
-
-# ---------------------------------------------------------------------------
-# ✅ FIX MINIATURAS: _thumb_url_for_message valida que el ID sea numérico
-# Si message_id no es un entero válido (ej: YouTube ID "JZGPUgpdK8o"),
-# retorna None para que el fallback use img.youtube.com correctamente.
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+✅ FIX MINIATURAS: _thumb_url_for_message valida que el ID sea numérico
+Si message_id no es un entero válido (ej: YouTube ID "JZGPUgpdK8o"),
+retorna None para que el fallback use img.youtube.com correctamente.
+---------------------------------------------------------------------------
 def _thumb_url_for_message(message_id, stream_url: str | None = None, ch: int | None = None) -> str | None:
     if not message_id:
         return None
-    # Validar que sea un ID numérico de Telegram (no un ID de YouTube como "JZGPUgpdK8o")
+Validar que sea un ID numérico de Telegram (no un ID de YouTube como "JZGPUgpdK8o")
     try:
         msg_id_int = int(message_id)
     except (ValueError, TypeError):
@@ -447,9 +352,9 @@ def _youtube_thumb_from_stream_url(stream_url: str | None) -> str | None:
     except Exception:
         return None
 
-# ---------------------------------------------------------------------------
-# LIFESPAN
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+LIFESPAN
+---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("📡 Conectando a Telegram...")
@@ -541,9 +446,9 @@ app.add_middleware(
 )
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# ---------------------------------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+HEALTH CHECK
+---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
     channels_up = sum(1 for e in getattr(app.state, "entities", []) if e is not None)
@@ -554,9 +459,9 @@ async def health_check():
         "cache_entries":   len(getattr(app.state, "meta_cache", {})),
     })
 
-# ---------------------------------------------------------------------------
-# EXTRACCIÓN DE TÍTULO LIMPIA
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+EXTRACCIÓN DE TÍTULO LIMPIA
+---------------------------------------------------------------------------
 _MAX_TITLE_LEN = 100
 
 def _extract_title_from_caption(caption: str) -> str:
@@ -565,8 +470,8 @@ def _extract_title_from_caption(caption: str) -> str:
 
     first_line = caption.split('\n')[0].strip()
 
-    first_line = re.sub(r'\[([^\]]*)\]\(https?://[^\)]*\)', r'\1', first_line)
-    first_line = re.sub(r'\]\s*\(https?://[^\)]*\)', '', first_line)
+    first_line = re.sub(r'\[(])\]\(https?://\)', r'\1', first_line)
+    first_line = re.sub(r'\]\s\(https?://\)', '', first_line)
     first_line = re.sub(r'https?://\S+', '', first_line)
     first_line = re.sub(r'[\[\]]', '', first_line)
 
@@ -574,21 +479,10 @@ def _extract_title_from_caption(caption: str) -> str:
     if len(first_line) > _MAX_TITLE_LEN:
         for sep in ('.', ',', ';', '!', '?', ' - '):
             idx = first_line.find(sep, 15)
-            if 15 < idx <= _MAX_TITLE_LEN:
-                first_line = first_line[:idx].strip()
-                break
-        else:
-            first_line = first_line[:_MAX_TITLE_LEN].strip()
-
-    return first_line.strip() or "Película"
-
-# ---------------------------------------------------------------------------
-# HELPER: número de capítulo/episodio para ordenar
-# ---------------------------------------------------------------------------
-def extract_chapter_number(result: dict) -> int:
+            if 15  int:
     title = result["title"]
     match = re.search(
-        r'(?:cap[ií]tulo|cap[.]?|ep(?:isodio)?[.]?|parte|vol(?:[.]|umen)?)\s*[:\-]?\s*(\d+)',
+        r'(?:cap[ií]tulo|cap[.]?|ep(?:isodio)?[.]?|parte|vol(?:[.]|umen)?)\s[:\-]?\s(\d+)',
         title, re.IGNORECASE,
     )
     if match:
@@ -596,9 +490,9 @@ def extract_chapter_number(result: dict) -> int:
     numbers = re.findall(r'\d+', title)
     return int(numbers[-1]) if numbers else 0
 
-# ---------------------------------------------------------------------------
-# YOUTUBE FALLBACK
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+YOUTUBE FALLBACK
+---------------------------------------------------------------------------
 async def youtube_fallback(youtube_query: str) -> list:
     if not YOUTUBE_API_KEY:
         return []
@@ -634,18 +528,18 @@ async def youtube_fallback(youtube_query: str) -> list:
         print(f"⚠️  Error usando YouTube fallback: {e}")
         return []
 
-# ---------------------------------------------------------------------------
-# HELPERS: limpieza de títulos
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+HELPERS: limpieza de títulos
+---------------------------------------------------------------------------
 _ROMAN_RE = r"(?:I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|XVI|XVII|XVIII|XIX|XX)"
 
 def _strip_decorations(title: str) -> str:
     t = (title or "").strip()
-    t = re.sub(r'\]\s*\(https?://[^\)]*\)', '', t)
+    t = re.sub(r'\]\s\(https?://\)', '', t)
     t = re.sub(r'https?://\S+', '', t)
     t = re.sub(r'[\[\]]', '', t)
     t = re.sub(r"[*_`]+", "", t)
-    t = re.sub(r"^[^\wáéíóúüñÁÉÍÓÚÜÑ]+", "", t)
+    t = re.sub(r"^+", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -676,8 +570,8 @@ def _remove_bracketed_text(s: str) -> str:
         return s
     out = s
     for _ in range(3):
-        out = re.sub(r"\([^)]*\)", " ", out)
-        out = re.sub(r"\[[^\]]*\]", " ", out)
+        out = re.sub(r"\(*\)", " ", out)
+        out = re.sub(r"\[]*\]", " ", out)
     return out
 
 def _clean_title_for_api(title: str) -> str:
@@ -693,30 +587,21 @@ def _clean_title_for_api(title: str) -> str:
     if len(t) > _MAX_TITLE_LEN:
         for sep in ('.', ',', ';', '!', '?', ' - '):
             idx = t.find(sep, 15)
-            if 15 < idx <= _MAX_TITLE_LEN:
-                t = t[:idx].strip()
-                break
-        else:
-            t = t[:_MAX_TITLE_LEN].strip()
-
-    return t
-
-def _build_tmdb_query_from_title(title: str) -> tuple[str, str | None]:
+            if 15  tuple[str, str | None]:
     raw  = _strip_decorations(title)
     year = _extract_year_from_title(raw)
     q    = _clean_title_for_api(raw)
     q = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q).strip()
     q = re.sub(
         rf"\b(?:cap[ií]tulo|cap[.]?|ep(?:isodio)?[.]?|parte|vol(?:[.]|umen)?|"
-        rf"temporada|season)\s*[:\-]?\s*(?:\d+|{_ROMAN_RE})\b",
+        rf"temporada|season)\s[:\-]?\s(?:\d+|{_ROMAN_RE})\b",
         " ", q, flags=re.IGNORECASE,
     )
     q = re.sub(r"\s+", " ", q).strip()
     return (q or raw), year
 
-# ✅ Placeholder coherente (se genera como JPG, tamaño uniforme, desde /thumb/0?t=...)
 def _placeholder_image_for_title(title: str) -> str:
-    return _thumb_titlecard_url(title or "Película")
+    return PLACEHOLDER_IMAGE_BASE
 
 def _nn_str(v, default: str = "") -> str:
     if v is None:
@@ -727,9 +612,9 @@ def _nn_str(v, default: str = "") -> str:
 def _nn_num(v, default=0):
     return v if v is not None else default
 
-# ---------------------------------------------------------------------------
-# FETCH + CACHÉ DE RECIENTES POR CANAL
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+FETCH + CACHÉ DE RECIENTES POR CANAL
+---------------------------------------------------------------------------
 async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) -> list[dict]:
     if entity is None:
         return []
@@ -767,67 +652,17 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
         if isinstance(entry, dict):
             ts = entry.get("ts") or 0.0
             items = entry.get("items") or []
-            if items and (now - ts) < SEARCH_CHANNEL_CACHE_TTL:
-                return items
-
-    locks = getattr(app.state, "search_channel_cache_locks", None)
-    if not isinstance(locks, dict):
-        return []
-
-    lock = locks.get(ch_index)
-    if lock is None:
-        lock = asyncio.Lock()
-        locks[ch_index] = lock
-
-    async with lock:
-        now2 = time.monotonic()
-        if not force_refresh:
-            entry2 = cache.get(ch_index)
-            if isinstance(entry2, dict):
-                ts2 = entry2.get("ts") or 0.0
-                items2 = entry2.get("items") or []
-                if items2 and (now2 - ts2) < SEARCH_CHANNEL_CACHE_TTL:
-                    return items2
-
-        try:
-            items = await asyncio.wait_for(
-                _fetch_recent_media_from_channel(ch_index, entity, SEARCH_CHANNEL_CACHE_LIMIT),
-                timeout=SEARCH_CHANNEL_FETCH_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            old = cache.get(ch_index)
-            if isinstance(old, dict) and (old.get("items") or []):
-                return old.get("items") or []
-            return []
-        except Exception:
-            old = cache.get(ch_index)
-            if isinstance(old, dict) and (old.get("items") or []):
-                return old.get("items") or []
-            return []
-
-        cache[ch_index] = {"ts": time.monotonic(), "items": items}
-        return items
-
-# ---------------------------------------------------------------------------
-# ADAPTADOR DE SALIDA → schema
-# ---------------------------------------------------------------------------
-def _to_peliculas_json_schema(items: list[dict]) -> list[dict]:
+            if items and (now - ts)  list[dict]:
     out: list[dict] = []
     for it in (items or []):
         titulo       = it.get("titulo") or it.get("title") or it.get("nombre") or "Película"
+        imagen_url   = it.get("imagen_url") or PLACEHOLDER_IMAGE_BASE
         pelicula_url = it.get("pelicula_url") or it.get("stream_url") or it.get("url") or ""
         desc         = (it.get("descripcion") or it.get("sinopsis") or "").strip()
 
-        imagen_raw = it.get("imagen_url") or ""
-        if (not imagen_raw) or _is_placeholder_image(imagen_raw):
-            imagen_raw = _placeholder_image_for_title(str(titulo))
-
-        # ✅ Estandariza SIEMPRE: uniforme w500 + JPG + nunca vacío
-        imagen_url = _standardize_imagen_url(imagen_raw, str(titulo))
-
         obj = {
             "titulo":       _nn_str(titulo,       "Película"),
-            "imagen_url":   _nn_str(imagen_url,   _placeholder_image_for_title(str(titulo))),
+            "imagen_url":   _nn_str(imagen_url,   PLACEHOLDER_IMAGE_BASE),
             "pelicula_url": _nn_str(pelicula_url, ""),
         }
         if desc and desc != "Sin descripción disponible.":
@@ -859,9 +694,9 @@ def _to_peliculas_json_schema(items: list[dict]) -> list[dict]:
         out.append(obj)
     return out
 
-# ---------------------------------------------------------------------------
-# FILTROS AVANZADOS POST-ENRIQUECIMIENTO
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+FILTROS AVANZADOS POST-ENRIQUECIMIENTO
+---------------------------------------------------------------------------
 def _apply_advanced_filters(
     results:  list[dict],
     year:     str | None = None,
@@ -894,9 +729,7 @@ def _apply_advanced_filters(
             try:
                 r_year_int = int(r_year_str[:4]) if len(r_year_str) >= 4 else None
                 if r_year_int is not None:
-                    if desde and r_year_int < desde:
-                        continue
-                    if hasta and r_year_int > hasta:
+                    if desde and r_year_int  hasta:
                         continue
             except (ValueError, TypeError):
                 pass
@@ -917,15 +750,15 @@ def _apply_advanced_filters(
 
     return filtered
 
-# ---------------------------------------------------------------------------
-# COROUTINE NULA
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+COROUTINE NULA
+---------------------------------------------------------------------------
 async def _noop() -> None:
     return None
 
-# ---------------------------------------------------------------------------
-# GOOGLE KNOWLEDGE GRAPH
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+GOOGLE KNOWLEDGE GRAPH
+---------------------------------------------------------------------------
 async def _google_kg_search(
     http: httpx.AsyncClient,
     query_title: str,
@@ -1078,9 +911,9 @@ async def _google_kg_search(
         print(f"⚠️  Google KG error ({query_title}): {e}")
         return None
 
-# ---------------------------------------------------------------------------
-# TMDB
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+TMDB
+---------------------------------------------------------------------------
 async def _tmdb_search_and_details(
     http: httpx.AsyncClient,
     query_title: str,
@@ -1181,9 +1014,9 @@ async def _tmdb_search_and_details(
         print(f"⚠️  TMDb error ({query_title}): {e}")
         return None
 
-# ---------------------------------------------------------------------------
-# TVMaze — gratuita, sin API key
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+TVMaze — gratuita, sin API key
+---------------------------------------------------------------------------
 async def _tvmaze_fetch(
     http: httpx.AsyncClient,
     query_title: str,
@@ -1214,7 +1047,7 @@ async def _tvmaze_fetch(
         imagen_url = image_obj.get("original") or image_obj.get("medium") or None
 
         summary_raw = best_show.get("summary") or ""
-        sinopsis    = re.sub(r"<[^>]+>", "", summary_raw).strip() or None
+        sinopsis    = re.sub(r"]+>", "", summary_raw).strip() or None
 
         genres_list = best_show.get("genres") or []
         generos     = ", ".join(genres_list) if genres_list else None
@@ -1254,9 +1087,9 @@ async def _tvmaze_fetch(
         print(f"⚠️  TVMaze error ({query_title}): {e}")
         return None
 
-# ---------------------------------------------------------------------------
-# GEMINI AI: completa metadatos faltantes (SOLO EN /search, LIMITADO A 10)
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+GEMINI AI: completa metadatos faltantes (SOLO EN /search, LIMITADO A 10)
+---------------------------------------------------------------------------
 _GEMINI_CALL_COUNTER = {"count": 0}
 
 async def _gemini_complete_metadata(
@@ -1318,8 +1151,7 @@ async def _gemini_complete_metadata(
         ) or ""
         text = text.strip()
 
-        text = re.sub(r"```(?:json)?\s*", "", text)
-        text = re.sub(r"```\s*$",          "", text).strip()
+        text = re.sub(r"text = re.sub(r"\s*$",          "", text).strip()
 
         result = json.loads(text)
         if not isinstance(result, dict):
@@ -1335,9 +1167,9 @@ async def _gemini_complete_metadata(
         print(f"⚠️  Gemini error ({title}): {e}")
         return None
 
-# ---------------------------------------------------------------------------
-# MERGE con prioridades diferenciadas
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+MERGE con prioridades diferenciadas
+---------------------------------------------------------------------------
 def _merge_metadata_with_kg(
     kg:             dict | None,
     tmdb:           dict | None,
@@ -1382,9 +1214,9 @@ def _merge_metadata_with_kg(
         "descripcion_detallada": pick("descripcion_detallada"),
     }
 
-# ---------------------------------------------------------------------------
-# CACHÉ: get / set con dirty flag
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+CACHÉ: get / set con dirty flag
+---------------------------------------------------------------------------
 async def _meta_cache_get(cache_key: str) -> dict | None:
     meta_cache = getattr(app.state, "meta_cache", None)
     if not isinstance(meta_cache, dict): return None
@@ -1404,9 +1236,9 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
             await _save_persistent_cache(app.state.meta_cache)
             app.state.meta_cache_dirty = False
 
-# ---------------------------------------------------------------------------
-# ENRIQUECIMIENTO PRINCIPAL
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+ENRIQUECIMIENTO PRINCIPAL
+---------------------------------------------------------------------------
 async def enrich_results_with_tmdb(
     results: list[dict],
     max_new: int | None = None,
@@ -1571,9 +1403,9 @@ async def enrich_results_with_tmdb(
                 })
         return final
 
-# ---------------------------------------------------------------------------
-# FORMATO BÁSICO (sin APIs)
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+FORMATO BÁSICO (sin APIs)
+---------------------------------------------------------------------------
 def _format_results_without_apis(final_results: list[dict]) -> list[dict]:
     formatted = []
     for r in final_results:
@@ -1605,9 +1437,9 @@ def _format_results_without_apis(final_results: list[dict]) -> list[dict]:
         })
     return formatted
 
-# ---------------------------------------------------------------------------
-# ENDPOINT /search
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+ENDPOINT /search
+---------------------------------------------------------------------------
 @app.get("/search")
 async def search(
     q:        str | None = Query(None,  description="Texto de búsqueda (mín. 3 caracteres)"),
@@ -1627,52 +1459,7 @@ async def search(
                 "q, year, genre, language, desde, hasta, canal"
             ),
         )
-    if q is not None and len(q.strip()) < 3:
-        raise HTTPException(
-            status_code=422,
-            detail="El parámetro 'q' debe tener al menos 3 caracteres",
-        )
-
-    try:
-        print(
-            f"🔍 Búsqueda: q='{q}' year={year} genre={genre} "
-            f"language={language} desde={desde} hasta={hasta} canal={canal}"
-        )
-
-        deadline = time.monotonic() + CHANNELS_READY_MAX_WAIT_SEARCH
-        while not getattr(app.state, "channels_ready", False) and time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
-
-        entities = getattr(app.state, "entities", [])
-
-        target_channel_names: set[str] = set()
-        if canal:
-            c = canal.strip()
-            if not c.startswith('@'):
-                c = f'@{c}'
-            target_channel_names.add(c.lower())
-        if genre:
-            for ch in _get_genre_channels(genre):
-                target_channel_names.add(ch.lower())
-
-        entities_indexed = list(enumerate(entities))
-
-        if target_channel_names:
-            filtered_ei = [
-                (i, e) for i, e in entities_indexed
-                if e is not None and
-                f'@{getattr(e, "username", "")}'.lower() in target_channel_names
-            ]
-            if filtered_ei:
-                entities_indexed = filtered_ei
-                print(
-                    f"🎯 Búsqueda dirigida: {len(entities_indexed)} canal(es) "
-                    f"para genre='{genre}' / canal='{canal}'"
-                )
-            else:
-                print(f"⚠️  Sin coincidencia de canales para '{genre}', usando todos")
-
-        async def search_in_channel(ch_index: int, entity) -> list:
+    if q is not None and len(q.strip())  list:
             if entity is None:
                 return []
             results = []
@@ -1763,9 +1550,9 @@ async def search(
         print(f"❌ Error en /search: {e}")
         return {"error": str(e)}
 
-# ---------------------------------------------------------------------------
-# ENDPOINT /catalog
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+ENDPOINT /catalog
+---------------------------------------------------------------------------
 @app.get("/catalog")
 async def catalog():
     try:
@@ -1774,31 +1561,7 @@ async def catalog():
         cached_ts  = pool_cache.get("ts")    or 0.0
         cached_pool= pool_cache.get("pool")  or []
 
-        if isinstance(cached_pool, list) and (now - cached_ts) < CATALOG_POOL_TTL and cached_pool:
-            base_pool = cached_pool
-            print(f"🧊 /catalog pool desde RAM (TTL ok): {len(base_pool)} items base")
-        else:
-            json_pool: list[dict] = []
-            try:
-                with open("peliculas.json", "r", encoding="utf-8") as f:
-                    peliculas_data = json.load(f)
-                for p in (peliculas_data if isinstance(peliculas_data, list) else []):
-                    title = (p.get("titulo") or p.get("title") or p.get("nombre") or "Película")
-                    json_pool.append({
-                        "id":         p.get("id"),
-                        "title":      str(title),
-                        "size":       p.get("size", "N/A"),
-                        "stream_url": p.get("pelicula_url") or p.get("stream_url") or p.get("url") or "",
-                    })
-                print(f"📂 peliculas.json cargado: {len(json_pool)} entradas")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                print(f"⚠️  Error leyendo peliculas.json: {e}")
-
-            fetch_sem = asyncio.Semaphore(CATALOG_FETCH_CONCURRENCY)
-
-            async def fetch_from_channel(ch_index: int, entity) -> list:
+        if isinstance(cached_pool, list) and (now - cached_ts)  list:
                 if entity is None: return []
                 results = []
                 try:
@@ -1826,322 +1589,7 @@ async def catalog():
                 return results
 
             deadline = time.monotonic() + 15.0
-            while not getattr(app.state, "channels_ready", False) and time.monotonic() < deadline:
-                await asyncio.sleep(0.3)
-
-            entities  = getattr(app.state, "entities", [])
-            tasks     = [fetch_from_channel(i, e) for i, e in enumerate(entities)]
-            raw       = await asyncio.gather(*tasks, return_exceptions=True)
-
-            telegram_pool: list[dict] = []
-            for item in raw:
-                if isinstance(item, list):
-                    telegram_pool.extend(item)
-
-            combined = json_pool + telegram_pool
-            seen, unique_results = set(), []
-            for result in combined:
-                key = normalize_title(result.get("title") or "")
-                if key and key not in seen:
-                    seen.add(key); unique_results.append(result)
-
-            app.state.catalog_pool_cache = {"ts": now, "pool": unique_results}
-            base_pool = unique_results
-            print(f"🧊 /catalog pool regenerado y cacheado (RAM): {len(base_pool)} items base")
-
-        pool_copy = list(base_pool)
-        random.shuffle(pool_copy)
-        final_results = pool_copy[:500]
-
-        print(f"🎲 /catalog → {len(final_results)} películas aleatorias → enriqueciendo (max_new={MAX_ENRICH_NEW})...")
-
-        try:
-            enriched = await asyncio.wait_for(
-                enrich_results_with_tmdb(final_results, max_new=MAX_ENRICH_NEW, use_gemini=False),
-                timeout=4.5,
-            )
-        except asyncio.TimeoutError:
-            print("⚠️  /catalog enrichment timeout — devolviendo formato básico")
-            enriched = _format_results_without_apis(final_results)
-
-        return _to_peliculas_json_schema(enriched)
-
-    except Exception as e:
-        print(f"❌ Error en /catalog: {e}")
-        return {"error": str(e)}
-
-# ---------------------------------------------------------------------------
-# ENDPOINT /thumb/{message_id}
-# ---------------------------------------------------------------------------
-def _pil_fit_to_std_jpeg(data: bytes) -> bytes | None:
-    if not _PIL_OK:
-        return None
-    try:
-        im = Image.open(io.BytesIO(data))
-        im = ImageOps.exif_transpose(im)
-        im = im.convert("RGB")
-        im = ImageOps.fit(im, THUMB_STD_SIZE, method=Image.LANCZOS, centering=(0.5, 0.5))
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=85, optimize=True, progressive=True)
-        return out.getvalue()
-    except Exception:
-        return None
-
-def _pil_generate_titlecard_jpeg(title: str) -> bytes | None:
-    if not _PIL_OK:
-        return None
-    try:
-        t = (title or "Película").strip() or "Película"
-
-        # Color determinístico por título (coherente, no genérico random)
-        h = int(_sha1(t)[:8], 16)
-        base = (
-            20 + (h % 50),
-            20 + ((h >> 8) % 50),
-            30 + ((h >> 16) % 50),
-        )
-        accent = (
-            120 + (h % 80),
-            70 + ((h >> 8) % 80),
-            90 + ((h >> 16) % 80),
-        )
-
-        im = Image.new("RGB", THUMB_STD_SIZE, base)
-        draw = ImageDraw.Draw(im)
-
-        # Banda superior (estilo póster simple)
-        draw.rectangle([(0, 0), (THUMB_STD_W, int(THUMB_STD_H * 0.22))], fill=accent)
-
-        # Fuente
-        font_title = None
-        try:
-            font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 40)
-        except Exception:
-            try:
-                font_title = ImageFont.truetype("DejaVuSans.ttf", 40)
-            except Exception:
-                font_title = ImageFont.load_default()
-
-        font_small = None
-        try:
-            font_small = ImageFont.truetype("DejaVuSans.ttf", 18)
-        except Exception:
-            font_small = ImageFont.load_default()
-
-        # Wrap de texto
-        max_chars = 18
-        lines = textwrap.wrap(t, width=max_chars)[:4]
-        text = "\n".join(lines) if lines else "Película"
-
-        # Medir y centrar
-        try:
-            bbox = draw.multiline_textbbox((0, 0), text, font=font_title, spacing=8, align="center")
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-        except Exception:
-            tw, th = (THUMB_STD_W - 80, 200)
-
-        x = (THUMB_STD_W - tw) // 2
-        y = int(THUMB_STD_H * 0.32)
-
-        # Sombra + texto
-        shadow = (0, 0, 0)
-        draw.multiline_text((x + 2, y + 2), text, font=font_title, fill=shadow, spacing=8, align="center")
-        draw.multiline_text((x, y), text, font=font_title, fill=(245, 245, 245), spacing=8, align="center")
-
-        # Footer
-        footer = "Miniatura generada automáticamente"
-        try:
-            fb = draw.textbbox((0, 0), footer, font=font_small)
-            fw = fb[2] - fb[0]
-        except Exception:
-            fw = 200
-        draw.text(((THUMB_STD_W - fw) // 2, THUMB_STD_H - 40), footer, font=font_small, fill=(230, 230, 230))
-
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=85, optimize=True, progressive=True)
-        return out.getvalue()
-    except Exception:
-        return None
-
-async def _fetch_external_image_bytes(u: str) -> bytes | None:
-    try:
-        if not _is_allowed_thumb_url(u):
-            return None
-        timeout = httpx.Timeout(connect=2.0, read=3.5, write=2.0, pool=1.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-            r = await http.get(u)
-            if r.status_code != 200:
-                return None
-            ct = (r.headers.get("content-type") or "").lower()
-            if "image" not in ct:
-                return None
-            data = r.content
-            if not data:
-                return None
-            # Límite simple por seguridad/performance (8 MB)
-            if len(data) > 8 * 1024 * 1024:
-                return None
-            return data
-    except Exception:
-        return None
-
-@app.get("/thumb/{message_id}")
-async def thumb_image(message_id: int, request: Request, ch: int = 0, u: str | None = None, t: str | None = None):
-    try:
-        # -------------------------------------------------------------------
-        # ✅ MODO PROXY / GENERADOR (MISMO endpoint, sin cambiar rutas):
-        # - /thumb/0?u=<url>&t=<titulo>  -> baja imagen externa allowlist, la convierte a JPG y la ajusta a 500
-        # - /thumb/0?t=<titulo>          -> genera miniatura coherente con el título
-        # -------------------------------------------------------------------
-        if message_id == 0:
-            title_for_card = (t or "Película").strip() or "Película"
-            u_clean = (u or "").strip()
-
-            proxy_key = ""
-            if u_clean:
-                proxy_key = f"proxy:{_sha1(u_clean)}:{_sha1(title_for_card)}"
-            else:
-                proxy_key = f"title:{_sha1(title_for_card)}"
-
-            cache_key = f"{ch}:{proxy_key}"
-            now = time.monotonic()
-
-            thumb_cache = getattr(app.state, "thumb_cache", None)
-            if not isinstance(thumb_cache, dict):
-                thumb_cache = {}
-                app.state.thumb_cache = thumb_cache
-
-            entry = thumb_cache.get(cache_key)
-            if isinstance(entry, dict):
-                ts = entry.get("ts") or 0.0
-                if (now - ts) < THUMB_CACHE_TTL and entry.get("data"):
-                    return Response(
-                        content=entry["data"],
-                        media_type="image/jpeg",
-                        headers={"Cache-Control": "public, max-age=3600"},
-                    )
-
-            async with app.state.thumb_cache_lock:
-                entry2 = thumb_cache.get(cache_key)
-                now2 = time.monotonic()
-                if isinstance(entry2, dict):
-                    ts2 = entry2.get("ts") or 0.0
-                    if (now2 - ts2) < THUMB_CACHE_TTL and entry2.get("data"):
-                        return Response(
-                            content=entry2["data"],
-                            media_type="image/jpeg",
-                            headers={"Cache-Control": "public, max-age=3600"},
-                        )
-
-                data_final = None
-
-                # 1) Intentar proxy de imagen externa
-                if u_clean:
-                    ext_bytes = await _fetch_external_image_bytes(u_clean)
-                    if ext_bytes and _PIL_OK:
-                        data_final = _pil_fit_to_std_jpeg(ext_bytes)
-
-                # 2) Si no se pudo, generar miniatura coherente por título
-                if not data_final:
-                    data_final = _pil_generate_titlecard_jpeg(title_for_card)
-                    if not data_final:
-                        # fallback extremo (mantiene endpoint vivo)
-                        data_final = b""
-
-                if not data_final:
-                    raise HTTPException(status_code=404, detail="Thumb no disponible")
-
-                thumb_cache[cache_key] = {"ts": time.monotonic(), "ct": "image/jpeg", "data": data_final}
-                _thumb_cache_prune(thumb_cache)
-
-                return Response(
-                    content=data_final,
-                    media_type="image/jpeg",
-                    headers={"Cache-Control": "public, max-age=3600"},
-                )
-
-        # -------------------------------------------------------------------
-        # ✅ MODO ORIGINAL TELEGRAM: /thumb/{message_id}?ch=...
-        # Ahora: siempre convierte a JPG y ajusta a tamaño uniforme (w500)
-        # y si no hay thumb, genera titlecard coherente con el caption.
-        # -------------------------------------------------------------------
-        entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
-            entities[ch]
-            if (0 <= ch < len(entities) and entities[ch] is not None)
-            else app.state.entity
-        )
-
-        cache_key = f"{ch}:{message_id}"
-        now = time.monotonic()
-
-        thumb_cache = getattr(app.state, "thumb_cache", None)
-        if not isinstance(thumb_cache, dict):
-            thumb_cache = {}
-            app.state.thumb_cache = thumb_cache
-
-        entry = thumb_cache.get(cache_key)
-        if isinstance(entry, dict):
-            ts = entry.get("ts") or 0.0
-            if (now - ts) < THUMB_CACHE_TTL and entry.get("data"):
-                return Response(
-                    content=entry["data"],
-                    media_type="image/jpeg",
-                    headers={"Cache-Control": "public, max-age=3600"},
-                )
-
-        async with app.state.thumb_cache_lock:
-            entry2 = thumb_cache.get(cache_key)
-            now2 = time.monotonic()
-            if isinstance(entry2, dict):
-                ts2 = entry2.get("ts") or 0.0
-                if (now2 - ts2) < THUMB_CACHE_TTL and entry2.get("data"):
-                    return Response(
-                        content=entry2["data"],
-                        media_type="image/jpeg",
-                        headers={"Cache-Control": "public, max-age=3600"},
-                    )
-
-            message = await client.get_messages(entity, ids=message_id)
-            if not message:
-                raise HTTPException(status_code=404, detail="Thumb no encontrado")
-
-            title_from_msg = _extract_title_from_caption(message.text or "") if (message.text or "") else "Película"
-
-            data_final = None
-
-            if message.media:
-                data = await client.download_media(message.media, file=bytes, thumb=-1)
-                if data and _PIL_OK:
-                    data_final = _pil_fit_to_std_jpeg(data)
-
-            # Si no hay thumb, o no se pudo convertir, generamos una miniatura coherente por título
-            if not data_final:
-                data_final = _pil_generate_titlecard_jpeg(title_from_msg)
-
-            if not data_final:
-                raise HTTPException(status_code=404, detail="Thumb no disponible")
-
-            thumb_cache[cache_key] = {"ts": time.monotonic(), "ct": "image/jpeg", "data": data_final}
-            _thumb_cache_prune(thumb_cache)
-
-            return Response(
-                content=data_final,
-                media_type="image/jpeg",
-                headers={"Cache-Control": "public, max-age=3600"},
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"⚠️  Error en /thumb: {e}")
-        raise HTTPException(status_code=500, detail="Error obteniendo thumb")
-
-# ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id}
-# ---------------------------------------------------------------------------
-def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+            while not getattr(app.state, "channels_ready", False) and time.monotonic()  tuple[int, int] | None:
     if not range_header:
         return None
     try:
@@ -2163,9 +1611,7 @@ def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, 
 
         if start_s == "" and end_s.isdigit():
             length = int(end_s)
-            if length <= 0:
-                return None
-            if length > file_size:
+            if length  file_size:
                 length = file_size
             start = file_size - length
             end = file_size - 1
@@ -2182,9 +1628,7 @@ def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, 
                 return None
             end = int(end_s)
 
-        if start < 0:
-            start = 0
-        if end >= file_size:
+        if start = file_size:
             end = file_size - 1
 
         if start > end or start >= file_size:
@@ -2297,9 +1741,8 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
         print(f"⚠️  Error de streaming: {e}")
         raise HTTPException(status_code=500, detail="Error de streaming")
 
-
-# ---------------------------------------------------------------------------
-# ENTRYPOINT
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
+---------------------------------------------------------------------------
+ENTRYPOINT
+---------------------------------------------------------------------------
+if name == "main":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
