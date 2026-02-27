@@ -71,22 +71,22 @@ CACHE_SAVE_EVERY      = 10
 STREAM_CHUNK_SIZE = max(64 * 1024, min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024)))))
 
 # ---------------------------------------------------------------------------
-# THUMBNAILS (FIX IMAGEN_URL DEFINITIVO)
+# THUMBNAILS
 # ---------------------------------------------------------------------------
 THUMB_CACHE_TTL     = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX     = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
 # ---------------------------------------------------------------------------
-# OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL PARA BÚSQUEDAS POR CATEGORÍA
+# OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
-SEARCH_CHANNEL_CACHE_TTL = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
-SEARCH_CHANNEL_CACHE_LIMIT = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
-SEARCH_CHANNEL_WARMUP_CONCURRENCY = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
-SEARCH_CHANNEL_FETCH_TIMEOUT = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
-CHANNELS_READY_MAX_WAIT_SEARCH = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
+SEARCH_CHANNEL_CACHE_TTL           = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
+SEARCH_CHANNEL_CACHE_LIMIT         = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
+SEARCH_CHANNEL_WARMUP_CONCURRENCY  = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
+SEARCH_CHANNEL_FETCH_TIMEOUT       = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
+CHANNELS_READY_MAX_WAIT_SEARCH     = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
 
 # ---------------------------------------------------------------------------
-# CANALES DE RESPALDO (ACTUALIZADOS CON NUEVOS CANALES)
+# CANALES DE RESPALDO
 # ---------------------------------------------------------------------------
 _REQUIRED_CHANNELS = [
     '@animadasssss',
@@ -133,7 +133,7 @@ def _dedupe_channels(channels: list[str]) -> list[str]:
 BACKUP_CHANNELS = _dedupe_channels(_REQUIRED_CHANNELS)
 
 # ---------------------------------------------------------------------------
-# MAPA DE GÉNEROS → CANALES (ACTUALIZADO CON NUEVOS CANALES)
+# MAPA DE GÉNEROS → CANALES
 # ---------------------------------------------------------------------------
 GENRE_CHANNEL_MAP: dict[str, list[str]] = {
     "anime":           ["@peliculasdeanimes1349", "@AnimesFinalizadosHD",
@@ -320,15 +320,25 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
     except Exception:
         return 0
 
-def _thumb_url_for_message(message_id: int | None, stream_url: str | None = None, ch: int | None = None) -> str | None:
+# ---------------------------------------------------------------------------
+# ✅ FIX MINIATURAS: _thumb_url_for_message valida que el ID sea numérico
+# Si message_id no es un entero válido (ej: YouTube ID "JZGPUgpdK8o"),
+# retorna None para que el fallback use img.youtube.com correctamente.
+# ---------------------------------------------------------------------------
+def _thumb_url_for_message(message_id, stream_url: str | None = None, ch: int | None = None) -> str | None:
     if not message_id:
+        return None
+    # Validar que sea un ID numérico de Telegram (no un ID de YouTube como "JZGPUgpdK8o")
+    try:
+        msg_id_int = int(message_id)
+    except (ValueError, TypeError):
         return None
     ch_final = 0
     if ch is not None:
         ch_final = int(ch)
     elif stream_url:
         ch_final = _extract_ch_from_stream_url(stream_url)
-    return _build_public_url(f"/thumb/{message_id}?ch={ch_final}")
+    return _build_public_url(f"/thumb/{msg_id_int}?ch={ch_final}")
 
 def _is_placeholder_image(url: str | None) -> bool:
     u = (url or "").strip()
@@ -343,11 +353,11 @@ def _youtube_thumb_from_stream_url(stream_url: str | None) -> str | None:
             qs = parse_qs(parsed.query or "")
             vid = (qs.get("v") or [None])[0]
             if vid:
-                return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                return f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
         if "youtu.be/" in stream_url:
             vid = stream_url.rstrip("/").split("/")[-1]
             if vid:
-                return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                return f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
         return None
     except Exception:
         return None
@@ -369,6 +379,7 @@ async def lifespan(app: FastAPI):
 
     app.state.search_channel_media_cache = {}
     app.state.search_channel_cache_locks = {}
+
     app.state.thumb_cache = {}
     app.state.thumb_cache_lock = asyncio.Lock()
 
@@ -631,7 +642,7 @@ def _nn_num(v, default=0):
     return v if v is not None else default
 
 # ---------------------------------------------------------------------------
-# FETCH + CACHÉ DE RECIENTES POR CANAL (para búsquedas sin q)
+# FETCH + CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
 async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) -> list[dict]:
     if entity is None:
@@ -712,7 +723,7 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
         return items
 
 # ---------------------------------------------------------------------------
-# ADAPTADOR DE SALIDA → schema con nuevos campos opcionales
+# ADAPTADOR DE SALIDA → schema
 # ---------------------------------------------------------------------------
 def _to_peliculas_json_schema(items: list[dict]) -> list[dict]:
     out: list[dict] = []
@@ -1340,8 +1351,7 @@ async def enrich_results_with_tmdb(
                     if new_counter["n"] >= limit_new:
                         pelicula_url = r.get("stream_url") or ""
                         thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
-                        yt_thumb = _youtube_thumb_from_stream_url(pelicula_url)
-                        img_final = thumb or yt_thumb or _placeholder_image_for_title(fallback_title)
+                        img_final = thumb or _youtube_thumb_from_stream_url(pelicula_url) or _placeholder_image_for_title(fallback_title)
                         return {
                             "titulo":                fallback_title or "Película",
                             "imagen_url":            img_final,
@@ -1504,7 +1514,7 @@ def _format_results_without_apis(final_results: list[dict]) -> list[dict]:
     return formatted
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /search (búsqueda avanzada + IA permitida)
+# ENDPOINT /search
 # ---------------------------------------------------------------------------
 @app.get("/search")
 async def search(
@@ -1662,7 +1672,7 @@ async def search(
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /catalog (SIN IA)
+# ENDPOINT /catalog
 # ---------------------------------------------------------------------------
 @app.get("/catalog")
 async def catalog():
@@ -1769,9 +1779,7 @@ async def catalog():
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /thumb/{message_id}  ✅ NUEVO
-# Devuelve miniatura REAL del propio Telegram (video/documento)
-# No modifica JSON existente: solo provee una URL estable y relacionada
+# ENDPOINT /thumb/{message_id}
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def thumb_image(message_id: int, request: Request, ch: int = 0):
@@ -1844,7 +1852,7 @@ async def thumb_image(message_id: int, request: Request, ch: int = 0):
         raise HTTPException(status_code=500, detail="Error obteniendo thumb")
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id}  ✅ FIX STREAMING DEFINITIVO
+# ENDPOINT /stream/{message_id}
 # ---------------------------------------------------------------------------
 def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | None:
     if not range_header:
