@@ -460,7 +460,7 @@ async def _extract_video_frame(message) -> bytes | None:
     Extrae un frame del video usando Smart Streaming Capture.
     - Para videos largos (>1h): captura en el segundo 120 (2 min).
     - Para videos cortos: captura en el segundo 2.
-    Optimizado: descarga solo lo estrictamente necesario para el frame.
+    Optimizado para no descargar el video completo y manejar streams parciales.
     """
     duration_secs = 0
     if message.document and message.document.attributes:
@@ -475,10 +475,13 @@ async def _extract_video_frame(message) -> bytes | None:
     vf_path  = None
     out_path = None
     try:
-        # 🔧 Reducimos drásticamente el tamaño de descarga inicial.
-        # Para la mayoría de los MP4, los primeros 15-20MB contienen los metadatos (moov atom)
-        # y los primeros segundos/minutos de video.
-        FRAME_DOWNLOAD_LIMIT = 20 * 1024 * 1024 if is_long_video else 8 * 1024 * 1024
+        # --- 1. Descarga inteligente ---
+        # Si el video es largo, necesitamos más datos al principio para que ffmpeg pueda 
+        # indexar y llegar al minuto 2 sin que el archivo esté demasiado truncado.
+        if is_long_video:
+            FRAME_DOWNLOAD_LIMIT = 45 * 1024 * 1024 # 45MB para asegurar minuto 2
+        else:
+            FRAME_DOWNLOAD_LIMIT = 12 * 1024 * 1024 # 12MB para segundo 2
 
         chunks = []
         total  = 0
@@ -486,7 +489,7 @@ async def _extract_video_frame(message) -> bytes | None:
             message.media,
             offset=0,
             limit=FRAME_DOWNLOAD_LIMIT,
-            chunk_size=512 * 1024,
+            chunk_size=1024 * 1024,
         ):
             chunks.append(chunk)
             total += len(chunk)
@@ -502,22 +505,26 @@ async def _extract_video_frame(message) -> bytes | None:
 
         out_path = vf_path + "_frame.jpg"
 
+        # --- 2. Ejecutar ffmpeg con parámetros de robustez ---
         def _run_ffmpeg():
             try:
-                # 🔧 Optimizamos ffmpeg para archivos truncados
-                # -ss ANTES de -i es mucho más rápido y no intenta leer todo el archivo
+                # Parámetros clave:
+                # -probesize y -analyzeduration bajos para rapidez en archivos truncados
+                # -ss DESPUÉS de -i para mayor compatibilidad con archivos corruptos/truncados
+                # -error_detect ignore_err para saltar errores de stream
                 result = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-ss",     str(seek_time),
+                        "-error_detect", "ignore_err",
                         "-i",      vf_path,
+                        "-ss",     str(seek_time),
                         "-vframes", "1",
-                        "-update", "1",
+                        "-q:v",    "2", # Alta calidad
                         "-f",      "image2",
                         out_path,
                     ],
                     capture_output=True,
-                    timeout=15,
+                    timeout=20,
                 )
                 return result
             except Exception as e:
@@ -526,7 +533,7 @@ async def _extract_video_frame(message) -> bytes | None:
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_run_ffmpeg),
-            timeout=20.0,
+            timeout=25.0,
         )
 
         if result is None:
@@ -2125,10 +2132,10 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if is_video:
                 print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
                 try:
-                    # 🔧 Reducimos el timeout global de la miniatura para no bloquear el catálogo
+                    # 🔧 Aumentamos el timeout para permitir descargas más pesadas de frames
                     thumb_data = await asyncio.wait_for(
                         _extract_video_frame(message),
-                        timeout=25.0,
+                        timeout=45.0,
                     )
                 except asyncio.TimeoutError:
                     print(f"   ⚠️  Timeout extrayendo frame del video msg {message_id}")
