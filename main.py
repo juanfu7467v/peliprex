@@ -453,14 +453,49 @@ def _youtube_thumb_from_stream_url(stream_url):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 NUEVO: Extrae un frame real del video Telegram cuando no hay miniatura
+# 🔧 NUEVO (ROBUSTO): Validación fuerte de imagen para evitar vacías/incorrectas
+# ---------------------------------------------------------------------------
+def _is_valid_image_bytes(data: bytes) -> bool:
+    if not data or len(data) < 1500:
+        return False
+
+    # Firma básica rápida
+    if not (data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG\r\n\x1a\n") or (data[:4] == b"RIFF" and b"WEBP" in data[:16])):
+        # Podría ser válido igualmente, pero evitamos basura binaria típica
+        # (si Pillow está disponible, lo verificamos igual)
+        pass
+
+    if _PIL_AVAILABLE:
+        try:
+            img = _PIL_Image.open(io.BytesIO(data))
+            img.verify()  # valida estructura sin decodificar todo
+            # Reabrir para leer size (verify() deja el objeto en estado no usable)
+            img2 = _PIL_Image.open(io.BytesIO(data))
+            w, h = img2.size
+            if w is None or h is None:
+                return False
+            if w < 64 or h < 64:
+                return False
+            return True
+        except Exception:
+            return False
+
+    # Sin Pillow: validación mínima por tamaño
+    return len(data) > 5000
+
+
+# ---------------------------------------------------------------------------
+# 🔧 NUEVO (ROBUSTO): Extrae un frame real del video Telegram cuando no hay miniatura
 # ---------------------------------------------------------------------------
 async def _extract_video_frame(message) -> bytes | None:
     """
-    Extrae un frame del video usando Smart Streaming Capture.
-    - Para videos largos (>1h): captura en el segundo 120 (2 min).
-    - Para videos cortos: captura en el segundo 2.
-    Optimizado: descarga solo lo estrictamente necesario para el frame.
+    MODO ROBUSTO/AGRESIVO:
+    - Reintenta extracción en: segundo 2, 60, 120, 300 (en ese orden).
+    - Usa ffmpeg con parámetros de decodificación forzada y tolerancia a errores.
+    - Si falla con descarga parcial, escala progresivamente el tamaño descargado.
+    - Último recurso: descarga completa del video y vuelve a intentar.
+    - Valida que la imagen sea real (no vacía/incorrecta) antes de devolverla.
+    - Maneja errores sin detener el proceso.
     """
     duration_secs = 0
     if message.document and message.document.attributes:
@@ -468,76 +503,224 @@ async def _extract_video_frame(message) -> bytes | None:
             if hasattr(attr, 'duration'):
                 duration_secs = attr.duration
                 break
-    
-    is_long_video = duration_secs > 3600
-    seek_time = 120 if is_long_video else 2
-    
+
+    # ✅ Reintentos solicitados (fijos)
+    seek_points = [2, 60, 120, 300]
+
+    # Si conocemos duración, evitamos buscar fuera (sin romper la estrategia):
+    # Clamp suave (mantiene el orden y evita t>=duración).
+    if isinstance(duration_secs, int) and duration_secs > 0:
+        clamped = []
+        for t in seek_points:
+            tt = max(0, min(int(t), max(0, duration_secs - 1)))
+            clamped.append(tt)
+        # Deduplicar manteniendo orden
+        seen_t = set()
+        seek_points = []
+        for t in clamped:
+            if t not in seen_t:
+                seen_t.add(t)
+                seek_points.append(t)
+
     vf_path  = None
     out_path = None
+    full_download_path = None
+
     try:
-        # 🔧 Reducimos drásticamente el tamaño de descarga inicial.
-        # Para la mayoría de los MP4, los primeros 15-20MB contienen los metadatos (moov atom)
-        # y los primeros segundos/minutos de video.
-        FRAME_DOWNLOAD_LIMIT = 20 * 1024 * 1024 if is_long_video else 8 * 1024 * 1024
+        # ------------------------------------------------------------
+        # 1) Descarga progresiva (prefijo) para intentar rápido
+        # ------------------------------------------------------------
+        # Escalado agresivo (aumenta probabilidad con videos "difíciles")
+        # Nota: no cambia endpoints ni respuestas, solo robustez interna.
+        progressive_limits = [
+            8  * 1024 * 1024,    # 8 MB
+            25 * 1024 * 1024,    # 25 MB
+            60 * 1024 * 1024,    # 60 MB
+        ]
 
-        chunks = []
-        total  = 0
-        async for chunk in client.iter_download(
-            message.media,
-            offset=0,
-            limit=FRAME_DOWNLOAD_LIMIT,
-            chunk_size=512 * 1024,
-        ):
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= FRAME_DOWNLOAD_LIMIT:
-                break
+        downloaded = bytearray()
+        downloaded_len = 0
 
-        if not chunks: return None
-        video_data = b"".join(chunks)
+        async def _download_prefix_to(limit_bytes: int) -> bytes | None:
+            nonlocal downloaded_len, downloaded
+            if limit_bytes <= 0:
+                return None
+            if downloaded_len >= limit_bytes:
+                return bytes(downloaded)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
-            vf.write(video_data)
-            vf_path = vf.name
-
-        out_path = vf_path + "_frame.jpg"
-
-        def _run_ffmpeg():
             try:
-                # 🔧 Optimizamos ffmpeg para archivos truncados
-                # -ss ANTES de -i es mucho más rápido y no intenta leer todo el archivo
-                result = subprocess.run(
-                    [
-                        "ffmpeg", "-y",
-                        "-ss",     str(seek_time),
-                        "-i",      vf_path,
-                        "-vframes", "1",
-                        "-update", "1",
-                        "-f",      "image2",
-                        out_path,
-                    ],
-                    capture_output=True,
-                    timeout=15,
-                )
-                return result
+                # Descarga incremental desde offset ya descargado
+                async for chunk in client.iter_download(
+                    message.media,
+                    offset=downloaded_len,
+                    limit=(limit_bytes - downloaded_len),
+                    chunk_size=512 * 1024,
+                ):
+                    if not chunk:
+                        break
+                    downloaded.extend(chunk)
+                    downloaded_len += len(chunk)
+                    if downloaded_len >= limit_bytes:
+                        break
+                return bytes(downloaded) if downloaded_len > 0 else None
             except Exception as e:
-                print(f"⚠️ Error ffmpeg: {e}")
+                print(f"⚠️  Error descargando prefijo de video (msg {getattr(message, 'id', '?')}): {e}")
+                return bytes(downloaded) if downloaded_len > 0 else None
+
+        def _ffmpeg_extract_frame(input_path: str, seek_time: int, output_path: str) -> bool:
+            """
+            Ejecuta ffmpeg con decodificación forzada/tolerante y devuelve True si generó imagen válida.
+            """
+            try:
+                # Parámetros agresivos para archivos truncados/corruptos/lentos
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-nostdin",
+                    # Robustez (tolerancia a corrupción y timestamps raros)
+                    "-fflags", "+genpts+discardcorrupt",
+                    "-err_detect", "ignore_err",
+                    "-analyzeduration", "100M",
+                    "-probesize", "100M",
+                    # Seek (rápido): -ss antes de -i
+                    "-ss", str(int(seek_time)),
+                    "-i", input_path,
+                    # Forzamos 1 frame
+                    "-frames:v", "1",
+                    # Evita filtros raros: genera una imagen "normal"
+                    "-f", "image2",
+                    "-q:v", "3",
+                    output_path,
+                ]
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=7,   # corto por intento; el endpoint /thumb ya limita globalmente
+                )
+
+                if result is None:
+                    return False
+
+                if not os.path.exists(output_path):
+                    return False
+
+                try:
+                    with open(output_path, "rb") as f:
+                        frame_data = f.read()
+                except Exception:
+                    return False
+
+                if not _is_valid_image_bytes(frame_data):
+                    return False
+
+                return True
+
+            except subprocess.TimeoutExpired:
+                return False
+            except Exception:
+                return False
+
+        async def _try_extract_from_bytes(video_bytes: bytes, seek_list: list[int]) -> bytes | None:
+            nonlocal vf_path, out_path
+            if not video_bytes:
                 return None
 
-        result = await asyncio.wait_for(
-            asyncio.to_thread(_run_ffmpeg),
-            timeout=20.0,
-        )
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+                vf.write(video_bytes)
+                vf_path = vf.name
 
-        if result is None:
+            out_path = vf_path + "_frame.jpg"
+
+            # Intentos por puntos de tiempo
+            for t in seek_list:
+                # Limpia salida anterior
+                try:
+                    if os.path.exists(out_path):
+                        os.unlink(out_path)
+                except Exception:
+                    pass
+
+                ok = await asyncio.to_thread(_ffmpeg_extract_frame, vf_path, int(t), out_path)
+                if not ok:
+                    continue
+
+                # Leer bytes válidos
+                try:
+                    with open(out_path, "rb") as f:
+                        data = f.read()
+                    if _is_valid_image_bytes(data):
+                        print(f"   🎞️  Frame extraído (ROBUST) msg {message.id} @ {t}s")
+                        return data
+                except Exception:
+                    continue
+
             return None
 
-        if os.path.exists(out_path):
-            with open(out_path, "rb") as f:
-                frame_data = f.read()
-            if frame_data:
-                print(f"   🎞️  Frame extraído correctamente del video (msg {message.id})")
-                return frame_data
+        # ------------------------------------------------------------
+        # 2) Intentos con descarga progresiva
+        # ------------------------------------------------------------
+        for lim in progressive_limits:
+            video_data = await _download_prefix_to(lim)
+            if not video_data:
+                continue
+
+            # Intentar con puntos 2/60/120/300 en ese orden
+            try:
+                frame = await _try_extract_from_bytes(video_data, seek_points)
+                if frame and _is_valid_image_bytes(frame):
+                    return frame
+            except Exception as e:
+                print(f"⚠️  Error intentando extraer frame con prefijo (lim={lim}) msg {getattr(message, 'id', '?')}: {e}")
+                # No detenemos, seguimos al siguiente nivel
+                continue
+            finally:
+                # Limpieza de temporales intermedios
+                for p in [vf_path, out_path]:
+                    if p:
+                        try:
+                            if os.path.exists(p):
+                                os.unlink(p)
+                        except Exception:
+                            pass
+                vf_path = None
+                out_path = None
+
+        # ------------------------------------------------------------
+        # 3) Último recurso: descarga completa y reintento
+        # ------------------------------------------------------------
+        try:
+            # Descarga completa a archivo (agresivo, maximiza probabilidad)
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as ffull:
+                full_download_path = ffull.name
+
+            await client.download_media(message.media, file=full_download_path)
+
+            # Reusar ffmpeg con los mismos puntos
+            out_path = full_download_path + "_frame.jpg"
+            for t in seek_points:
+                try:
+                    if os.path.exists(out_path):
+                        os.unlink(out_path)
+                except Exception:
+                    pass
+
+                ok = await asyncio.to_thread(_ffmpeg_extract_frame, full_download_path, int(t), out_path)
+                if not ok:
+                    continue
+
+                try:
+                    with open(out_path, "rb") as f:
+                        frame_data = f.read()
+                    if _is_valid_image_bytes(frame_data):
+                        print(f"   🎞️  Frame extraído (FULL ROBUST) msg {message.id} @ {t}s")
+                        return frame_data
+                except Exception:
+                    continue
+
+        except Exception as e:
+            print(f"⚠️  Error en fallback descarga completa (msg {getattr(message, 'id', '?')}): {e}")
 
         return None
 
@@ -548,8 +731,8 @@ async def _extract_video_frame(message) -> bytes | None:
         print(f"⚠️  Error en _extract_video_frame (msg {getattr(message, 'id', '?')}): {e}")
         return None
     finally:
-        # --- 4. Limpieza de archivos temporales ---
-        for p in [vf_path, out_path]:
+        # Limpieza de archivos temporales (robusta)
+        for p in [vf_path, out_path, full_download_path]:
             if p:
                 try:
                     if os.path.exists(p):
@@ -2075,7 +2258,7 @@ async def youtube_thumbnail_proxy(video_id: str):
 # 🔧 ENDPOINT /thumb/{message_id} — MODIFICADO
 # Cambios aplicados SOLO a Telegram:
 # - NO usa imagen genérica / placeholder en ningún caso dentro de /thumb
-# - Si no hay thumb embebida => extrae frame real del video
+# - Si no hay thumb embebida => extrae frame real del video (modo robusto)
 # - Recorta siempre a 500x750 cover sin deformar
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
@@ -2114,7 +2297,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 message.document.thumbs[-1], bytes
             )
 
-        # --- Intento 3: extraer frame real del video ---
+        # --- Intento 3: extraer frame real del video (ROBUSTO) ---
         if not thumb_data:
             is_video = (
                 message.document is not None
@@ -2123,7 +2306,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 and "video" in message.file.mime_type.lower()
             )
             if is_video:
-                print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
+                print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video (modo robusto)...")
                 try:
                     # 🔧 Reducimos el timeout global de la miniatura para no bloquear el catálogo
                     thumb_data = await asyncio.wait_for(
@@ -2137,6 +2320,10 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         if not thumb_data:
             # 🔧 IMPORTANTE: sin placeholder/fallback
             raise HTTPException(status_code=404, detail="Miniatura no disponible (no se pudo extraer del contenido)")
+
+        # ✅ Validación extra: evitar devolver basura
+        if not _is_valid_image_bytes(thumb_data):
+            raise HTTPException(status_code=404, detail="Miniatura no disponible (imagen inválida)")
 
         # --- Aplicar recorte cover 500x750 a TODAS las miniaturas de Telegram ---
         thumb_data = _crop_cover_to_poster(thumb_data)
