@@ -7,13 +7,15 @@ ENV PORT=8080
 
 WORKDIR /app
 
-# 1. Dependencias de sistema necesarias para compilación de librerías
+# 1. INSTALACIÓN DE FFMPEG Y DEPENDENCIAS DE SISTEMA
+# Se añade ffmpeg para poder extraer miniaturas de los videos
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     python3-dev \
     libjpeg-dev \
     zlib1g-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Instalar dependencias de Python
