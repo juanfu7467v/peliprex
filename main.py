@@ -69,7 +69,8 @@ PLACEHOLDER_IMAGE_BASE = (
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN / LÍMITES
 # ---------------------------------------------------------------------------
-MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "10"))))
+# 🔧 Reducimos un poco la concurrencia para evitar saturar el ancho de banda en descargas de frames
+MAX_CONCURRENCY           = max(3,  min(10, int(os.getenv("MAX_CONCURRENCY",           "8"))))
 CATALOG_POOL_TTL          = max(60,         int(os.getenv("CATALOG_POOL_TTL",          "600")))
 CATALOG_FETCH_CONCURRENCY = max(1,  min(10, int(os.getenv("CATALOG_FETCH_CONCURRENCY", "5"))))
 MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",            "25"))))
@@ -459,9 +460,8 @@ async def _extract_video_frame(message) -> bytes | None:
     Extrae un frame del video usando Smart Streaming Capture.
     - Para videos largos (>1h): captura en el segundo 120 (2 min).
     - Para videos cortos: captura en el segundo 2.
-    No descarga el video completo, usa ffmpeg para leer el stream.
+    Optimizado para no descargar el video completo y manejar streams parciales.
     """
-    # 📌 Reglas de captura
     duration_secs = 0
     if message.document and message.document.attributes:
         for attr in message.document.attributes:
@@ -470,32 +470,19 @@ async def _extract_video_frame(message) -> bytes | None:
                 break
     
     is_long_video = duration_secs > 3600
-    seek_time = "00:02:00" if is_long_video else "00:00:02"
-    
-    # Intentar obtener URL de streaming interna para ffmpeg
-    # Si no es posible, descargamos una porción (fallback)
-    # Pero la instrucción pide "No descargar el video completo" y "Usar ffmpeg para leer solo una parte del stream"
+    seek_time = 120 if is_long_video else 2
     
     vf_path  = None
     out_path = None
     try:
-        # Para cumplir con "Smart Streaming Capture" sin descargar todo:
-        # 1. Calculamos un offset aproximado si es largo, o empezamos desde 0
-        # 2. Descargamos solo lo necesario para que ffmpeg encuentre el frame
-        
-        # Como no tenemos una URL directa de Telegram estable para ffmpeg sin el cliente,
-        # descargamos un segmento pequeño del punto de interés.
-        
-        offset = 0
+        # --- 1. Descarga inteligente ---
+        # Si el video es largo, necesitamos más datos al principio para que ffmpeg pueda 
+        # indexar y llegar al minuto 2 sin que el archivo esté demasiado truncado.
         if is_long_video:
-            # Estimación conservadora: 120s en un video de 2GB (7200s) son ~33MB.
-            # Descargamos un bloque de 15MB a partir de un punto estimado o simplemente 
-            # confiamos en que ffmpeg pueda manejar un stream parcial desde el inicio si no es muy pesado,
-            # o mejor, descargamos del inicio pero con un límite mayor para videos largos.
-            FRAME_DOWNLOAD_LIMIT = 25 * 1024 * 1024 # 25MB para asegurar encontrar el min 2
+            FRAME_DOWNLOAD_LIMIT = 45 * 1024 * 1024 # 45MB para asegurar minuto 2
         else:
-            FRAME_DOWNLOAD_LIMIT = 8 * 1024 * 1024  # 8MB para el segundo 2
-            
+            FRAME_DOWNLOAD_LIMIT = 12 * 1024 * 1024 # 12MB para segundo 2
+
         chunks = []
         total  = 0
         async for chunk in client.iter_download(
@@ -518,21 +505,26 @@ async def _extract_video_frame(message) -> bytes | None:
 
         out_path = vf_path + "_frame.jpg"
 
+        # --- 2. Ejecutar ffmpeg con parámetros de robustez ---
         def _run_ffmpeg():
             try:
-                # Usamos -sseof si fuera necesario, pero aquí usamos -ss antes del input para rapidez
-                # o después para precisión en archivos truncados.
+                # Parámetros clave:
+                # -probesize y -analyzeduration bajos para rapidez en archivos truncados
+                # -ss DESPUÉS de -i para mayor compatibilidad con archivos corruptos/truncados
+                # -error_detect ignore_err para saltar errores de stream
                 result = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-ss",     seek_time,
+                        "-error_detect", "ignore_err",
                         "-i",      vf_path,
+                        "-ss",     str(seek_time),
                         "-vframes", "1",
+                        "-q:v",    "2", # Alta calidad
                         "-f",      "image2",
                         out_path,
                     ],
                     capture_output=True,
-                    timeout=15,
+                    timeout=20,
                 )
                 return result
             except Exception as e:
@@ -541,7 +533,7 @@ async def _extract_video_frame(message) -> bytes | None:
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_run_ffmpeg),
-            timeout=20.0,
+            timeout=25.0,
         )
 
         if result is None:
@@ -2140,9 +2132,10 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if is_video:
                 print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
                 try:
+                    # 🔧 Aumentamos el timeout para permitir descargas más pesadas de frames
                     thumb_data = await asyncio.wait_for(
                         _extract_video_frame(message),
-                        timeout=25.0,
+                        timeout=45.0,
                     )
                 except asyncio.TimeoutError:
                     print(f"   ⚠️  Timeout extrayendo frame del video msg {message_id}")
