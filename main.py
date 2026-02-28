@@ -114,6 +114,7 @@ MIN_CATEGORY_RESULTS = 15
 # ---------------------------------------------------------------------------
 _REQUIRED_CHANNELS = [
     '@animadasssss',
+    '@goodanalsex',
     '@pelisdeterror2',
     '@peliculasdetodogeneroo',
     '@PeliculasCristianasBpB',
@@ -495,9 +496,8 @@ async def _extract_video_frame(message) -> bytes | None:
                     [
                         "ffmpeg", "-y",
                         "-i",      vf_path,
-                        "-ss",     "00:02:00",   # 🔧 Frame en el segundo 120 (2 minutos)
+                        "-ss",     "00:00:02",   # Frame en el segundo 2
                         "-vframes", "1",
-                        "-q:v",    "2",           # Alta calidad
                         out_path,
                     ],
                     capture_output=True,
@@ -517,35 +517,6 @@ async def _extract_video_frame(message) -> bytes | None:
 
         if result is None:
             return None
-
-        # Si el frame en el segundo 120 falla, intentar con alternativas
-        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            # Fallback: probar segundos 30, 60, 90, y el primer frame (0)
-            for fallback_ss in ["00:00:30", "00:01:00", "00:01:30", "00:00:01"]:
-                def _run_ffmpeg_fallback(ss):
-                    try:
-                        return subprocess.run(
-                            [
-                                "ffmpeg", "-y",
-                                "-i",      vf_path,
-                                "-ss",     ss,
-                                "-vframes", "1",
-                                "-q:v",    "2",
-                                out_path,
-                            ],
-                            capture_output=True,
-                            timeout=10,
-                        )
-                    except Exception:
-                        return None
-
-                result_fb = await asyncio.wait_for(
-                    asyncio.to_thread(_run_ffmpeg_fallback, fallback_ss),
-                    timeout=12.0,
-                )
-                if result_fb is not None and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    print(f"   🎞️  Frame extraído en segundo alternativo {fallback_ss}")
-                    break
 
         if os.path.exists(out_path):
             with open(out_path, "rb") as f:
