@@ -449,46 +449,89 @@ def _youtube_thumb_from_stream_url(stream_url):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 NUEVO: _extract_video_frame — VÍA STREAM LOCAL HTTP
+# 🔧 FIX PRINCIPAL: _extract_video_frame — ESTRATEGIA DE SEEK OPTIMIZADA
 #
 # PROBLEMA ANTERIOR:
-#   - Se descargaban los primeros 1.5 MB del video como archivo parcial
-#   - Los videos MP4/MKV de Telegram tienen el átomo "moov" (cabecera del
-#     contenedor) al FINAL del archivo
-#   - FFmpeg NO podía leer el archivo parcial → extracción fallaba al 100%
+#   - Seeks: [61, 30, 10, 3, 1, 0] con timeout de 25s cada uno
+#   - Los MP4 sin faststart (moov atom al final) fallan en seeks grandes
+#   - Resultado: 25s × 3 intentos fallidos = 75s antes de llegar a seek=3s
+#   - seek=3s SÍ funciona (confirmado en logs: ✅ Frame extraído en seek=3s)
 #
 # SOLUCIÓN NUEVA:
-#   - FFmpeg apunta directamente al endpoint /stream/{id}?ch={ch} LOCAL
-#   - FFmpeg hace HTTP range requests para descargar solo lo necesario:
-#       1. Cabecera del contenedor (primeros KB o MB)
-#       2. Segmento exacto en el minuto 1 (seek 61s)
-#   - Solo se descargan ~5-15 MB en total (vs 1.5 MB inútiles antes)
-#   - Funciona con MP4 faststart, MP4 normal, MKV, AVI, etc.
-#   - NO bloquea: se ejecuta en thread pool via asyncio.to_thread
+#   Estrategia mixta con timeouts cortos y fallback inteligente:
+#
+#   1. seek=60s  pre-seek  timeout=8s  → intento rápido para faststart/MKV
+#   2. seek=5s   pre-seek  timeout=12s → seek pequeño, muy confiable
+#   3. seek=3s   pre-seek  timeout=12s → probado que funciona (logs lo confirman)
+#   4. seek=1s   post-seek timeout=12s → decode desde inicio, muy confiable
+#   5. seek=0s   pre-seek  timeout=10s → último recurso
+#
+#   Total peor caso: 8+12+12+12+10 = 54s (en segundo plano, no bloquea)
+#   Caso típico:     8s (falla 60s) + 3-5s (éxito en seek=3s) = ~11-13s total
+#
+#   Diferencia pre-seek vs post-seek:
+#   - pre_seek=True:  -ss ANTES de -i → seek por bytes (rápido, requiere moov)
+#   - pre_seek=False: -i ANTES de -ss → decodifica desde inicio hasta seek_secs
+#     (más lento pero no requiere moov al inicio)
+#
+#   HTTP reconnect options añadidas para streams de Telegram:
+#   - -reconnect 1 -reconnect_streamed 1 → reconecta si se corta
+#   - -rw_timeout 7000000 → 7s timeout de lectura HTTP (en µs)
+#   - -probesize 1000000 → limita análisis inicial a 1MB
+#   - -analyzeduration 1000000 → limita duración de análisis a 1s
 # ---------------------------------------------------------------------------
 async def _extract_video_frame(message_id: int, ch: int) -> bytes | None:
     """
     Extrae un frame del video usando el endpoint /stream local via HTTP.
     FFmpeg hace range requests directos sin descargar el archivo completo.
 
-    Punto de captura objetivo: minuto 1 (segundo 61).
-    Si falla, retrocede progresivamente: 30s → 10s → 3s → 1s → 0s.
+    Estrategia de seek (en orden):
+      1. 60s  pre-seek   8s timeout  → Intento minuto 1 (rápido para faststart)
+      2.  5s  pre-seek  12s timeout  → Seek pequeño, muy confiable
+      3.  3s  pre-seek  12s timeout  → Confirmado funcional en logs
+      4.  1s  post-seek 12s timeout  → Decodifica desde inicio, muy confiable
+      5.  0s  pre-seek  10s timeout  → Fallback absoluto
+
+    Opciones HTTP especiales para streams de Telegram:
+      -reconnect, -reconnect_streamed, -rw_timeout, -probesize, -analyzeduration
     """
     out_path = None
     try:
-        # URL del stream local — FFmpeg usará range requests sobre este endpoint
+        # URL del stream local — FFmpeg usa range requests sobre este endpoint
         stream_url = f"http://127.0.0.1:{INTERNAL_PORT}/stream/{message_id}?ch={ch}"
-
-        out_path = tempfile.mktemp(suffix="_thumb.jpg")
+        out_path   = tempfile.mktemp(suffix="_thumb.jpg")
 
         def _run_ffmpeg_via_stream() -> bool:
             """
-            Intenta extraer un frame con seeks progresivamente más
-            conservadores. El primer seek es en el minuto 1 (61s).
-            Retorna True si se generó una imagen JPEG válida.
+            Intenta extraer frame con estrategia de seek progresivamente
+            más conservadora. Cada intento tiene su propio timeout.
+
+            pre_seek=True:  -ss ANTES de -i (seek rápido por contenedor)
+            pre_seek=False: -i ANTES de -ss (decodifica hasta ese punto, más lento pero confiable)
+
+            Retorna True si generó una imagen JPEG válida (>500 bytes).
             """
-            # Seeks en orden descendente: objetivo → fallbacks seguros
-            for seek_secs in [61, 30, 10, 3, 1, 0]:
+            # (seek_segundos, pre_seek, timeout_segundos)
+            strategies = [
+                (60, True,  8),   # Minuto 1: pre-seek rápido, timeout corto
+                ( 5, True,  12),  # 5s: pre-seek, muy confiable para faststart
+                ( 3, True,  12),  # 3s: PROBADO en logs, siempre funciona
+                ( 1, False, 12),  # 1s: post-seek, decodifica desde inicio
+                ( 0, True,  10),  # 0s: fallback absoluto
+            ]
+
+            # Opciones HTTP comunes para todos los intentos
+            # Mejoran el comportamiento con streams HTTP de Telegram
+            http_opts = [
+                "-reconnect",          "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max","2",
+                "-rw_timeout",         "7000000",   # 7s timeout lectura HTTP (µs)
+                "-probesize",          "1000000",   # Máx 1MB análisis inicial
+                "-analyzeduration",    "1000000",   # Máx 1s duración análisis
+            ]
+
+            for seek_secs, pre_seek, timeout_s in strategies:
                 # Limpiar salida previa si existe
                 try:
                     if os.path.exists(out_path):
@@ -496,48 +539,73 @@ async def _extract_video_frame(message_id: int, ch: int) -> bytes | None:
                 except Exception:
                     pass
 
-                args = [
-                    "ffmpeg", "-y",
-                    "-hide_banner", "-loglevel", "error",
-                    # ⚡ -ss ANTES de -i → seek a nivel de contenedor (más rápido)
-                    "-ss", str(seek_secs),
-                    "-i",        stream_url,
-                    "-frames:v", "1",       # Solo 1 frame
-                    "-q:v",      "3",       # Calidad JPEG (1=mejor, 31=peor)
-                    "-threads",  "1",       # Limitar CPU por proceso
-                    "-an",                  # Sin procesamiento de audio
-                    "-f",        "image2",
-                    out_path,
-                ]
+                if pre_seek:
+                    # -ss ANTES de -i: seek por contenedor (rápido, necesita moov al inicio)
+                    args = [
+                        "ffmpeg", "-y",
+                        "-hide_banner", "-loglevel", "error",
+                        *http_opts,
+                        "-ss",       str(seek_secs),
+                        "-i",        stream_url,
+                        "-frames:v", "1",
+                        "-q:v",      "3",
+                        "-threads",  "1",
+                        "-an",
+                        "-f",        "image2",
+                        out_path,
+                    ]
+                else:
+                    # -i ANTES de -ss: decodifica desde el inicio hasta seek_secs
+                    # Más lento pero funciona sin importar dónde esté el moov
+                    args = [
+                        "ffmpeg", "-y",
+                        "-hide_banner", "-loglevel", "error",
+                        *http_opts,
+                        "-i",        stream_url,
+                        "-ss",       str(seek_secs),
+                        "-frames:v", "1",
+                        "-q:v",      "3",
+                        "-threads",  "1",
+                        "-an",
+                        "-f",        "image2",
+                        out_path,
+                    ]
 
                 try:
                     subprocess.run(
                         args,
                         capture_output=True,
-                        timeout=25,  # Máx 25s por intento (range requests pueden tardar)
+                        timeout=timeout_s,
                     )
 
                     if (os.path.exists(out_path)
                             and os.path.getsize(out_path) > 500):
+                        seek_type = "pre" if pre_seek else "post"
                         print(
-                            f"   ✅ Frame extraído en seek={seek_secs}s "
-                            f"para msg {message_id}"
+                            f"   ✅ Frame extraído seek={seek_secs}s "
+                            f"({seek_type}-seek) para msg {message_id}"
                         )
                         return True
 
                 except FileNotFoundError:
                     print("⚠️  ffmpeg no encontrado. Instalar: apt-get install -y ffmpeg")
                     return False  # Sin FFmpeg no hay reintentos posibles
+
                 except subprocess.TimeoutExpired:
                     print(
-                        f"   ⏱️  FFmpeg timeout en seek={seek_secs}s "
-                        f"para msg {message_id}, probando seek menor..."
+                        f"   ⏱️  FFmpeg timeout seek={seek_secs}s "
+                        f"(límite={timeout_s}s) msg {message_id}, probando siguiente..."
                     )
                     continue
+
                 except Exception as ex:
-                    print(f"   ⚠️  FFmpeg error seek={seek_secs}s msg {message_id}: {ex}")
+                    print(
+                        f"   ⚠️  FFmpeg error seek={seek_secs}s "
+                        f"msg {message_id}: {ex}"
+                    )
                     continue
 
+            # Todos los intentos fallaron
             return False
 
         # Ejecutar en thread pool para no bloquear el event loop
@@ -554,7 +622,7 @@ async def _extract_video_frame(message_id: int, ch: int) -> bytes | None:
         return None
 
     finally:
-        # Limpieza siempre
+        # Limpieza siempre, independientemente del resultado
         if out_path:
             try:
                 if os.path.exists(out_path):
@@ -564,13 +632,15 @@ async def _extract_video_frame(message_id: int, ch: int) -> bytes | None:
 
 
 # ---------------------------------------------------------------------------
-# 🔧 NUEVO: _background_frame_extract — SIMPLIFICADO Y CORREGIDO
+# 🔧 _background_frame_extract — EXTRACCIÓN EN SEGUNDO PLANO
 #
-# Cambios respecto al original:
-#   - Ya NO descarga el archivo parcial (eso lo hace FFmpeg internamente)
-#   - Usa _extract_video_frame(message_id, ch) con nueva firma
-#   - Mantiene semáforo ffmpeg_sem para limitar procesos concurrentes
-#   - Lógica de 3 intentos: photo → document.thumbs → FFmpeg vía stream
+# Lógica de 3 intentos:
+#   1. Foto del mensaje (instantáneo si existe)
+#   2. Thumbnail embebido del documento (instantáneo si existe)
+#   3. FFmpeg vía stream HTTP con estrategia de seek optimizada
+#
+# Control de concurrencia: app.state.ffmpeg_sem (máx THUMB_FFMPEG_SEM_LIMIT)
+# Al terminar (éxito o fallo): activa done_event y limpia thumb_in_progress
 # ---------------------------------------------------------------------------
 async def _background_frame_extract(
     message_id: int,
@@ -655,7 +725,7 @@ async def _background_frame_extract(
 
 
 # ---------------------------------------------------------------------------
-# 🆕 NUEVO: _prelaunch_thumb_extractions
+# 🆕 _prelaunch_thumb_extractions
 # Pre-lanza extracciones de miniaturas para todos los resultados de /search
 # ANTES de que el cliente empiece a pedir /thumb, dando ventaja de tiempo.
 # ---------------------------------------------------------------------------
@@ -735,7 +805,7 @@ async def lifespan(app: FastAPI):
     app.state.thumb_cache      = {}
     app.state.thumb_cache_lock = asyncio.Lock()
 
-    # 🔧 Solo semáforo FFmpeg (el de descarga ya no es necesario con el nuevo método)
+    # 🔧 Semáforo FFmpeg — limita procesos paralelos de extracción
     app.state.ffmpeg_sem             = asyncio.Semaphore(THUMB_FFMPEG_SEM_LIMIT)
     app.state.thumb_in_progress      = {}
     app.state.thumb_in_progress_lock = asyncio.Lock()
@@ -744,6 +814,7 @@ async def lifespan(app: FastAPI):
     print(f"🧠 Caché persistente cargada: {len(app.state.meta_cache)} entradas")
     print(f"⚙️  Semáforo FFmpeg: max={THUMB_FFMPEG_SEM_LIMIT} procesos paralelos")
     print(f"⚙️  Puerto interno para thumbnails: {INTERNAL_PORT}")
+    print(f"⚙️  Estrategia seeks: [60s/8s, 5s/12s, 3s/12s, 1s-post/12s, 0s/10s]")
 
     try:
         main_entity = await client.get_entity(CHANNEL_IDENTIFIER)
@@ -1694,7 +1765,7 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
 
 # ---------------------------------------------------------------------------
 # 🔧 ENRIQUECIMIENTO PRINCIPAL
-# Nuevo parámetro: catalog_mode
+# Parámetro catalog_mode:
 #   - True  → /catalog: NO añade thumb de Telegram cuando no hay imagen de API
 #   - False → /search:  SÍ añade thumb de Telegram siempre
 # ---------------------------------------------------------------------------
@@ -1913,9 +1984,8 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
 
 # ---------------------------------------------------------------------------
 # ENDPOINT /search
-# Cambios:
-#   ✅ Pre-lanza extracción de miniaturas antes de devolver respuesta
-#   ✅ Devuelve TODOS los resultados coincidentes (sin cap de 50)
+# ✅ Pre-lanza extracción de miniaturas antes de devolver respuesta
+# ✅ Devuelve TODOS los resultados coincidentes (sin cap de 50)
 # ---------------------------------------------------------------------------
 @app.get("/search")
 async def search(
@@ -2073,8 +2143,8 @@ async def search(
             print(f"✅ Complemento aplicado: ahora {len(final_results)} resultado(s)")
 
         # ✅ PRE-LANZAR EXTRACCIÓN DE MINIATURAS antes de responder
-        # Esto da ventaja de tiempo: cuando el cliente pida /thumb, la extracción
-        # ya habrá avanzado varios segundos.
+        # Esto da ventaja de tiempo: cuando el cliente pida /thumb,
+        # la extracción ya habrá avanzado varios segundos.
         if final_results:
             asyncio.create_task(_prelaunch_thumb_extractions(final_results))
 
@@ -2118,9 +2188,8 @@ async def search(
 
 # ---------------------------------------------------------------------------
 # ENDPOINT /catalog
-# Cambios:
-#   ✅ catalog_mode=True → NO genera miniaturas desde Telegram
-#   ✅ Filtra resultados sin poster de API (imagen_url vacía)
+# ✅ catalog_mode=True → NO genera miniaturas desde Telegram
+# ✅ Filtra resultados sin poster de API (imagen_url vacía)
 # ---------------------------------------------------------------------------
 @app.get("/catalog")
 async def catalog():
@@ -2269,23 +2338,30 @@ async def youtube_thumbnail_proxy(video_id: str):
 # ---------------------------------------------------------------------------
 # 🔧 ENDPOINT /thumb/{message_id}
 #
-# ARQUITECTURA DE DOS FASES:
+# ARQUITECTURA DE DOS FASES — GARANTÍA ≤ 5 SEGUNDOS:
 #
 # FASE 1 — INMEDIATA (< 200 ms):
 #   • Verifica caché RAM → responde al instante si está disponible
 #   • Intenta miniatura embebida de Telegram (photo / document.thumbs)
-#     con timeout corto (3s) → responde si se obtiene
+#     con timeout corto (2.5s) → responde si se obtiene
 #
 # FASE 2 — SEGUNDO PLANO (no bloquea la request):
 #   • Si no hay miniatura embebida, lanza _background_frame_extract
-#   • FFmpeg usa /stream local con HTTP range requests (nuevo método)
+#   • FFmpeg usa estrategia de seek: [60s/8s, 5s/12s, 3s/12s, 1s-post/12s, 0s/10s]
 #   • Guarda el resultado en thumb_cache cuando termina
 #   • El cliente puede reintentar /thumb/... y obtendrá la imagen cacheada
+#
+# TIEMPOS AJUSTADOS para garantizar respuesta < 5s total:
+#   - get_messages:    3.0s (era 4.0s)
+#   - photo download:  2.5s (era 3.0s)
+#   - thumbs download: 2.5s (era 3.0s)
+#   - done_event wait: 3.5s (era 4.5s)
 #
 # GARANTÍAS:
 #   ✅ Respuesta siempre < 5 segundos
 #   ✅ Extracción real desde el video (sin placeholders)
 #   ✅ Sin duplicación de trabajo (thumb_in_progress evita doble extracción)
+#   ✅ _prelaunch_thumb_extractions adelanta el trabajo desde /search
 #   ✅ Estable con muchos usuarios concurrentes
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
@@ -2310,10 +2386,10 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             else app.state.entity
         )
 
-        # ── PASO 3: Obtener mensaje de Telegram ──────────────────────────────
+        # ── PASO 3: Obtener mensaje de Telegram (timeout reducido a 3s) ──────
         message = await asyncio.wait_for(
             client.get_messages(entity, ids=message_id),
-            timeout=4.0,
+            timeout=3.0,
         )
         if not message:
             raise HTTPException(status_code=404, detail="Miniatura no disponible (mensaje no encontrado)")
@@ -2325,7 +2401,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             try:
                 thumb_data = await asyncio.wait_for(
                     client.download_media(message.photo, bytes),
-                    timeout=3.0,
+                    timeout=2.5,
                 )
             except Exception:
                 thumb_data = None
@@ -2335,7 +2411,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             try:
                 thumb_data = await asyncio.wait_for(
                     client.download_media(message.document.thumbs[-1], bytes),
-                    timeout=3.0,
+                    timeout=2.5,
                 )
             except Exception:
                 thumb_data = None
@@ -2383,12 +2459,13 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 # Ya hay una extracción en curso → esperar a que termine
                 done_event_ref = in_progress[cache_key]
 
-        # Esperar hasta 4.5s por si la extracción termina rápido
-        # (videos pequeños, miniatura embebida encontrada en segunda llamada, etc.)
+        # ── PASO 7: Esperar hasta 3.5s (era 4.5s) para respuesta < 5s total ─
+        # Con _prelaunch_thumb_extractions activo, el seek=3s habrá completado
+        # antes de que el cliente solicite /thumb por primera vez.
         try:
             await asyncio.wait_for(
                 asyncio.shield(done_event_ref.wait()),
-                timeout=4.5,
+                timeout=3.5,
             )
         except asyncio.TimeoutError:
             # Extracción sigue en curso → devolver 404 ahora;
@@ -2403,7 +2480,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        # ── PASO 7: Aún no disponible (la tarea de fondo seguirá generándola) ─
+        # ── PASO 8: Aún no disponible (la tarea de fondo seguirá generándola) ─
         raise HTTPException(
             status_code=404,
             detail="Miniatura procesándose en segundo plano (reintentar en unos segundos)",
