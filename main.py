@@ -96,42 +96,6 @@ TARGET_THUMB_WIDTH  = 500
 TARGET_THUMB_HEIGHT = 750
 
 # ---------------------------------------------------------------------------
-# ✅ SMART STREAMING CAPTURE (sin descargar el video completo)
-# ---------------------------------------------------------------------------
-# Tiempo objetivo principal para evitar pantallas negras/intros
-THUMB_SMART_PRIMARY_SECOND = int(os.getenv("THUMB_SMART_PRIMARY_SECOND", "120"))
-
-# Fallbacks si 120 falla
-_THUMB_SMART_FALLBACKS_RAW = os.getenv("THUMB_SMART_FALLBACK_SECONDS", "90,60,30,10,2,0")
-try:
-    THUMB_SMART_FALLBACK_SECONDS = [
-        int(x.strip()) for x in _THUMB_SMART_FALLBACKS_RAW.split(",") if x.strip().isdigit()
-    ]
-except Exception:
-    THUMB_SMART_FALLBACK_SECONDS = [90, 60, 30, 10, 2, 0]
-
-# Cuánto esperar en el request antes de devolver 404 pero dejar tarea en background
-THUMB_CAPTURE_REQUEST_WAIT = float(os.getenv("THUMB_CAPTURE_REQUEST_WAIT", "3.2"))
-
-# Timeout duro interno de ffmpeg por intento (cada timestamp)
-THUMB_FFMPEG_TIMEOUT_PER_TRY = float(os.getenv("THUMB_FFMPEG_TIMEOUT_PER_TRY", "6.5"))
-
-# Máxima concurrencia de capturas simultáneas (protege CPU/I/O)
-THUMB_EXTRACT_CONCURRENCY = max(1, min(6, int(os.getenv("THUMB_EXTRACT_CONCURRENCY", "2"))))
-
-# Escaneo final (último recurso) en primeros N segundos buscando primer frame no negro
-THUMB_NON_BLACK_SCAN_SECONDS = max(6, min(40, int(os.getenv("THUMB_NON_BLACK_SCAN_SECONDS", "15"))))
-
-# Base interna para ffmpeg (preferible loopback para no depender de PUBLIC_URL)
-INTERNAL_BASE_URL = os.getenv("INTERNAL_BASE_URL", "").strip().rstrip("/")
-
-def _internal_ffmpeg_base_url() -> str:
-    if INTERNAL_BASE_URL:
-        return INTERNAL_BASE_URL
-    port = int(os.getenv("PORT", "8080"))
-    return f"http://127.0.0.1:{port}"
-
-# ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
 SEARCH_CHANNEL_CACHE_TTL          = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
@@ -485,303 +449,20 @@ def _youtube_thumb_from_stream_url(stream_url):
 
 
 # ---------------------------------------------------------------------------
-# ✅ SMART CAPTURE HELPERS (detección de frames negros + ffmpeg por stream)
-# ---------------------------------------------------------------------------
-def _is_mostly_black(image_bytes: bytes, pixel_threshold: int = 14, black_ratio: float = 0.92) -> bool:
-    """
-    Devuelve True si la imagen es mayormente negra.
-    Usa Pillow si está disponible; si no, asume que NO es negra (no bloquea).
-    """
-    if not _PIL_AVAILABLE or not image_bytes:
-        return False
-    try:
-        img = _PIL_Image.open(io.BytesIO(image_bytes)).convert("L")
-        img = img.resize((64, 64))
-        px = list(img.getdata())
-        if not px:
-            return False
-        black = sum(1 for p in px if p <= pixel_threshold)
-        return (black / len(px)) >= black_ratio
-    except Exception:
-        return False
-
-
-def _get_message_duration_seconds(message) -> int | None:
-    """
-    Intenta obtener duración del video (segundos) desde atributos del mensaje.
-    """
-    try:
-        # message.video suele tener duration
-        if getattr(message, "video", None) is not None:
-            d = getattr(message.video, "duration", None)
-            if isinstance(d, int) and d > 0:
-                return d
-        # fallback: attributes del documento
-        doc = getattr(message, "document", None)
-        attrs = getattr(doc, "attributes", None) if doc else None
-        if attrs:
-            for a in attrs:
-                d = getattr(a, "duration", None)
-                if isinstance(d, int) and d > 0:
-                    return d
-    except Exception:
-        pass
-    return None
-
-
-def _build_smart_seek_candidates(duration_s: int | None) -> list[int]:
-    """
-    Genera lista de segundos para intentar:
-    - Prioridad: 120
-    - Fallbacks: 90,60,30,10,2,0
-    Ajusta automáticamente si el video es corto.
-    """
-    candidates = []
-
-    primary = THUMB_SMART_PRIMARY_SECOND
-    fallbacks = list(THUMB_SMART_FALLBACK_SECONDS)
-
-    if isinstance(duration_s, int) and duration_s > 0:
-        # Si el video es corto, intentamos un punto "válido" cerca del 20% o (dur-2)
-        if duration_s <= 5:
-            primary_adj = 0
-        elif duration_s < (primary + 2):
-            primary_adj = max(0, min(int(duration_s * 0.2), duration_s - 2))
-        else:
-            primary_adj = primary
-        candidates.append(primary_adj)
-
-        # Ajustar fallbacks para que no sobrepasen duration-2
-        for s in fallbacks:
-            if duration_s <= 2:
-                ss = 0
-            else:
-                ss = min(s, max(0, duration_s - 2))
-            candidates.append(ss)
-    else:
-        candidates.append(primary)
-        candidates.extend(fallbacks)
-
-    # Dedup preservando orden, y no negativos
-    seen = set()
-    out = []
-    for s in candidates:
-        try:
-            s_int = int(s)
-        except Exception:
-            continue
-        if s_int < 0:
-            continue
-        if s_int not in seen:
-            seen.add(s_int)
-            out.append(s_int)
-    return out
-
-
-async def _ffmpeg_capture_jpeg_from_url(input_url: str, seek_second: int, timeout_s: float) -> bytes | None:
-    """
-    Captura 1 frame JPEG con ffmpeg desde una URL (con soporte Range via /stream).
-    NO descarga el video completo: ffmpeg hace lectura parcial/seek.
-    """
-    if not input_url:
-        return None
-
-    def _run():
-        try:
-            # -ss antes de -i => seek rápido (streaming-friendly)
-            # image2pipe => stdout con JPEG
-            # probesize/analyzeduration moderados para rapidez y estabilidad
-            cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-rw_timeout", str(int(8_000_000)),            # microsegundos (I/O)
-                "-probesize", "5M",
-                "-analyzeduration", "5000000",
-                "-ss", str(max(0, int(seek_second))),
-                "-i", input_url,
-                "-frames:v", "1",
-                "-an", "-sn", "-dn",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "pipe:1",
-            ]
-            r = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=max(1.0, float(timeout_s)),
-            )
-            if r.returncode == 0 and r.stdout and len(r.stdout) > 2048:
-                return r.stdout
-            return None
-        except FileNotFoundError:
-            print("⚠️  ffmpeg no encontrado. Instalar con: apt-get install -y ffmpeg")
-            return None
-        except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            return None
-
-    return await asyncio.to_thread(_run)
-
-
-async def _ffmpeg_find_first_non_black(input_url: str, scan_seconds: int, timeout_s: float) -> bytes | None:
-    """
-    Último recurso:
-    Extrae 1 fps durante scan_seconds y devuelve el primer frame que no sea negro.
-    Usa archivos temporales para simplicidad (raro que se ejecute).
-    """
-    if not input_url:
-        return None
-
-    def _run_scan():
-        tmpdir = None
-        try:
-            tmpdir = tempfile.mkdtemp(prefix="thumbscan_")
-            pattern = os.path.join(tmpdir, "f_%03d.jpg")
-
-            cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-rw_timeout", str(int(10_000_000)),
-                "-probesize", "5M",
-                "-analyzeduration", "5000000",
-                "-ss", "0",
-                "-i", input_url,
-                "-t", str(int(scan_seconds)),
-                "-vf", "fps=1",
-                "-q:v", "4",
-                "-an", "-sn", "-dn",
-                pattern,
-            ]
-            subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(2.0, float(timeout_s)),
-            )
-
-            # Leer frames en orden y elegir primer no negro
-            try:
-                files = sorted(
-                    [f for f in os.listdir(tmpdir) if f.lower().endswith(".jpg")]
-                )
-            except Exception:
-                files = []
-
-            for fn in files:
-                fp = os.path.join(tmpdir, fn)
-                try:
-                    with open(fp, "rb") as f:
-                        data = f.read()
-                    if data and len(data) > 2048 and not _is_mostly_black(data):
-                        return data
-                except Exception:
-                    continue
-
-            # Si todos negros, devolver el primero que exista
-            for fn in files:
-                fp = os.path.join(tmpdir, fn)
-                try:
-                    with open(fp, "rb") as f:
-                        data = f.read()
-                    if data and len(data) > 2048:
-                        return data
-                except Exception:
-                    continue
-            return None
-        except FileNotFoundError:
-            return None
-        except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            return None
-        finally:
-            if tmpdir:
-                try:
-                    for fn in os.listdir(tmpdir):
-                        try:
-                            os.unlink(os.path.join(tmpdir, fn))
-                        except Exception:
-                            pass
-                    try:
-                        os.rmdir(tmpdir)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-    return await asyncio.to_thread(_run_scan)
-
-
-# ---------------------------------------------------------------------------
 # 🔧 NUEVO: Extrae un frame real del video Telegram cuando no hay miniatura
-# (MEJORADO: Smart Streaming Capture por URL + fallbacks + no-black)
 # ---------------------------------------------------------------------------
-async def _extract_video_frame(message, message_id: int | None = None, ch: int = 0) -> bytes | None:
+async def _extract_video_frame(message) -> bytes | None:
     """
-    Extrae un frame real del video SIN descargarlo completo.
-    Estrategia:
-    1) Smart Streaming Capture con ffmpeg apuntando a /stream/{id}?ch=...
-       - intenta segundo 120
-       - si falla: 90,60,30,10,2,0 (ajustado si video es corto)
-       - si sale frame negro: sigue intentando
-    2) Último recurso: escanear primeros N segundos y elegir primer frame no negro
-    3) Fallback legacy: descargar porción inicial (~10MB) y extraer frame (por compatibilidad)
+    Descarga los primeros ~10 MB del video y extrae un frame con ffmpeg.
+    Devuelve los bytes JPEG del frame, o None si falla.
+    Solo se llama cuando no hay miniatura disponible en Telegram ni en TMDB.
     """
-    FRAME_DOWNLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB máximo (fallback legacy)
+    FRAME_DOWNLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB máximo
 
     vf_path  = None
     out_path = None
-
-    msg_id = message_id or getattr(message, "id", None)
-    if not msg_id:
-        return None
-
-    # URL interna para ffmpeg (loopback por defecto)
-    input_url = f"{_internal_ffmpeg_base_url()}/stream/{int(msg_id)}?ch={int(ch)}"
-
     try:
-        # --- SMART: intentar timestamps con ffmpeg vía stream ---
-        duration_s = _get_message_duration_seconds(message)
-        candidates = _build_smart_seek_candidates(duration_s)
-
-        got_any_frame = None
-
-        for sec in candidates:
-            frame = await _ffmpeg_capture_jpeg_from_url(
-                input_url=input_url,
-                seek_second=sec,
-                timeout_s=THUMB_FFMPEG_TIMEOUT_PER_TRY,
-            )
-            if not frame:
-                continue
-
-            got_any_frame = frame
-            if not _is_mostly_black(frame):
-                print(f"   🎞️  SmartCapture OK (msg {msg_id}) @ {sec}s")
-                return frame
-            else:
-                print(f"   ⚫ Frame negro (msg {msg_id}) @ {sec}s, probando siguiente...")
-
-        # --- Último recurso: buscar primer frame no negro en primeros N segundos ---
-        scan = await _ffmpeg_find_first_non_black(
-            input_url=input_url,
-            scan_seconds=THUMB_NON_BLACK_SCAN_SECONDS,
-            timeout_s=max(8.0, THUMB_FFMPEG_TIMEOUT_PER_TRY * 2),
-        )
-        if scan:
-            print(f"   🎞️  SmartScan OK (msg {msg_id}) primer no negro en 0..{THUMB_NON_BLACK_SCAN_SECONDS}s")
-            return scan
-
-        # Si al menos obtuvimos algo, devolverlo (aunque sea oscuro) antes de legacy
-        if got_any_frame:
-            print(f"   🎞️  SmartCapture devolviendo mejor esfuerzo (msg {msg_id})")
-            return got_any_frame
-
-        # --- LEGACY fallback (por compatibilidad): descargar porción inicial y ffmpeg local ---
+        # --- 1. Descargar porción inicial del video ---
         chunks = []
         total  = 0
         async for chunk in client.iter_download(
@@ -800,22 +481,23 @@ async def _extract_video_frame(message, message_id: int | None = None, ch: int =
 
         video_data = b"".join(chunks)
 
+        # --- 2. Escribir a archivo temporal ---
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(video_data)
             vf_path = vf.name
 
         out_path = vf_path + "_frame.jpg"
 
-        def _run_ffmpeg_legacy():
+        # --- 3. Ejecutar ffmpeg para extraer frame ---
+        def _run_ffmpeg():
             try:
                 result = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-hide_banner",
-                        "-loglevel", "error",
                         "-i",      vf_path,
-                        "-ss",     "00:00:02",
+                        "-ss",     "00:02:00",   # 🔧 Frame en el segundo 120 (2 minutos)
                         "-vframes", "1",
+                        "-q:v",    "2",           # Alta calidad
                         out_path,
                     ],
                     capture_output=True,
@@ -829,29 +511,59 @@ async def _extract_video_frame(message, message_id: int | None = None, ch: int =
                 return None
 
         result = await asyncio.wait_for(
-            asyncio.to_thread(_run_ffmpeg_legacy),
+            asyncio.to_thread(_run_ffmpeg),
             timeout=12.0,
         )
 
         if result is None:
             return None
 
+        # Si el frame en el segundo 120 falla, intentar con alternativas
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            # Fallback: probar segundos 30, 60, 90, y el primer frame (0)
+            for fallback_ss in ["00:00:30", "00:01:00", "00:01:30", "00:00:01"]:
+                def _run_ffmpeg_fallback(ss):
+                    try:
+                        return subprocess.run(
+                            [
+                                "ffmpeg", "-y",
+                                "-i",      vf_path,
+                                "-ss",     ss,
+                                "-vframes", "1",
+                                "-q:v",    "2",
+                                out_path,
+                            ],
+                            capture_output=True,
+                            timeout=10,
+                        )
+                    except Exception:
+                        return None
+
+                result_fb = await asyncio.wait_for(
+                    asyncio.to_thread(_run_ffmpeg_fallback, fallback_ss),
+                    timeout=12.0,
+                )
+                if result_fb is not None and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    print(f"   🎞️  Frame extraído en segundo alternativo {fallback_ss}")
+                    break
+
         if os.path.exists(out_path):
             with open(out_path, "rb") as f:
                 frame_data = f.read()
             if frame_data:
-                print(f"   🎞️  Frame extraído (legacy) del video (msg {msg_id})")
+                print(f"   🎞️  Frame extraído correctamente del video (msg {message.id})")
                 return frame_data
 
         return None
 
     except asyncio.TimeoutError:
-        print(f"⚠️  Timeout extrayendo frame del video (msg {msg_id})")
+        print(f"⚠️  Timeout extrayendo frame del video (msg {getattr(message, 'id', '?')})")
         return None
     except Exception as e:
-        print(f"⚠️  Error en _extract_video_frame (msg {msg_id}): {e}")
+        print(f"⚠️  Error en _extract_video_frame (msg {getattr(message, 'id', '?')}): {e}")
         return None
     finally:
+        # --- 4. Limpieza de archivos temporales ---
         for p in [vf_path, out_path]:
             if p:
                 try:
@@ -881,11 +593,6 @@ async def lifespan(app: FastAPI):
 
     app.state.thumb_cache      = {}
     app.state.thumb_cache_lock = asyncio.Lock()
-
-    # ✅ NUEVO: control de concurrencia y tareas en background para miniaturas
-    app.state.thumb_extract_sem = asyncio.Semaphore(THUMB_EXTRACT_CONCURRENCY)
-    app.state.thumb_pending     = set()
-    app.state.thumb_pending_lock = asyncio.Lock()
 
     app.state.meta_cache = await _load_persistent_cache()
     print(f"🧠 Caché persistente cargada: {len(app.state.meta_cache)} entradas")
@@ -2383,9 +2090,8 @@ async def youtube_thumbnail_proxy(video_id: str):
 # 🔧 ENDPOINT /thumb/{message_id} — MODIFICADO
 # Cambios aplicados SOLO a Telegram:
 # - NO usa imagen genérica / placeholder en ningún caso dentro de /thumb
-# - Si no hay thumb embebida => extrae frame real del video (Smart Streaming Capture)
+# - Si no hay thumb embebida => extrae frame real del video
 # - Recorta siempre a 500x750 cover sin deformar
-# - Optimización: extracción corre en background si tarda
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
@@ -2423,7 +2129,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 message.document.thumbs[-1], bytes
             )
 
-        # --- Intento 3: extraer frame real del video (Smart Streaming Capture + fallbacks) ---
+        # --- Intento 3: extraer frame real del video ---
         if not thumb_data:
             is_video = (
                 message.document is not None
@@ -2432,52 +2138,14 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 and "video" in message.file.mime_type.lower()
             )
             if is_video:
-                print(f"   🎞️  Sin miniatura en msg {message_id}, iniciando SmartCapture...")
-
-                async def _extract_and_cache():
-                    try:
-                        async with app.state.thumb_extract_sem:
-                            frame = await _extract_video_frame(message, message_id=message_id, ch=ch)
-                        if not frame:
-                            return None
-                        frame = _crop_cover_to_poster(frame)
-                        mime  = "image/jpeg"
-                        async with app.state.thumb_cache_lock:
-                            _thumb_cache_prune(thumb_cache)
-                            thumb_cache[cache_key] = (time.monotonic(), frame, mime)
-                        return frame
-                    finally:
-                        # liberar "pending" si se estaba usando
-                        try:
-                            async with app.state.thumb_pending_lock:
-                                if cache_key in app.state.thumb_pending:
-                                    app.state.thumb_pending.discard(cache_key)
-                        except Exception:
-                            pass
-
-                # Evitar duplicar tareas si ya hay una captura en curso
-                already_pending = False
+                print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
                 try:
-                    async with app.state.thumb_pending_lock:
-                        if cache_key in app.state.thumb_pending:
-                            already_pending = True
-                        else:
-                            app.state.thumb_pending.add(cache_key)
-                except Exception:
-                    already_pending = False
-
-                if already_pending:
-                    # No bloquear: devolver 404 rápido (la captura ya está en curso)
-                    raise HTTPException(status_code=404, detail="Miniatura no disponible (generándose en segundo plano)")
-
-                task = asyncio.create_task(_extract_and_cache())
-
-                try:
-                    thumb_data = await asyncio.wait_for(asyncio.shield(task), timeout=THUMB_CAPTURE_REQUEST_WAIT)
+                    thumb_data = await asyncio.wait_for(
+                        _extract_video_frame(message),
+                        timeout=25.0,
+                    )
                 except asyncio.TimeoutError:
-                    print(f"   ⚠️  SmartCapture tardó >{THUMB_CAPTURE_REQUEST_WAIT}s (msg {message_id}). Sigue en background...")
-                    thumb_data = None
-                except Exception:
+                    print(f"   ⚠️  Timeout extrayendo frame del video msg {message_id}")
                     thumb_data = None
 
         if not thumb_data:
