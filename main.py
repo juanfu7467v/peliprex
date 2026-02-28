@@ -69,8 +69,7 @@ PLACEHOLDER_IMAGE_BASE = (
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN / LÍMITES
 # ---------------------------------------------------------------------------
-# 🔧 Reducimos un poco la concurrencia para evitar saturar el ancho de banda en descargas de frames
-MAX_CONCURRENCY           = max(3,  min(10, int(os.getenv("MAX_CONCURRENCY",           "8"))))
+MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "10"))))
 CATALOG_POOL_TTL          = max(60,         int(os.getenv("CATALOG_POOL_TTL",          "600")))
 CATALOG_FETCH_CONCURRENCY = max(1,  min(10, int(os.getenv("CATALOG_FETCH_CONCURRENCY", "5"))))
 MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",            "25"))))
@@ -81,10 +80,9 @@ CACHE_SAVE_EVERY      = 10
 # ---------------------------------------------------------------------------
 # STREAMING (FIX DEFINITIVO)
 # ---------------------------------------------------------------------------
-# 🔧 Optimización de Buffering: Aumentamos el tamaño de chunk para streaming más fluido
 STREAM_CHUNK_SIZE = max(
-    256 * 1024,
-    min(4 * 1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(1024 * 1024))))
+    64 * 1024,
+    min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024))))
 )
 
 # ---------------------------------------------------------------------------
@@ -103,9 +101,8 @@ TARGET_THUMB_HEIGHT = 750
 SEARCH_CHANNEL_CACHE_TTL          = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
 SEARCH_CHANNEL_CACHE_LIMIT        = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
 SEARCH_CHANNEL_WARMUP_CONCURRENCY = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
-# 🔧 Optimización: Aumentamos el timeout para evitar errores de fetching en canales lentos
-SEARCH_CHANNEL_FETCH_TIMEOUT      = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "8.0"))
-CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "12.0"))
+SEARCH_CHANNEL_FETCH_TIMEOUT      = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
+CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
 
 # ---------------------------------------------------------------------------
 # ✅ NUEVO: MÍNIMO DE RESULTADOS POR CATEGORÍA
@@ -457,29 +454,16 @@ def _youtube_thumb_from_stream_url(stream_url):
 # ---------------------------------------------------------------------------
 async def _extract_video_frame(message) -> bytes | None:
     """
-    Extrae un frame del video usando Smart Streaming Capture.
-    - Para videos largos (>1h): captura en el segundo 120 (2 min).
-    - Para videos cortos: captura en el segundo 2.
-    Optimizado: descarga solo lo estrictamente necesario para el frame.
+    Descarga los primeros ~10 MB del video y extrae un frame con ffmpeg.
+    Devuelve los bytes JPEG del frame, o None si falla.
+    Solo se llama cuando no hay miniatura disponible en Telegram ni en TMDB.
     """
-    duration_secs = 0
-    if message.document and message.document.attributes:
-        for attr in message.document.attributes:
-            if hasattr(attr, 'duration'):
-                duration_secs = attr.duration
-                break
-    
-    is_long_video = duration_secs > 3600
-    seek_time = 120 if is_long_video else 2
-    
+    FRAME_DOWNLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB máximo
+
     vf_path  = None
     out_path = None
     try:
-        # 🔧 Reducimos drásticamente el tamaño de descarga inicial.
-        # Para la mayoría de los MP4, los primeros 15-20MB contienen los metadatos (moov atom)
-        # y los primeros segundos/minutos de video.
-        FRAME_DOWNLOAD_LIMIT = 20 * 1024 * 1024 if is_long_video else 8 * 1024 * 1024
-
+        # --- 1. Descargar porción inicial del video ---
         chunks = []
         total  = 0
         async for chunk in client.iter_download(
@@ -493,40 +477,42 @@ async def _extract_video_frame(message) -> bytes | None:
             if total >= FRAME_DOWNLOAD_LIMIT:
                 break
 
-        if not chunks: return None
+        if not chunks:
+            return None
+
         video_data = b"".join(chunks)
 
+        # --- 2. Escribir a archivo temporal ---
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(video_data)
             vf_path = vf.name
 
         out_path = vf_path + "_frame.jpg"
 
+        # --- 3. Ejecutar ffmpeg para extraer frame ---
         def _run_ffmpeg():
             try:
-                # 🔧 Optimizamos ffmpeg para archivos truncados
-                # -ss ANTES de -i es mucho más rápido y no intenta leer todo el archivo
                 result = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-ss",     str(seek_time),
                         "-i",      vf_path,
+                        "-ss",     "00:00:02",   # Frame en el segundo 2
                         "-vframes", "1",
-                        "-update", "1",
-                        "-f",      "image2",
                         out_path,
                     ],
                     capture_output=True,
-                    timeout=15,
+                    timeout=10,
                 )
                 return result
-            except Exception as e:
-                print(f"⚠️ Error ffmpeg: {e}")
+            except FileNotFoundError:
+                print("⚠️  ffmpeg no encontrado. Instalar con: apt-get install -y ffmpeg")
+                return None
+            except subprocess.TimeoutExpired:
                 return None
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_run_ffmpeg),
-            timeout=20.0,
+            timeout=12.0,
         )
 
         if result is None:
@@ -2125,7 +2111,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if is_video:
                 print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
                 try:
-                    # 🔧 Reducimos el timeout global de la miniatura para no bloquear el catálogo
                     thumb_data = await asyncio.wait_for(
                         _extract_video_frame(message),
                         timeout=25.0,
@@ -2256,8 +2241,8 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 "Content-Type":      content_type,
                 "Accept-Ranges":     "bytes",
                 "Content-Length":    str(content_length),
-                "Cache-Control":     "public, max-age=3600",
-                "X-Accel-Buffering": "yes", # Permitir buffering de Nginx/Proxy
+                "Cache-Control":     "no-store",
+                "X-Accel-Buffering": "no",
             }
 
             return StreamingResponse(
@@ -2296,8 +2281,8 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             "Accept-Ranges":     "bytes",
             "Content-Range":     f"bytes {start}-{end}/{file_size}",
             "Content-Length":    str(content_length),
-            "Cache-Control":     "public, max-age=3600",
-            "X-Accel-Buffering": "yes",
+            "Cache-Control":     "no-store",
+            "X-Accel-Buffering": "no",
         }
 
         return StreamingResponse(
