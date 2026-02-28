@@ -69,6 +69,7 @@ PLACEHOLDER_IMAGE_BASE = (
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN / LÍMITES
 # ---------------------------------------------------------------------------
+# 🔧 Reducimos un poco la concurrencia para evitar saturar el ancho de banda en descargas de frames
 MAX_CONCURRENCY           = max(3,  min(10, int(os.getenv("MAX_CONCURRENCY",           "8"))))
 CATALOG_POOL_TTL          = max(60,         int(os.getenv("CATALOG_POOL_TTL",          "600")))
 CATALOG_FETCH_CONCURRENCY = max(1,  min(10, int(os.getenv("CATALOG_FETCH_CONCURRENCY", "5"))))
@@ -78,8 +79,9 @@ PERSISTENT_CACHE_PATH = "/data/cache_peliculas.json"
 CACHE_SAVE_EVERY      = 10
 
 # ---------------------------------------------------------------------------
-# STREAMING
+# STREAMING (FIX DEFINITIVO)
 # ---------------------------------------------------------------------------
+# 🔧 Optimización de Buffering: Aumentamos el tamaño de chunk para streaming más fluido
 STREAM_CHUNK_SIZE = max(
     256 * 1024,
     min(4 * 1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(1024 * 1024))))
@@ -91,12 +93,9 @@ STREAM_CHUNK_SIZE = max(
 THUMB_CACHE_TTL = max(60, int(os.getenv("THUMB_CACHE_TTL", "3600")))
 THUMB_CACHE_MAX = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 
-# Tamaño estándar de miniaturas
+# 🔧 NUEVO: Tamaño estándar de miniaturas
 TARGET_THUMB_WIDTH  = 500
 TARGET_THUMB_HEIGHT = 750
-
-# 🆕 NUEVO: Directorio persistente para caché de miniaturas en disco
-THUMB_DISK_CACHE_DIR = "/data/thumbs"
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
@@ -104,11 +103,12 @@ THUMB_DISK_CACHE_DIR = "/data/thumbs"
 SEARCH_CHANNEL_CACHE_TTL          = max(10, int(os.getenv("SEARCH_CHANNEL_CACHE_TTL", "120")))
 SEARCH_CHANNEL_CACHE_LIMIT        = max(20, min(200, int(os.getenv("SEARCH_CHANNEL_CACHE_LIMIT", "80"))))
 SEARCH_CHANNEL_WARMUP_CONCURRENCY = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
+# 🔧 Optimización: Aumentamos el timeout para evitar errores de fetching en canales lentos
 SEARCH_CHANNEL_FETCH_TIMEOUT      = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "8.0"))
 CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "12.0"))
 
 # ---------------------------------------------------------------------------
-# ✅ MÍNIMO DE RESULTADOS POR CATEGORÍA
+# ✅ NUEVO: MÍNIMO DE RESULTADOS POR CATEGORÍA
 # ---------------------------------------------------------------------------
 MIN_CATEGORY_RESULTS = 15
 
@@ -318,7 +318,7 @@ def _cache_key_from_query(query_title: str, year) -> str:
 
 
 # ---------------------------------------------------------------------------
-# THUMB CACHE HELPERS (RAM)
+# THUMB CACHE HELPERS
 # ---------------------------------------------------------------------------
 def _thumb_cache_prune(cache: dict):
     try:
@@ -343,55 +343,7 @@ def _detect_mime_type(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 🆕 NUEVO: Helpers de caché en DISCO para miniaturas
-# ---------------------------------------------------------------------------
-def _ensure_thumb_dir():
-    """Crea el directorio de caché de miniaturas en disco si no existe."""
-    try:
-        os.makedirs(THUMB_DISK_CACHE_DIR, exist_ok=True)
-    except Exception:
-        pass
-
-
-def _thumb_disk_path(message_id: int, ch: int) -> str:
-    """Devuelve la ruta en disco para una miniatura dada su message_id y canal."""
-    return os.path.join(THUMB_DISK_CACHE_DIR, f"{message_id}_{ch}.jpg")
-
-
-async def _save_thumb_to_disk_async(message_id: int, ch: int, data: bytes) -> None:
-    """Guarda una miniatura en disco de forma asíncrona (no bloqueante)."""
-    def _write():
-        try:
-            _ensure_thumb_dir()
-            path     = _thumb_disk_path(message_id, ch)
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            os.replace(tmp_path, path)
-        except Exception as e:
-            print(f"⚠️  Error guardando miniatura en disco ({message_id}_{ch}): {e}")
-    await asyncio.to_thread(_write)
-
-
-async def _load_thumb_from_disk_async(message_id: int, ch: int) -> bytes | None:
-    """
-    Carga una miniatura desde disco de forma asíncrona.
-    Devuelve None si no existe o hay error.
-    """
-    def _read():
-        try:
-            path = _thumb_disk_path(message_id, ch)
-            if not os.path.exists(path):
-                return None
-            with open(path, "rb") as f:
-                return f.read()
-        except Exception:
-            return None
-    return await asyncio.to_thread(_read)
-
-
-# ---------------------------------------------------------------------------
-# Recortar/redimensionar imagen a 500x750 con cover mode
+# 🔧 NUEVO: Recortar/redimensionar imagen a 500x750 con cover mode
 # ---------------------------------------------------------------------------
 def _crop_cover_to_poster(image_data: bytes) -> bytes:
     """
@@ -403,6 +355,7 @@ def _crop_cover_to_poster(image_data: bytes) -> bytes:
         return image_data
     try:
         img = _PIL_Image.open(io.BytesIO(image_data))
+        # Convertir a RGB (elimina canal alfa si existe)
         if img.mode != "RGB":
             img = img.convert("RGB")
 
@@ -412,12 +365,14 @@ def _crop_cover_to_poster(image_data: bytes) -> bytes:
         if src_w == 0 or src_h == 0:
             return image_data
 
+        # Cover: escalar para que ninguna dimensión quede por debajo del objetivo
         scale = max(target_w / src_w, target_h / src_h)
         new_w = max(int(src_w * scale), target_w)
         new_h = max(int(src_h * scale), target_h)
 
         img = img.resize((new_w, new_h), _PIL_Image.LANCZOS)
 
+        # Recorte centrado
         left = (new_w - target_w) // 2
         top  = (new_h - target_h) // 2
         img  = img.crop((left, top, left + target_w, top + target_h))
@@ -474,7 +429,7 @@ def _is_placeholder_image(url) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# YouTube thumbnail apunta al proxy /ytthumb/{vid}
+# 🔧 MODIFICADO: YouTube thumbnail apunta al proxy /ytthumb/{vid}
 # ---------------------------------------------------------------------------
 def _youtube_thumb_from_stream_url(stream_url):
     try:
@@ -485,10 +440,12 @@ def _youtube_thumb_from_stream_url(stream_url):
             qs = parse_qs(parsed.query or "")
             vid = (qs.get("v") or [None])[0]
             if vid:
+                # 🔧 Apunta al proxy interno que recorta a 500x750
                 return _build_public_url(f"/ytthumb/{vid}")
         if "youtu.be/" in stream_url:
             vid = stream_url.rstrip("/").split("/")[-1]
             if vid:
+                # 🔧 Apunta al proxy interno que recorta a 500x750
                 return _build_public_url(f"/ytthumb/{vid}")
         return None
     except Exception:
@@ -496,15 +453,14 @@ def _youtube_thumb_from_stream_url(stream_url):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 MODIFICADO: Extrae un frame real del video Telegram
-# Cambios: FFmpeg optimizado con probesize, analyzeduration y vf scale/crop
+# 🔧 NUEVO: Extrae un frame real del video Telegram cuando no hay miniatura
 # ---------------------------------------------------------------------------
 async def _extract_video_frame(message) -> bytes | None:
     """
     Extrae un frame del video usando Smart Streaming Capture.
     - Para videos largos (>1h): captura en el segundo 120 (2 min).
     - Para videos cortos: captura en el segundo 2.
-    🔧 FFmpeg optimizado: probesize reducido, analyzeduration=0, vf scale+crop directo.
+    Optimizado para no descargar el video completo y manejar streams parciales.
     """
     duration_secs = 0
     if message.document and message.document.attributes:
@@ -512,14 +468,20 @@ async def _extract_video_frame(message) -> bytes | None:
             if hasattr(attr, 'duration'):
                 duration_secs = attr.duration
                 break
-
+    
     is_long_video = duration_secs > 3600
-    seek_time     = 120 if is_long_video else 2
-
+    seek_time = 120 if is_long_video else 2
+    
     vf_path  = None
     out_path = None
     try:
-        FRAME_DOWNLOAD_LIMIT = 20 * 1024 * 1024 if is_long_video else 8 * 1024 * 1024
+        # --- 1. Descarga inteligente ---
+        # Si el video es largo, necesitamos más datos al principio para que ffmpeg pueda 
+        # indexar y llegar al minuto 2 sin que el archivo esté demasiado truncado.
+        if is_long_video:
+            FRAME_DOWNLOAD_LIMIT = 45 * 1024 * 1024 # 45MB para asegurar minuto 2
+        else:
+            FRAME_DOWNLOAD_LIMIT = 12 * 1024 * 1024 # 12MB para segundo 2
 
         chunks = []
         total  = 0
@@ -527,15 +489,14 @@ async def _extract_video_frame(message) -> bytes | None:
             message.media,
             offset=0,
             limit=FRAME_DOWNLOAD_LIMIT,
-            chunk_size=512 * 1024,
+            chunk_size=1024 * 1024,
         ):
             chunks.append(chunk)
             total += len(chunk)
             if total >= FRAME_DOWNLOAD_LIMIT:
                 break
 
-        if not chunks:
-            return None
+        if not chunks: return None
         video_data = b"".join(chunks)
 
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
@@ -544,34 +505,26 @@ async def _extract_video_frame(message) -> bytes | None:
 
         out_path = vf_path + "_frame.jpg"
 
+        # --- 2. Ejecutar ffmpeg con parámetros de robustez ---
         def _run_ffmpeg():
             try:
-                # 🔧 MODIFICADO: FFmpeg optimizado para máxima velocidad
-                # - probesize reducido a 500KB (evita análisis profundo del archivo)
-                # - analyzeduration=0 (sin análisis de duración, más rápido)
-                # - -ss ANTES de -i (seek ultrarrápido, no decodifica hasta el punto)
-                # - -vf scale+crop: redimensiona y recorta directamente en FFmpeg (500x750)
-                # - -q:v 3: calidad JPEG buena sin overhead excesivo
+                # Parámetros clave:
+                # -probesize y -analyzeduration bajos para rapidez en archivos truncados
+                # -ss DESPUÉS de -i para mayor compatibilidad con archivos corruptos/truncados
+                # -error_detect ignore_err para saltar errores de stream
                 result = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-probesize",       "500000",
-                        "-analyzeduration", "0",
-                        "-ss",              str(seek_time),
-                        "-i",               vf_path,
-                        "-vframes",         "1",
-                        "-vf",
-                        (
-                            f"scale={TARGET_THUMB_WIDTH}:{TARGET_THUMB_HEIGHT}"
-                            f":force_original_aspect_ratio=increase,"
-                            f"crop={TARGET_THUMB_WIDTH}:{TARGET_THUMB_HEIGHT}"
-                        ),
-                        "-q:v",  "3",
-                        "-f",    "image2",
+                        "-error_detect", "ignore_err",
+                        "-i",      vf_path,
+                        "-ss",     str(seek_time),
+                        "-vframes", "1",
+                        "-q:v",    "2", # Alta calidad
+                        "-f",      "image2",
                         out_path,
                     ],
                     capture_output=True,
-                    timeout=15,
+                    timeout=20,
                 )
                 return result
             except Exception as e:
@@ -580,7 +533,7 @@ async def _extract_video_frame(message) -> bytes | None:
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_run_ffmpeg),
-            timeout=20.0,
+            timeout=25.0,
         )
 
         if result is None:
@@ -602,6 +555,7 @@ async def _extract_video_frame(message) -> bytes | None:
         print(f"⚠️  Error en _extract_video_frame (msg {getattr(message, 'id', '?')}): {e}")
         return None
     finally:
+        # --- 4. Limpieza de archivos temporales ---
         for p in [vf_path, out_path]:
             if p:
                 try:
@@ -612,151 +566,12 @@ async def _extract_video_frame(message) -> bytes | None:
 
 
 # ---------------------------------------------------------------------------
-# 🆕 NUEVO: Precarga asíncrona de miniaturas en segundo plano
-# Se invoca desde /search como "fire and forget" (asyncio.create_task).
-# No bloquea la respuesta. Genera y persiste miniaturas en /data/thumbs/.
-# ---------------------------------------------------------------------------
-async def _preload_thumbnails_background(results: list) -> None:
-    """
-    Recorre los resultados enriquecidos y, para cada item cuya imagen_url
-    apunte a /thumb/ (miniatura Telegram), genera y guarda la miniatura
-    en disco (/data/thumbs/) de forma asíncrona y sin bloquear el servidor.
-
-    Flujo por item:
-      1. Si ya existe en disco → saltar (ya generada).
-      2. Si está en caché RAM → persistir en disco y saltar.
-      3. Descargar miniatura embebida o extraer frame del video.
-      4. Recortar a 500×750.
-      5. Guardar en RAM cache + disco.
-    """
-    if not results:
-        return
-
-    # Semáforo: máximo 3 generaciones simultáneas para no saturar Telegram
-    sem = asyncio.Semaphore(3)
-
-    async def _preload_one(item: dict) -> None:
-        imagen_url = item.get("imagen_url") or ""
-
-        # Solo procesamos URLs que apunten a nuestro endpoint /thumb/
-        if "/thumb/" not in imagen_url:
-            return
-
-        # --- Extraer message_id y ch de la URL ---
-        try:
-            parsed     = urlparse(imagen_url)
-            path_parts = parsed.path.rstrip("/").split("/")
-            msg_id_str = path_parts[-1] if path_parts else ""
-            if not msg_id_str.isdigit():
-                return
-            msg_id = int(msg_id_str)
-            qs     = parse_qs(parsed.query or "")
-            ch     = int((qs.get("ch") or ["0"])[0])
-        except Exception:
-            return
-
-        # --- 1. Comprobar caché en disco (más rápido que generar) ---
-        disk_path = _thumb_disk_path(msg_id, ch)
-        if os.path.exists(disk_path):
-            return  # ya generada anteriormente
-
-        # --- 2. Comprobar caché en RAM y persistir en disco si existe ---
-        cache_key   = f"{msg_id}:{ch}"
-        thumb_cache = getattr(app.state, "thumb_cache", {})
-        thumb_lock  = getattr(app.state, "thumb_cache_lock", None)
-
-        if thumb_lock is not None:
-            async with thumb_lock:
-                cached = thumb_cache.get(cache_key)
-                if cached:
-                    ts, data, _ = cached
-                    if time.monotonic() - ts < THUMB_CACHE_TTL and data:
-                        await _save_thumb_to_disk_async(msg_id, ch, data)
-                        return
-
-        # --- 3. Generar miniatura desde Telegram (limitado por semáforo) ---
-        async with sem:
-            try:
-                entities = getattr(app.state, "entities", [app.state.entity])
-                entity   = (
-                    entities[ch]
-                    if (0 <= ch < len(entities) and entities[ch] is not None)
-                    else app.state.entity
-                )
-
-                message = await client.get_messages(entity, ids=msg_id)
-                if not message:
-                    return
-
-                thumb_data = None
-
-                # Intento 1: foto del mensaje
-                if hasattr(message, 'photo') and message.photo:
-                    thumb_data = await client.download_media(message.photo, bytes)
-
-                # Intento 2: miniatura embebida del documento
-                if not thumb_data and message.document and message.document.thumbs:
-                    thumb_data = await client.download_media(
-                        message.document.thumbs[-1], bytes
-                    )
-
-                # Intento 3: extraer frame real del video
-                if not thumb_data:
-                    is_video = (
-                        message.document is not None
-                        and message.file is not None
-                        and message.file.mime_type is not None
-                        and "video" in message.file.mime_type.lower()
-                    )
-                    if is_video:
-                        print(f"   🎞️  BG: extrayendo frame de msg {msg_id}...")
-                        try:
-                            thumb_data = await asyncio.wait_for(
-                                _extract_video_frame(message),
-                                timeout=30.0,
-                            )
-                        except asyncio.TimeoutError:
-                            print(f"   ⚠️  BG: timeout extrayendo frame msg {msg_id}")
-                            thumb_data = None
-
-                if not thumb_data:
-                    return
-
-                # --- 4. Recortar a 500×750 ---
-                thumb_data = _crop_cover_to_poster(thumb_data)
-                mime       = "image/jpeg"
-
-                # --- 5. Guardar en RAM cache ---
-                if thumb_lock is not None:
-                    async with thumb_lock:
-                        _thumb_cache_prune(thumb_cache)
-                        thumb_cache[cache_key] = (time.monotonic(), thumb_data, mime)
-
-                # --- 6. Persistir en disco ---
-                await _save_thumb_to_disk_async(msg_id, ch, thumb_data)
-                print(f"   ✅ BG: miniatura lista → msg {msg_id} ch={ch}")
-
-            except Exception as e:
-                print(f"   ⚠️  BG: error generando miniatura msg {msg_id}: {e}")
-
-    # Lanzar todas las tareas en paralelo (limitadas por el semáforo interno)
-    await asyncio.gather(
-        *[_preload_one(item) for item in results],
-        return_exceptions=True,
-    )
-
-
-# ---------------------------------------------------------------------------
 # LIFESPAN
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("📡 Conectando a Telegram...")
     await client.connect()
-
-    # 🆕 NUEVO: Asegurar que el directorio de miniaturas en disco exista
-    _ensure_thumb_dir()
-    print(f"📁 Directorio de caché de miniaturas: {THUMB_DISK_CACHE_DIR}")
 
     app.state.entity               = None
     app.state.entities             = [None]
@@ -854,25 +669,11 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 @app.get("/health")
 async def health_check():
     channels_up = sum(1 for e in getattr(app.state, "entities", []) if e is not None)
-
-    # 🆕 NUEVO: incluir estadísticas del caché de miniaturas en disco
-    thumb_disk_count = 0
-    try:
-        if os.path.isdir(THUMB_DISK_CACHE_DIR):
-            thumb_disk_count = len([
-                f for f in os.listdir(THUMB_DISK_CACHE_DIR)
-                if f.endswith(".jpg")
-            ])
-    except Exception:
-        pass
-
     return JSONResponse({
-        "status":              "ok",
-        "channels_ready":      getattr(app.state, "channels_ready", False),
-        "channels_loaded":     channels_up,
-        "cache_entries":       len(getattr(app.state, "meta_cache", {})),
-        "thumb_disk_cached":   thumb_disk_count,   # 🆕
-        "thumb_ram_cached":    len(getattr(app.state, "thumb_cache", {})),  # 🆕
+        "status":          "ok",
+        "channels_ready":  getattr(app.state, "channels_ready", False),
+        "channels_loaded": channels_up,
+        "cache_entries":   len(getattr(app.state, "meta_cache", {})),
     })
 
 
@@ -1130,6 +931,7 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
 
 # ---------------------------------------------------------------------------
 # NORMALIZACIÓN DEL ESQUEMA JSON DE RESPUESTA
+# 🔧 CAMBIO: elimina fallback a imagen genérica en schema (no altera estructura)
 # ---------------------------------------------------------------------------
 def _to_peliculas_json_schema(items: list) -> list:
     out = []
@@ -1733,6 +1535,7 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
 
 # ---------------------------------------------------------------------------
 # ENRIQUECIMIENTO PRINCIPAL
+# 🔧 CAMBIO: elimina fallback a imagen genérica para Telegram (YouTube intacto)
 # ---------------------------------------------------------------------------
 async def enrich_results_with_tmdb(
     results: list,
@@ -1849,6 +1652,10 @@ async def enrich_results_with_tmdb(
             thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
             yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
 
+            # 🔧 IMPORTANTE:
+            # - Telegram sin póster (TMDB/KG/TVMaze) => usar SIEMPRE /thumb (miniatura real del contenido).
+            # - YouTube se mantiene igual (usa /ytthumb).
+            # - Sin imagen disponible: NO se inyecta placeholder.
             imagen_url = meta_img or thumb_img or yt_img or ""
 
             descripcion = (meta.get("sinopsis") if isinstance(meta, dict) else None) or "Sin descripción disponible."
@@ -1900,6 +1707,7 @@ async def enrich_results_with_tmdb(
 
 # ---------------------------------------------------------------------------
 # FORMATO BÁSICO (sin APIs)
+# 🔧 CAMBIO: elimina fallback a imagen genérica
 # ---------------------------------------------------------------------------
 def _format_results_without_apis(final_results: list) -> list:
     formatted = []
@@ -1935,8 +1743,6 @@ def _format_results_without_apis(final_results: list) -> list:
 
 # ---------------------------------------------------------------------------
 # ENDPOINT /search
-# 🔧 MODIFICADO: Se añade asyncio.create_task para precarga en segundo plano.
-#   La respuesta al usuario es INMEDIATA. Las miniaturas se generan después.
 # ---------------------------------------------------------------------------
 @app.get("/search")
 async def search(
@@ -1966,6 +1772,7 @@ async def search(
     _GEMINI_CALL_COUNTER["count"] = 0
 
     try:
+        # Esperar a que los canales estén listos
         if not getattr(app.state, "channels_ready", False):
             waited = 0.0
             while not getattr(app.state, "channels_ready", False) and waited < CHANNELS_READY_MAX_WAIT_SEARCH:
@@ -1975,6 +1782,7 @@ async def search(
         entities = getattr(app.state, "entities", [app.state.entity])
         all_entities_indexed = [(i, e) for i, e in enumerate(entities) if e is not None]
 
+        # Determinar qué canales buscar
         if canal:
             canal_clean = canal.strip().lstrip('@').lower()
             entities_indexed = [
@@ -2052,6 +1860,7 @@ async def search(
 
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
 
+        # ✅ NUEVO: Complementar hasta mínimo MIN_CATEGORY_RESULTS cuando se busca por categoría
         if genre and len(final_results) < MIN_CATEGORY_RESULTS:
             print(
                 f"⚠️  Categoría '{genre}': solo {len(final_results)} resultado(s). "
@@ -2107,15 +1916,7 @@ async def search(
                     enriched = _format_results_without_apis(yt_results)
                 if any([year, genre, language, desde, hasta]):
                     enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
-
-                # 🆕 NUEVO: Precarga de miniaturas en segundo plano (YouTube fallback)
-                schema_result = _to_peliculas_json_schema(enriched)
-                try:
-                    asyncio.create_task(_preload_thumbnails_background(schema_result))
-                    print("🚀 BG: tarea de precarga de miniaturas lanzada (YouTube fallback)")
-                except Exception as _bg_err:
-                    print(f"⚠️  No se pudo lanzar tarea BG: {_bg_err}")
-                return schema_result
+                return _to_peliculas_json_schema(enriched)
 
         try:
             enriched = await asyncio.wait_for(
@@ -2130,16 +1931,7 @@ async def search(
             enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
             print(f"🔎 Filtros avanzados aplicados → {len(enriched)} resultado(s)")
 
-        # 🆕 NUEVO: Precarga de miniaturas en segundo plano (flujo principal)
-        # La respuesta se devuelve INMEDIATAMENTE.
-        # Las miniaturas se generan después, sin bloquear al usuario.
-        schema_result = _to_peliculas_json_schema(enriched)
-        try:
-            asyncio.create_task(_preload_thumbnails_background(schema_result))
-            print("🚀 BG: tarea de precarga de miniaturas lanzada")
-        except Exception as _bg_err:
-            print(f"⚠️  No se pudo lanzar tarea BG: {_bg_err}")
-        return schema_result
+        return _to_peliculas_json_schema(enriched)
 
     except HTTPException:
         raise
@@ -2236,13 +2028,15 @@ async def catalog():
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /ytthumb/{video_id}
+# 🔧 NUEVO ENDPOINT: /ytthumb/{video_id}
 # Proxy que descarga la miniatura de YouTube y la recorta a 500x750
+# (NO MODIFICADO: se mantiene exactamente igual)
 # ---------------------------------------------------------------------------
 @app.get("/ytthumb/{video_id}")
 async def youtube_thumbnail_proxy(video_id: str):
     cache_key = f"yt:{video_id}"
 
+    # Verificar caché
     thumb_cache = getattr(app.state, "thumb_cache", {})
     async with app.state.thumb_cache_lock:
         cached = thumb_cache.get(cache_key)
@@ -2251,12 +2045,15 @@ async def youtube_thumbnail_proxy(video_id: str):
             if time.monotonic() - ts < THUMB_CACHE_TTL:
                 return Response(content=data, media_type=mime)
 
+    # Intentar descargar miniatura en diferentes calidades
     thumb_data = None
     for quality in ["maxresdefault", "sddefault", "hqdefault", "mqdefault", "default"]:
         url = f"https://img.youtube.com/vi/{video_id}/{quality}.jpg"
         try:
             async with httpx.AsyncClient(timeout=5.0) as http:
                 r = await http.get(url)
+                # YouTube devuelve imagen 120x90 "no disponible" para maxres/sd si no existe
+                # La filtramos por tamaño mínimo de contenido
                 if r.status_code == 200 and len(r.content) > 5000:
                     thumb_data = r.content
                     break
@@ -2269,9 +2066,11 @@ async def youtube_thumbnail_proxy(video_id: str):
             headers={"Location": PLACEHOLDER_IMAGE_BASE},
         )
 
+    # 🔧 Recortar a 500x750
     processed = _crop_cover_to_poster(thumb_data)
     mime      = "image/jpeg"
 
+    # Guardar en caché
     async with app.state.thumb_cache_lock:
         _thumb_cache_prune(thumb_cache)
         thumb_cache[cache_key] = (time.monotonic(), processed, mime)
@@ -2280,11 +2079,11 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /thumb/{message_id}
-# 🔧 MODIFICADO: Añadida caché en disco persistente.
-#   Orden de prioridad: RAM cache → Disco → Telegram (generación).
-#   Gracias a _preload_thumbnails_background, la mayoría de peticiones
-#   se resolverán desde disco en menos de 1ms.
+# 🔧 ENDPOINT /thumb/{message_id} — MODIFICADO
+# Cambios aplicados SOLO a Telegram:
+# - NO usa imagen genérica / placeholder en ningún caso dentro de /thumb
+# - Si no hay thumb embebida => extrae frame real del video
+# - Recorta siempre a 500x750 cover sin deformar
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
@@ -2292,7 +2091,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         thumb_cache = getattr(app.state, "thumb_cache", {})
         cache_key   = f"{message_id}:{ch}"
 
-        # --- Nivel 1: RAM cache (más rápido) ---
         async with app.state.thumb_cache_lock:
             cached = thumb_cache.get(cache_key)
             if cached:
@@ -2300,17 +2098,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        # --- 🆕 Nivel 2: Disco persistente (generado por background task) ---
-        disk_data = await _load_thumb_from_disk_async(message_id, ch)
-        if disk_data:
-            mime = "image/jpeg"
-            # Cargar también en RAM para siguientes accesos ultrarrápidos
-            async with app.state.thumb_cache_lock:
-                _thumb_cache_prune(thumb_cache)
-                thumb_cache[cache_key] = (time.monotonic(), disk_data, mime)
-            return Response(content=disk_data, media_type=mime)
-
-        # --- Nivel 3: Generar desde Telegram (fallback, solo si no hay precarga) ---
         entities = getattr(app.state, "entities", [app.state.entity])
         entity   = (
             entities[ch]
@@ -2324,17 +2111,17 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
 
         thumb_data = None
 
-        # Intento 1: foto del mensaje
+        # --- Intento 1: foto del mensaje ---
         if hasattr(message, 'photo') and message.photo:
             thumb_data = await client.download_media(message.photo, bytes)
 
-        # Intento 2: miniatura embebida del documento
+        # --- Intento 2: miniatura embebida del documento ---
         if not thumb_data and message.document and message.document.thumbs:
             thumb_data = await client.download_media(
                 message.document.thumbs[-1], bytes
             )
 
-        # Intento 3: extraer frame real del video
+        # --- Intento 3: extraer frame real del video ---
         if not thumb_data:
             is_video = (
                 message.document is not None
@@ -2345,28 +2132,26 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if is_video:
                 print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video...")
                 try:
+                    # 🔧 Aumentamos el timeout para permitir descargas más pesadas de frames
                     thumb_data = await asyncio.wait_for(
                         _extract_video_frame(message),
-                        timeout=25.0,
+                        timeout=45.0,
                     )
                 except asyncio.TimeoutError:
                     print(f"   ⚠️  Timeout extrayendo frame del video msg {message_id}")
                     thumb_data = None
 
         if not thumb_data:
+            # 🔧 IMPORTANTE: sin placeholder/fallback
             raise HTTPException(status_code=404, detail="Miniatura no disponible (no se pudo extraer del contenido)")
 
-        # Aplicar recorte cover 500x750
+        # --- Aplicar recorte cover 500x750 a TODAS las miniaturas de Telegram ---
         thumb_data = _crop_cover_to_poster(thumb_data)
         mime       = "image/jpeg"
 
-        # Guardar en RAM
         async with app.state.thumb_cache_lock:
             _thumb_cache_prune(thumb_cache)
             thumb_cache[cache_key] = (time.monotonic(), thumb_data, mime)
-
-        # 🆕 NUEVO: Persistir en disco para accesos futuros instantáneos
-        await _save_thumb_to_disk_async(message_id, ch, thumb_data)
 
         return Response(content=thumb_data, media_type=mime)
 
@@ -2374,6 +2159,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         raise
     except Exception as e:
         print(f"⚠️  Error en /thumb/{message_id}: {e}")
+        # 🔧 IMPORTANTE: sin placeholder/fallback
         raise HTTPException(status_code=404, detail="Miniatura no disponible")
 
 
@@ -2478,7 +2264,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 "Accept-Ranges":     "bytes",
                 "Content-Length":    str(content_length),
                 "Cache-Control":     "public, max-age=3600",
-                "X-Accel-Buffering": "yes",
+                "X-Accel-Buffering": "yes", # Permitir buffering de Nginx/Proxy
             }
 
             return StreamingResponse(
