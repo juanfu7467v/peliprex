@@ -97,6 +97,12 @@ THUMB_CACHE_MAX = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 TARGET_THUMB_WIDTH  = 500
 TARGET_THUMB_HEIGHT = 750
 
+# ✅ NUEVO: Caché persistente de miniaturas en disco (/data)
+THUMB_DISK_DIR = os.getenv("THUMB_DISK_DIR", "/data/thumbs").strip() or "/data/thumbs"
+
+# ✅ NUEVO: Concurrencia de generación de miniaturas (ffmpeg + descargas)
+THUMB_GEN_CONCURRENCY = max(1, min(6, int(os.getenv("THUMB_GEN_CONCURRENCY", "2"))))
+
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
 # ---------------------------------------------------------------------------
@@ -343,6 +349,286 @@ def _detect_mime_type(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ✅ NUEVO: helpers de miniaturas persistentes (/data)
+# ---------------------------------------------------------------------------
+def _ensure_thumb_disk_dir_exists():
+    try:
+        os.makedirs(THUMB_DISK_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️  No se pudo crear THUMB_DISK_DIR={THUMB_DISK_DIR}: {e}")
+
+
+def _thumb_disk_path(message_id: int, ch: int) -> str:
+    safe_mid = int(message_id)
+    safe_ch  = int(ch)
+    return os.path.join(THUMB_DISK_DIR, f"{safe_mid}_{safe_ch}.jpg")
+
+
+async def _read_file_bytes(path: str) -> bytes | None:
+    def _read():
+        try:
+            if not path or (not os.path.exists(path)):
+                return None
+            with open(path, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
+    return await asyncio.to_thread(_read)
+
+
+async def _write_file_bytes_atomic(path: str, data: bytes) -> bool:
+    def _write():
+        try:
+            if not path or not data:
+                return False
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, path)
+            return True
+        except Exception as e:
+            print(f"⚠️  Error guardando miniatura en disco: {e}")
+            try:
+                if path and os.path.exists(path + ".tmp"):
+                    os.unlink(path + ".tmp")
+            except Exception:
+                pass
+            return False
+    return await asyncio.to_thread(_write)
+
+
+async def _thumb_get_from_memory_or_disk(message_id: int, ch: int) -> tuple[bytes | None, str]:
+    """
+    Devuelve (bytes, mime). Si no existe, (None, "image/jpeg").
+    - Primero mira caché RAM
+    - Luego mira disco /data/thumbs
+    """
+    mime = "image/jpeg"
+    try:
+        thumb_cache = getattr(app.state, "thumb_cache", {})
+        cache_key   = f"{int(message_id)}:{int(ch)}"
+        async with app.state.thumb_cache_lock:
+            cached = thumb_cache.get(cache_key)
+            if cached:
+                ts, data, cmime = cached
+                if time.monotonic() - ts < THUMB_CACHE_TTL and data:
+                    return data, (cmime or mime)
+    except Exception:
+        pass
+
+    # disco
+    try:
+        path = _thumb_disk_path(int(message_id), int(ch))
+        data = await _read_file_bytes(path)
+        if data and _is_valid_image_bytes(data):
+            # subimos a RAM
+            try:
+                thumb_cache = getattr(app.state, "thumb_cache", {})
+                cache_key   = f"{int(message_id)}:{int(ch)}"
+                async with app.state.thumb_cache_lock:
+                    _thumb_cache_prune(thumb_cache)
+                    thumb_cache[cache_key] = (time.monotonic(), data, mime)
+            except Exception:
+                pass
+            return data, mime
+    except Exception:
+        pass
+
+    return None, mime
+
+
+async def _mark_thumb_inflight(cache_key: str) -> bool:
+    """
+    Devuelve True si logró marcar como inflight (es decir, no estaba en progreso).
+    """
+    try:
+        lock = getattr(app.state, "thumb_inflight_lock", None)
+        infl = getattr(app.state, "thumb_inflight", None)
+        if lock is None or infl is None:
+            return False
+        async with lock:
+            if cache_key in infl:
+                return False
+            infl.add(cache_key)
+            return True
+    except Exception:
+        return False
+
+
+async def _unmark_thumb_inflight(cache_key: str) -> None:
+    try:
+        lock = getattr(app.state, "thumb_inflight_lock", None)
+        infl = getattr(app.state, "thumb_inflight", None)
+        if lock is None or infl is None:
+            return
+        async with lock:
+            infl.discard(cache_key)
+    except Exception:
+        pass
+
+
+async def _generate_and_persist_thumb(message_id: int, ch: int) -> None:
+    """
+    Generación real (background):
+    - descarga miniatura embebida o extrae frame con ffmpeg
+    - recorta a 500x750
+    - guarda en /data/thumbs y RAM cache
+    """
+    cache_key = f"{int(message_id)}:{int(ch)}"
+    sem = getattr(app.state, "thumb_gen_semaphore", None)
+    if sem is None:
+        sem = asyncio.Semaphore(THUMB_GEN_CONCURRENCY)
+
+    try:
+        async with sem:
+            # Evitar trabajo si ya existe en disco mientras esperábamos
+            path = _thumb_disk_path(int(message_id), int(ch))
+            if os.path.exists(path):
+                return
+
+            entities = getattr(app.state, "entities", [app.state.entity])
+            entity   = (
+                entities[ch]
+                if (0 <= ch < len(entities) and entities[ch] is not None)
+                else app.state.entity
+            )
+
+            message = await client.get_messages(entity, ids=int(message_id))
+            if not message:
+                return
+
+            thumb_data = None
+
+            # --- Intento 1: foto del mensaje ---
+            if hasattr(message, 'photo') and message.photo:
+                try:
+                    thumb_data = await client.download_media(message.photo, bytes)
+                except Exception:
+                    thumb_data = None
+
+            # --- Intento 2: miniatura embebida del documento ---
+            if not thumb_data and message.document and message.document.thumbs:
+                try:
+                    thumb_data = await client.download_media(
+                        message.document.thumbs[-1], bytes
+                    )
+                except Exception:
+                    thumb_data = None
+
+            # --- Intento 3: extraer frame real del video (ROBUSTO) ---
+            if not thumb_data:
+                is_video = (
+                    message.document is not None
+                    and message.file is not None
+                    and message.file.mime_type is not None
+                    and "video" in (message.file.mime_type or "").lower()
+                )
+                if is_video:
+                    try:
+                        # background: damos más margen global, pero sin bloquear endpoints
+                        thumb_data = await asyncio.wait_for(
+                            _extract_video_frame(message),
+                            timeout=45.0,
+                        )
+                    except asyncio.TimeoutError:
+                        thumb_data = None
+                    except Exception:
+                        thumb_data = None
+
+            if not thumb_data:
+                return
+
+            if not _is_valid_image_bytes(thumb_data):
+                return
+
+            # recorte estándar
+            thumb_data = _crop_cover_to_poster(thumb_data)
+            if not thumb_data:
+                return
+
+            # guardar en disco
+            ok = await _write_file_bytes_atomic(path, thumb_data)
+            if not ok:
+                return
+
+            # guardar en RAM cache
+            try:
+                thumb_cache = getattr(app.state, "thumb_cache", {})
+                async with app.state.thumb_cache_lock:
+                    _thumb_cache_prune(thumb_cache)
+                    thumb_cache[cache_key] = (time.monotonic(), thumb_data, "image/jpeg")
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"⚠️  Error generando miniatura BG ({cache_key}): {e}")
+    finally:
+        await _unmark_thumb_inflight(cache_key)
+
+
+async def _ensure_thumb_bg(message_id: int, ch: int) -> None:
+    """
+    Disparar y olvidar:
+    - si existe (RAM/disco): nada
+    - si no existe: marca inflight y crea task
+    """
+    try:
+        data, _ = await _thumb_get_from_memory_or_disk(int(message_id), int(ch))
+        if data:
+            return
+
+        cache_key = f"{int(message_id)}:{int(ch)}"
+        marked = await _mark_thumb_inflight(cache_key)
+        if not marked:
+            return
+
+        asyncio.create_task(_generate_and_persist_thumb(int(message_id), int(ch)))
+    except Exception:
+        # Si algo falla antes de marcar, no pasa nada.
+        pass
+
+
+async def _prewarm_thumbnails_from_results(enriched_results: list) -> None:
+    """
+    Recorre resultados ya enriquecidos y dispara generación BG de miniaturas
+    SOLO cuando la imagen actual sea del tipo /thumb/...
+    (no bloquea, no altera respuesta).
+    """
+    try:
+        if not enriched_results:
+            return
+
+        # límite suave para no disparar demasiados ffmpeg por búsqueda
+        max_to_prewarm = max(10, min(50, int(os.getenv("THUMB_PREWARM_LIMIT", "30"))))
+        count = 0
+
+        for r in (enriched_results or []):
+            if count >= max_to_prewarm:
+                break
+
+            try:
+                img = (r.get("imagen_url") or "").strip()
+                if "/thumb/" not in img:
+                    continue
+
+                mid = r.get("id")
+                if mid is None:
+                    continue
+
+                # ch desde pelicula_url (stream_url)
+                pu = (r.get("pelicula_url") or r.get("stream_url") or "").strip()
+                ch = _extract_ch_from_stream_url(pu) if pu else 0
+
+                count += 1
+                await _ensure_thumb_bg(int(mid), int(ch))
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"⚠️  Error en prewarm thumbnails: {e}")
+
+
+# ---------------------------------------------------------------------------
 # 🔧 NUEVO: Recortar/redimensionar imagen a 500x750 con cover mode
 # ---------------------------------------------------------------------------
 def _crop_cover_to_poster(image_data: bytes) -> bytes:
@@ -490,8 +776,9 @@ def _is_valid_image_bytes(data: bytes) -> bool:
 async def _extract_video_frame(message) -> bytes | None:
     """
     MODO ROBUSTO/AGRESIVO:
-    - Reintenta extracción en: segundo 2, 60, 120, 300 (en ese orden).
-    - Usa ffmpeg con parámetros de decodificación forzada y tolerancia a errores.
+    - Reintenta extracción en: segundo 120, 60, 2, 300 (en ese orden).
+    - Usa ffmpeg con parámetros de velocidad (probesize/analyzeduration bajos) en primer intento.
+    - Si falla, usa un modo robusto con mayor tolerancia.
     - Si falla con descarga parcial, escala progresivamente el tamaño descargado.
     - Último recurso: descarga completa del video y vuelve a intentar.
     - Valida que la imagen sea real (no vacía/incorrecta) antes de devolverla.
@@ -504,8 +791,8 @@ async def _extract_video_frame(message) -> bytes | None:
                 duration_secs = attr.duration
                 break
 
-    # ✅ Reintentos solicitados (fijos)
-    seek_points = [2, 60, 120, 300]
+    # ✅ Preferencia por ~minuto 2 para posters más "representativos"
+    seek_points = [120, 60, 2, 300]
 
     # Si conocemos duración, evitamos buscar fuera (sin romper la estrategia):
     # Clamp suave (mantiene el orden y evita t>=duración).
@@ -530,8 +817,6 @@ async def _extract_video_frame(message) -> bytes | None:
         # ------------------------------------------------------------
         # 1) Descarga progresiva (prefijo) para intentar rápido
         # ------------------------------------------------------------
-        # Escalado agresivo (aumenta probabilidad con videos "difíciles")
-        # Nota: no cambia endpoints ni respuestas, solo robustez interna.
         progressive_limits = [
             8  * 1024 * 1024,    # 8 MB
             25 * 1024 * 1024,    # 25 MB
@@ -567,42 +852,45 @@ async def _extract_video_frame(message) -> bytes | None:
                 print(f"⚠️  Error descargando prefijo de video (msg {getattr(message, 'id', '?')}): {e}")
                 return bytes(downloaded) if downloaded_len > 0 else None
 
-        def _ffmpeg_extract_frame(input_path: str, seek_time: int, output_path: str) -> bool:
+        def _ffmpeg_extract_frame_fast(input_path: str, seek_time: int, output_path: str) -> bool:
             """
-            Ejecuta ffmpeg con decodificación forzada/tolerante y devuelve True si generó imagen válida.
+            FFmpeg ULTRA-RÁPIDO:
+            - analyzeduration/probesize muy bajos para evitar análisis completo.
+            - seek antes de -i
+            - 1 frame
+            - escala/crop directo a 500x750 (reduce trabajo de Pillow y salida uniforme).
             """
             try:
-                # Parámetros agresivos para archivos truncados/corruptos/lentos
+                vf = (
+                    f"scale={TARGET_THUMB_WIDTH}:{TARGET_THUMB_HEIGHT}:force_original_aspect_ratio=increase,"
+                    f"crop={TARGET_THUMB_WIDTH}:{TARGET_THUMB_HEIGHT}"
+                )
                 cmd = [
                     "ffmpeg", "-y",
                     "-hide_banner",
                     "-loglevel", "error",
                     "-nostdin",
-                    # Robustez (tolerancia a corrupción y timestamps raros)
-                    "-fflags", "+genpts+discardcorrupt",
-                    "-err_detect", "ignore_err",
-                    "-analyzeduration", "100M",
-                    "-probesize", "100M",
-                    # Seek (rápido): -ss antes de -i
                     "-ss", str(int(seek_time)),
+                    "-probesize", "32k",
+                    "-analyzeduration", "0",
                     "-i", input_path,
-                    # Forzamos 1 frame
+                    "-map", "0:v:0",
+                    "-an", "-sn",
                     "-frames:v", "1",
-                    # Evita filtros raros: genera una imagen "normal"
-                    "-f", "image2",
+                    "-vf", vf,
                     "-q:v", "3",
+                    "-f", "image2",
                     output_path,
                 ]
 
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
-                    timeout=7,   # corto por intento; el endpoint /thumb ya limita globalmente
+                    timeout=5,
                 )
 
                 if result is None:
                     return False
-
                 if not os.path.exists(output_path):
                     return False
 
@@ -616,7 +904,63 @@ async def _extract_video_frame(message) -> bytes | None:
                     return False
 
                 return True
+            except subprocess.TimeoutExpired:
+                return False
+            except Exception:
+                return False
 
+        def _ffmpeg_extract_frame_robust(input_path: str, seek_time: int, output_path: str) -> bool:
+            """
+            FFmpeg ROBUSTO:
+            - tolerancia a corrupción
+            - analyzeduration/probesize altos (fallback)
+            """
+            try:
+                vf = (
+                    f"scale={TARGET_THUMB_WIDTH}:{TARGET_THUMB_HEIGHT}:force_original_aspect_ratio=increase,"
+                    f"crop={TARGET_THUMB_WIDTH}:{TARGET_THUMB_HEIGHT}"
+                )
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-nostdin",
+                    "-fflags", "+genpts+discardcorrupt",
+                    "-err_detect", "ignore_err",
+                    "-analyzeduration", "100M",
+                    "-probesize", "100M",
+                    "-ss", str(int(seek_time)),
+                    "-i", input_path,
+                    "-map", "0:v:0",
+                    "-an", "-sn",
+                    "-frames:v", "1",
+                    "-vf", vf,
+                    "-q:v", "3",
+                    "-f", "image2",
+                    output_path,
+                ]
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=7,
+                )
+
+                if result is None:
+                    return False
+                if not os.path.exists(output_path):
+                    return False
+
+                try:
+                    with open(output_path, "rb") as f:
+                        frame_data = f.read()
+                except Exception:
+                    return False
+
+                if not _is_valid_image_bytes(frame_data):
+                    return False
+
+                return True
             except subprocess.TimeoutExpired:
                 return False
             except Exception:
@@ -633,7 +977,7 @@ async def _extract_video_frame(message) -> bytes | None:
 
             out_path = vf_path + "_frame.jpg"
 
-            # Intentos por puntos de tiempo
+            # Intentos por puntos de tiempo (FAST primero; si falla, ROBUST)
             for t in seek_list:
                 # Limpia salida anterior
                 try:
@@ -642,7 +986,11 @@ async def _extract_video_frame(message) -> bytes | None:
                 except Exception:
                     pass
 
-                ok = await asyncio.to_thread(_ffmpeg_extract_frame, vf_path, int(t), out_path)
+                ok_fast = await asyncio.to_thread(_ffmpeg_extract_frame_fast, vf_path, int(t), out_path)
+                ok = ok_fast
+                if not ok:
+                    ok = await asyncio.to_thread(_ffmpeg_extract_frame_robust, vf_path, int(t), out_path)
+
                 if not ok:
                     continue
 
@@ -651,7 +999,7 @@ async def _extract_video_frame(message) -> bytes | None:
                     with open(out_path, "rb") as f:
                         data = f.read()
                     if _is_valid_image_bytes(data):
-                        print(f"   🎞️  Frame extraído (ROBUST) msg {message.id} @ {t}s")
+                        print(f"   🎞️  Frame extraído msg {message.id} @ {t}s")
                         return data
                 except Exception:
                     continue
@@ -666,14 +1014,12 @@ async def _extract_video_frame(message) -> bytes | None:
             if not video_data:
                 continue
 
-            # Intentar con puntos 2/60/120/300 en ese orden
             try:
                 frame = await _try_extract_from_bytes(video_data, seek_points)
                 if frame and _is_valid_image_bytes(frame):
                     return frame
             except Exception as e:
                 print(f"⚠️  Error intentando extraer frame con prefijo (lim={lim}) msg {getattr(message, 'id', '?')}: {e}")
-                # No detenemos, seguimos al siguiente nivel
                 continue
             finally:
                 # Limpieza de temporales intermedios
@@ -691,13 +1037,11 @@ async def _extract_video_frame(message) -> bytes | None:
         # 3) Último recurso: descarga completa y reintento
         # ------------------------------------------------------------
         try:
-            # Descarga completa a archivo (agresivo, maximiza probabilidad)
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as ffull:
                 full_download_path = ffull.name
 
             await client.download_media(message.media, file=full_download_path)
 
-            # Reusar ffmpeg con los mismos puntos
             out_path = full_download_path + "_frame.jpg"
             for t in seek_points:
                 try:
@@ -706,7 +1050,11 @@ async def _extract_video_frame(message) -> bytes | None:
                 except Exception:
                     pass
 
-                ok = await asyncio.to_thread(_ffmpeg_extract_frame, full_download_path, int(t), out_path)
+                ok_fast = await asyncio.to_thread(_ffmpeg_extract_frame_fast, full_download_path, int(t), out_path)
+                ok = ok_fast
+                if not ok:
+                    ok = await asyncio.to_thread(_ffmpeg_extract_frame_robust, full_download_path, int(t), out_path)
+
                 if not ok:
                     continue
 
@@ -714,7 +1062,7 @@ async def _extract_video_frame(message) -> bytes | None:
                     with open(out_path, "rb") as f:
                         frame_data = f.read()
                     if _is_valid_image_bytes(frame_data):
-                        print(f"   🎞️  Frame extraído (FULL ROBUST) msg {message.id} @ {t}s")
+                        print(f"   🎞️  Frame extraído (FULL) msg {message.id} @ {t}s")
                         return frame_data
                 except Exception:
                     continue
@@ -761,6 +1109,14 @@ async def lifespan(app: FastAPI):
 
     app.state.thumb_cache      = {}
     app.state.thumb_cache_lock = asyncio.Lock()
+
+    # ✅ NUEVO: control de tasks BG de thumbnails (no bloquear)
+    app.state.thumb_gen_semaphore = asyncio.Semaphore(THUMB_GEN_CONCURRENCY)
+    app.state.thumb_inflight      = set()
+    app.state.thumb_inflight_lock = asyncio.Lock()
+
+    # ✅ NUEVO: asegurar directorio persistente para thumbs
+    _ensure_thumb_disk_dir_exists()
 
     app.state.meta_cache = await _load_persistent_cache()
     print(f"🧠 Caché persistente cargada: {len(app.state.meta_cache)} entradas")
@@ -2092,6 +2448,10 @@ async def search(
                     enriched = _format_results_without_apis(yt_results)
                 if any([year, genre, language, desde, hasta]):
                     enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
+
+                # ✅ NUEVO: precarga async (no bloquea) para /thumb si aplica
+                asyncio.create_task(_prewarm_thumbnails_from_results(enriched))
+
                 return _to_peliculas_json_schema(enriched)
 
         try:
@@ -2106,6 +2466,9 @@ async def search(
         if any([year, genre, language, desde, hasta]):
             enriched = _apply_advanced_filters(enriched, year, genre, language, desde, hasta)
             print(f"🔎 Filtros avanzados aplicados → {len(enriched)} resultado(s)")
+
+        # ✅ NUEVO: disparar precarga de miniaturas en segundo plano (NO ESPERAR)
+        asyncio.create_task(_prewarm_thumbnails_from_results(enriched))
 
         return _to_peliculas_json_schema(enriched)
 
@@ -2196,6 +2559,9 @@ async def catalog():
             print("⚠️  /catalog enrichment timeout — devolviendo formato básico")
             enriched = _format_results_without_apis(sample)
 
+        # (Opcional, sin bloquear): precargar thumbs si el catálogo usa /thumb
+        asyncio.create_task(_prewarm_thumbnails_from_results(enriched))
+
         return _to_peliculas_json_schema(enriched)
 
     except Exception as e:
@@ -2256,91 +2622,42 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 # ---------------------------------------------------------------------------
 # 🔧 ENDPOINT /thumb/{message_id} — MODIFICADO
-# Cambios aplicados SOLO a Telegram:
-# - NO usa imagen genérica / placeholder en ningún caso dentro de /thumb
-# - Si no hay thumb embebida => extrae frame real del video (modo robusto)
-# - Recorta siempre a 500x750 cover sin deformar
+# NUEVO FLUJO ASÍNCRONO (sin bloquear):
+# - Primero intenta RAM cache
+# - Luego intenta /data/thumbs (persistente)
+# - Si no existe aún:
+#     - dispara generación en segundo plano (fire & forget)
+#     - responde INMEDIATO con imagen temporal (redirect a placeholder)
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
     try:
-        thumb_cache = getattr(app.state, "thumb_cache", {})
-        cache_key   = f"{message_id}:{ch}"
+        # 1) RAM / DISCO
+        data, mime = await _thumb_get_from_memory_or_disk(int(message_id), int(ch))
+        if data:
+            return Response(
+                content=data,
+                media_type=mime,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
 
-        async with app.state.thumb_cache_lock:
-            cached = thumb_cache.get(cache_key)
-            if cached:
-                ts, data, mime = cached
-                if time.monotonic() - ts < THUMB_CACHE_TTL:
-                    return Response(content=data, media_type=mime)
+        # 2) No existe aún => disparar generación BG (no esperar)
+        asyncio.create_task(_ensure_thumb_bg(int(message_id), int(ch)))
 
-        entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
-            entities[ch]
-            if (0 <= ch < len(entities) and entities[ch] is not None)
-            else app.state.entity
+        # 3) Respuesta inmediata con imagen temporal
+        # (302 evita transferir bytes desde tu servidor y es casi instantáneo)
+        return Response(
+            status_code=302,
+            headers={"Location": PLACEHOLDER_IMAGE_BASE, "Cache-Control": "no-store"},
         )
 
-        message = await client.get_messages(entity, ids=message_id)
-        if not message:
-            raise HTTPException(status_code=404, detail="Miniatura no disponible (mensaje no encontrado)")
-
-        thumb_data = None
-
-        # --- Intento 1: foto del mensaje ---
-        if hasattr(message, 'photo') and message.photo:
-            thumb_data = await client.download_media(message.photo, bytes)
-
-        # --- Intento 2: miniatura embebida del documento ---
-        if not thumb_data and message.document and message.document.thumbs:
-            thumb_data = await client.download_media(
-                message.document.thumbs[-1], bytes
-            )
-
-        # --- Intento 3: extraer frame real del video (ROBUSTO) ---
-        if not thumb_data:
-            is_video = (
-                message.document is not None
-                and message.file is not None
-                and message.file.mime_type is not None
-                and "video" in message.file.mime_type.lower()
-            )
-            if is_video:
-                print(f"   🎞️  Sin miniatura en msg {message_id}, extrayendo frame del video (modo robusto)...")
-                try:
-                    # 🔧 Reducimos el timeout global de la miniatura para no bloquear el catálogo
-                    thumb_data = await asyncio.wait_for(
-                        _extract_video_frame(message),
-                        timeout=25.0,
-                    )
-                except asyncio.TimeoutError:
-                    print(f"   ⚠️  Timeout extrayendo frame del video msg {message_id}")
-                    thumb_data = None
-
-        if not thumb_data:
-            # 🔧 IMPORTANTE: sin placeholder/fallback
-            raise HTTPException(status_code=404, detail="Miniatura no disponible (no se pudo extraer del contenido)")
-
-        # ✅ Validación extra: evitar devolver basura
-        if not _is_valid_image_bytes(thumb_data):
-            raise HTTPException(status_code=404, detail="Miniatura no disponible (imagen inválida)")
-
-        # --- Aplicar recorte cover 500x750 a TODAS las miniaturas de Telegram ---
-        thumb_data = _crop_cover_to_poster(thumb_data)
-        mime       = "image/jpeg"
-
-        async with app.state.thumb_cache_lock:
-            _thumb_cache_prune(thumb_cache)
-            thumb_cache[cache_key] = (time.monotonic(), thumb_data, mime)
-
-        return Response(content=thumb_data, media_type=mime)
-
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"⚠️  Error en /thumb/{message_id}: {e}")
-        # 🔧 IMPORTANTE: sin placeholder/fallback
-        raise HTTPException(status_code=404, detail="Miniatura no disponible")
+        # fallback rápido (sin bloquear)
+        return Response(
+            status_code=302,
+            headers={"Location": PLACEHOLDER_IMAGE_BASE, "Cache-Control": "no-store"},
+        )
 
 
 # ---------------------------------------------------------------------------
