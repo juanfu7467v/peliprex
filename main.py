@@ -145,6 +145,235 @@ CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEA
 MIN_CATEGORY_RESULTS = 15
 
 # ---------------------------------------------------------------------------
+# 🔧 MEJORAS SOLICITADAS: Limpieza avanzada, detección de año, orden por saga
+# ---------------------------------------------------------------------------
+
+def _advanced_title_cleaner(raw_title: str) -> str:
+    """
+    Limpieza avanzada de títulos para búsqueda en TMDB.
+    Elimina:
+    - Números al inicio o final
+    - Resoluciones (4K, 1080p, 720p, etc.)
+    - Texto extra (HD, Latino, Subtitulado, etc.)
+    - Paréntesis, corchetes, comillas, comas
+    - Caracteres especiales
+    """
+    if not raw_title:
+        return ""
+    
+    # Normalizar y eliminar acentos
+    title = unicodedata.normalize("NFD", raw_title)
+    title = "".join(c for c in title if unicodedata.category(c) != "Mn")
+    
+    # Eliminar URLs y markdown
+    title = re.sub(r'\]\s*\(https?://[^\)]*\)', '', title)
+    title = re.sub(r'https?://\S+', '', title)
+    title = re.sub(r'[\[\](){}<>]', ' ', title)
+    
+    # Eliminar caracteres especiales pero mantener letras, números y espacios
+    title = re.sub(r'[^\w\s]', ' ', title)
+    
+    # Eliminar patrones de ruido comunes
+    noise_patterns = [
+        r'\b\d{3,}[xX]\d{3,}\b',           # 37x45, 1920x1080
+        r'\b\d{3,}p\b',                      # 1080p, 720p
+        r'\b4k\b', r'\bhd\b', r'\bweb[-\s]?dl\b',
+        r'\bblu[-\s]?ray\b', r'\bdvd[ri]p?\b',
+        r'\b(?:latino|castellano|espa[ñn]ol|subtitulado|sub\s*espa[ñn]ol)\b',
+        r'\b(?:audio|idioma)\s*(?:latino|castellano|espa[ñn]ol)\b',
+        r'\b(?:full|complete|ultimate|collection|edition)\b',
+        r'\b(?:pel[ií]cula|movie|film|serie|tv)\b',
+        r'\b(?:cap[ií]tulo|episodio|parte|volumen)\s*\d+\b',
+        r'\b(?:temporada|season)\s*\d+\b',
+        r'^\d+\s*[xX]\s*\d+\s*',            # números al inicio tipo "12 nombre"
+        r'\s*\d+\s*$',                       # números al final
+        r'\([^)]*\)',                        # todo entre paréntesis
+        r'\[[^\]]*\]',                       # todo entre corchetes
+    ]
+    
+    for pattern in noise_patterns:
+        title = re.sub(pattern, ' ', title, flags=re.IGNORECASE)
+    
+    # Eliminar números romanos que suelen ser de sagas pero dejarlos si son parte del título
+    # (esto es delicado, mejor mantenerlos por ahora)
+    
+    # Limpiar espacios múltiples y recortar
+    title = re.sub(r'\s+', ' ', title).strip()
+    
+    # Si después de todo queda vacío, devolver una versión más conservadora
+    if not title or len(title) < 3:
+        # Versión conservadora: solo quitar caracteres muy obvios
+        title = re.sub(r'[\[\](){}<>]', ' ', raw_title)
+        title = re.sub(r'\s+', ' ', title).strip()
+    
+    return title
+
+
+def _extract_valid_year(text: str) -> str | None:
+    """
+    Extrae un año válido de 4 dígitos del texto.
+    Ignora números que no sean años (como 1527, etc.)
+    """
+    if not text:
+        return None
+    
+    # Buscar patrones de año entre paréntesis, guiones o espacios
+    year_patterns = [
+        r'\((\d{4})\)',           # (1993)
+        r'\[(\d{4})\]',            # [1993]
+        r'\b(19\d{2}|20\d{2})\b',  # cualquier año de 1900-2099
+    ]
+    
+    for pattern in year_patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            # Tomar el primer año válido encontrado
+            year = matches[0]
+            # Validar que sea un año razonable (1900-2099)
+            if 1900 <= int(year) <= 2099:
+                return year
+    
+    return None
+
+
+def _extract_saga_info(title: str) -> tuple[str, int]:
+    """
+    Extrae información de saga y número de capítulo.
+    Retorna (nombre_base, número_capítulo)
+    """
+    if not title:
+        return title, 0
+    
+    # Patrones comunes para sagas
+    saga_patterns = [
+        (r'(.+?)\s*[-\u2013]\s*(?:parte|part)\s*(\d+)', 1, 2),
+        (r'(.+?)\s*[:\u202F]\s*(?:cap[ií]tulo|cap|episodio|ep)\s*(\d+)', 1, 2),
+        (r'(.+?)\s+(\d+)$', 1, 2),  # "Rambo 3"
+        (r'(.+?)\s+[ivxlcdm]+$', 1, 0),  # números romanos al final
+    ]
+    
+    for pattern, name_group, num_group in saga_patterns:
+        match = re.search(pattern, title, re.IGNORECASE)
+        if match:
+            base_name = match.group(name_group).strip()
+            chapter = int(match.group(num_group)) if num_group > 0 else 0
+            return base_name, chapter
+    
+    return title, 0
+
+
+def _extract_chapter_number(result: dict) -> int:
+    """Extrae número de capítulo para ordenamiento por saga"""
+    title = result.get("title", "") or result.get("titulo", "")
+    if not title:
+        return 0
+    
+    # Primero intentar con _extract_saga_info
+    _, chapter = _extract_saga_info(title)
+    if chapter > 0:
+        return chapter
+    
+    # Fallback: buscar cualquier número al final
+    match = re.search(r'(\d+)$', title.strip())
+    if match:
+        return int(match.group(1))
+    
+    return 0
+
+
+def _sort_by_saga(results: list) -> list:
+    """
+    Ordena resultados por saga y número de capítulo.
+    Agrupa películas de la misma saga y las ordena por número.
+    """
+    if not results:
+        return results
+    
+    # Extraer información de saga para cada resultado
+    saga_groups = {}
+    
+    for result in results:
+        title = result.get("title", "") or result.get("titulo", "")
+        base_name, chapter = _extract_saga_info(title)
+        
+        # Usar el nombre base como clave de grupo
+        key = _advanced_title_cleaner(base_name)
+        if not key:
+            key = _advanced_title_cleaner(title)
+        
+        if key not in saga_groups:
+            saga_groups[key] = []
+        
+        # Guardar resultado con su número de capítulo
+        result_copy = dict(result)
+        result_copy["_chapter"] = chapter
+        result_copy["_saga_key"] = key
+        saga_groups[key].append(result_copy)
+    
+    # Ordenar dentro de cada saga por número de capítulo
+    sorted_results = []
+    for key in sorted(saga_groups.keys()):
+        group = saga_groups[key]
+        group.sort(key=lambda x: x.get("_chapter", 0))
+        sorted_results.extend(group)
+    
+    return sorted_results
+
+
+def _parse_search_query(query: str) -> dict:
+    """
+    Parsea una consulta de búsqueda combinada.
+    Detecta años, rangos, géneros y texto libre.
+    Ejemplos:
+    - "acción 2019 rambo"
+    - "animación 2020-2023"
+    - "terror 2020"
+    - "rambo"
+    """
+    if not query:
+        return {"text": "", "year": None, "year_start": None, "year_end": None, "genre": None}
+    
+    result = {
+        "text": query,
+        "year": None,
+        "year_start": None,
+        "year_end": None,
+        "genre": None
+    }
+    
+    # Detectar rango de años (ej: 2010-2020)
+    range_match = re.search(r'\b(19\d{2}|20\d{2})\s*[-–]\s*(19\d{2}|20\d{2})\b', query)
+    if range_match:
+        result["year_start"] = int(range_match.group(1))
+        result["year_end"] = int(range_match.group(2))
+        # Eliminar el rango del texto
+        query = re.sub(r'\b(19\d{2}|20\d{2})\s*[-–]\s*(19\d{2}|20\d{2})\b', '', query)
+    
+    # Detectar año único (ej: 2019)
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', query)
+    if year_match:
+        year = year_match.group(1)
+        result["year"] = year
+        # Eliminar el año del texto
+        query = re.sub(r'\b(19\d{2}|20\d{2})\b', '', query)
+    
+    # Detectar género (mapear a lista de géneros conocidos)
+    genre_keywords = list(GENRE_CHANNEL_MAP.keys())
+    query_lower = query.lower()
+    for genre in genre_keywords:
+        if genre in query_lower:
+            result["genre"] = genre
+            # Eliminar el género del texto
+            query = re.sub(r'\b' + re.escape(genre) + r'\b', '', query, flags=re.IGNORECASE)
+            break
+    
+    # Limpiar el texto restante
+    result["text"] = re.sub(r'\s+', ' ', query).strip()
+    
+    return result
+
+
+# ---------------------------------------------------------------------------
 # CANALES DE RESPALDO
 # ---------------------------------------------------------------------------
 _REQUIRED_CHANNELS = [
@@ -998,18 +1227,6 @@ def _extract_title_from_caption(caption: str) -> str:
     return first_line.strip() or "Película"
 
 
-def extract_chapter_number(result: dict) -> int:
-    title = result.get("title", "")
-    match = re.search(
-        r'(?:cap[ií]tulo|cap[.]?|ep(?:isodio)?[.]?|parte|vol(?:[.]|umen)?)\s*[:\-]?\s*(\d+)',
-        title, re.IGNORECASE,
-    )
-    if match:
-        return int(match.group(1))
-    numbers = re.findall(r'\d+', title)
-    return int(numbers[-1]) if numbers else 0
-
-
 # ---------------------------------------------------------------------------
 # YOUTUBE FALLBACK
 # ---------------------------------------------------------------------------
@@ -1050,7 +1267,7 @@ async def youtube_fallback(youtube_query: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# HELPERS: limpieza de títulos
+# HELPERS: limpieza de títulos (actualizados con la nueva función avanzada)
 # ---------------------------------------------------------------------------
 _ROMAN_RE = r"(?:I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|XVI|XVII|XVIII|XIX|XX)"
 
@@ -1085,8 +1302,8 @@ def _strip_decorations(title: str) -> str:
 def _extract_year_from_title(title: str):
     if not title:
         return None
-    m = re.search(r"(?:\(|\b)(19\d{2}|20\d{2})(?:\)|\b)", title)
-    return m.group(1) if m else None
+    # Usar la función mejorada
+    return _extract_valid_year(title)
 
 
 def _remove_bracketed_text(s: str) -> str:
@@ -1100,31 +1317,15 @@ def _remove_bracketed_text(s: str) -> str:
 
 
 def _clean_title_for_api(title: str) -> str:
-    t = _strip_decorations(title)
-    t = _remove_bracketed_text(t)
-
-    for pat in _NOISE_PATTERNS:
-        t = re.sub(pat, " ", t, flags=re.IGNORECASE)
-
-    t = re.sub(r"[|•·_]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    if len(t) > _MAX_TITLE_LEN:
-        for sep in ('.', ',', ';', '!', '?', ' - '):
-            idx = t.find(sep, 15)
-            if 15 < idx < _MAX_TITLE_LEN:
-                t = t[:idx].strip()
-                break
-        else:
-            t = t[:_MAX_TITLE_LEN].strip()
-
-    return t
+    """Versión legacy, ahora usamos _advanced_title_cleaner"""
+    return _advanced_title_cleaner(title)
 
 
 def _build_tmdb_query_from_title(title: str):
     raw  = _strip_decorations(title)
     year = _extract_year_from_title(raw)
-    q    = _clean_title_for_api(raw)
+    # Usar limpieza avanzada
+    q    = _advanced_title_cleaner(raw)
     q = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", q).strip()
     q = re.sub(
         rf"\b(?:cap[ií]tulo|cap[.]?|ep(?:isodio)?[.]?|parte|vol(?:[.]|umen)?|"
@@ -1139,10 +1340,14 @@ def _placeholder_image_for_title(title: str) -> str:
     return PLACEHOLDER_IMAGE_BASE
 
 
-def _nn_str(v, default: str = "") -> str:
+def _nn_str(v, default: str = "n/a") -> str:
+    """Maneja valores vacíos: si no existe o está vacío, devuelve default"""
     if v is None:
         return default
-    s = v.strip() if isinstance(v, str) else str(v)
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else default
+    s = str(v).strip()
     return s if s else default
 
 
@@ -1221,47 +1426,47 @@ async def _get_recent_media_cached(ch_index: int, entity, force_refresh: bool = 
 
 
 # ---------------------------------------------------------------------------
-# NORMALIZACIÓN DEL ESQUEMA JSON DE RESPUESTA
+# NORMALIZACIÓN DEL ESQUEMA JSON DE RESPUESTA (EXACTAMENTE COMO SE SOLICITA)
 # ---------------------------------------------------------------------------
 def _to_peliculas_json_schema(items: list) -> list:
+    """
+    Convierte cualquier formato interno al esquema JSON exacto requerido:
+    {
+      "titulo": "",
+      "imagen_url": "",
+      "pelicula_url": "",
+      "descripcion": "",
+      "fecha_lanzamiento": "",
+      "duracion": "",
+      "idioma_original": "",
+      "popularidad": "",
+      "puntuacion": "",
+      "generos": "",
+      "año": ""
+    }
+    """
     out = []
     for it in (items or []):
-        titulo       = it.get("titulo") or it.get("title") or it.get("nombre") or "Película"
-        imagen_url   = it.get("imagen_url") or ""
-        pelicula_url = it.get("pelicula_url") or it.get("stream_url") or it.get("url") or ""
-        desc         = (it.get("descripcion") or it.get("sinopsis") or "").strip()
-
+        # Extraer valores con _nn_str que maneja "n/a" por defecto
+        titulo       = _nn_str(it.get("titulo") or it.get("title") or it.get("nombre"))
+        imagen_url   = _nn_str(it.get("imagen_url") or "")
+        pelicula_url = _nn_str(it.get("pelicula_url") or it.get("stream_url") or it.get("url") or "")
+        descripcion  = _nn_str(it.get("descripcion") or it.get("sinopsis") or "", "Sin descripción disponible.")
+        
         obj = {
-            "titulo":       _nn_str(titulo,       "Película"),
-            "imagen_url":   _nn_str(imagen_url,   ""),
-            "pelicula_url": _nn_str(pelicula_url, ""),
+            "titulo": titulo,
+            "imagen_url": imagen_url,
+            "pelicula_url": pelicula_url,
+            "descripcion": descripcion,
+            "fecha_lanzamiento": _nn_str(it.get("fecha_lanzamiento")),
+            "duracion": _nn_str(it.get("duracion")),
+            "idioma_original": _nn_str(it.get("idioma_original")),
+            "popularidad": str(_nn_num(it.get("popularidad"), 0)),
+            "puntuacion": str(_nn_num(it.get("puntuacion"), 0)),
+            "generos": _nn_str(it.get("generos")),
+            "año": _nn_str(it.get("año")),
         }
-        if desc and desc != "Sin descripción disponible.":
-            obj["descripcion"] = desc
-
-        _fecha  = it.get("fecha_lanzamiento")
-        _dur    = it.get("duracion")
-        _idioma = it.get("idioma_original")
-        _pop    = it.get("popularidad")
-        _punt   = it.get("puntuacion")
-        _gen    = it.get("generos")
-        _anio   = it.get("año")
-
-        if _fecha  and str(_fecha).strip()  not in ("", "N/A"):
-            obj["fecha_lanzamiento"] = str(_fecha).strip()
-        if _dur    and str(_dur).strip()    not in ("", "N/A"):
-            obj["duracion"]          = str(_dur).strip()
-        if _idioma and str(_idioma).strip() not in ("", "N/A"):
-            obj["idioma_original"]   = str(_idioma).strip()
-        if _pop  is not None and _pop  != 0:
-            obj["popularidad"]       = _pop
-        if _punt is not None and _punt != 0:
-            obj["puntuacion"]        = _punt
-        if _gen    and str(_gen).strip()    not in ("", "N/A"):
-            obj["generos"]           = str(_gen).strip()
-        if _anio   and str(_anio).strip()   not in ("", "N/A"):
-            obj["año"]               = str(_anio).strip()
-
+        
         out.append(obj)
     return out
 
@@ -1913,6 +2118,8 @@ async def enrich_results_with_tmdb(
             title_raw            = r.get("title") or "Película"
             fallback_title       = _strip_decorations(title_raw)
             fallback_year_title  = _extract_year_from_title(title_raw)
+            # Usar limpieza avanzada para la consulta a APIs
+            clean_title          = _advanced_title_cleaner(title_raw)
             query_title, year    = _build_tmdb_query_from_title(title_raw)
             ck                   = _cache_key_from_query(query_title, year)
 
@@ -1952,7 +2159,7 @@ async def enrich_results_with_tmdb(
                             "popularidad":           0,
                             "puntuacion":            0,
                             "generos":               "",
-                            "año":                   fallback_year_title or year or "N/A",
+                            "año":                   fallback_year_title or year or "n/a",
                             "id":                    r.get("id"),
                             "size":                  _nn_str(r.get("size"), "N/A"),
                             "descripcion_detallada": "",
@@ -2036,23 +2243,23 @@ async def enrich_results_with_tmdb(
                 imagen_url = meta_img or thumb_img or yt_img or ""
 
             descripcion = (meta.get("sinopsis") if isinstance(meta, dict) else None) or "Sin descripción disponible."
-            year_out    = (meta.get("año") if isinstance(meta, dict) else None) or fallback_year_title or year or "N/A"
+            year_out    = (meta.get("año") if isinstance(meta, dict) else None) or fallback_year_title or year or "n/a"
 
             return {
                 "titulo":                _nn_str(meta.get("titulo") if isinstance(meta, dict) else None, fallback_title or "Película"),
                 "imagen_url":            _nn_str(imagen_url, ""),
                 "pelicula_url":          _nn_str(pelicula_url, ""),
                 "descripcion":           _nn_str(descripcion,  "Sin descripción disponible."),
-                "fecha_lanzamiento":     _nn_str(meta.get("fecha_lanzamiento") if isinstance(meta, dict) else None, ""),
-                "duracion":              _nn_str(meta.get("duracion")           if isinstance(meta, dict) else None, ""),
-                "idioma_original":       _nn_str(meta.get("idioma_original")    if isinstance(meta, dict) else None, ""),
-                "popularidad":           _nn_num(meta.get("popularidad")        if isinstance(meta, dict) else None, 0),
-                "puntuacion":            _nn_num(meta.get("puntuacion")         if isinstance(meta, dict) else None, 0),
-                "generos":               _nn_str(meta.get("generos")            if isinstance(meta, dict) else None, ""),
-                "año":                   _nn_str(year_out, "N/A"),
+                "fecha_lanzamiento":     _nn_str(meta.get("fecha_lanzamiento") if isinstance(meta, dict) else None),
+                "duracion":              _nn_str(meta.get("duracion")           if isinstance(meta, dict) else None),
+                "idioma_original":       _nn_str(meta.get("idioma_original")    if isinstance(meta, dict) else None),
+                "popularidad":           str(_nn_num(meta.get("popularidad")        if isinstance(meta, dict) else None, 0)),
+                "puntuacion":            str(_nn_num(meta.get("puntuacion")         if isinstance(meta, dict) else None, 0)),
+                "generos":               _nn_str(meta.get("generos")            if isinstance(meta, dict) else None),
+                "año":                   _nn_str(year_out),
                 "id":                    r.get("id"),
                 "size":                  _nn_str(r.get("size"), "N/A"),
-                "descripcion_detallada": _nn_str(meta.get("descripcion_detallada") if isinstance(meta, dict) else None, ""),
+                "descripcion_detallada": _nn_str(meta.get("descripcion_detallada") if isinstance(meta, dict) else None),
             }
 
         tasks    = [enrich_one(r) for r in results]
@@ -2068,13 +2275,13 @@ async def enrich_results_with_tmdb(
                     "imagen_url":            "",
                     "pelicula_url":          "",
                     "descripcion":           "Sin descripción disponible.",
-                    "fecha_lanzamiento":     "",
-                    "duracion":              "",
-                    "idioma_original":       "",
-                    "popularidad":           0,
-                    "puntuacion":            0,
-                    "generos":               "",
-                    "año":                   "N/A",
+                    "fecha_lanzamiento":     "n/a",
+                    "duracion":              "n/a",
+                    "idioma_original":       "n/a",
+                    "popularidad":           "0",
+                    "puntuacion":            "0",
+                    "generos":               "n/a",
+                    "año":                   "n/a",
                     "id":                    None,
                     "size":                  "N/A",
                     "descripcion_detallada": "",
@@ -2090,7 +2297,7 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
     for r in final_results:
         title_raw = r.get("title") or "Película"
         titulo    = _strip_decorations(title_raw) or "Película"
-        year      = _extract_year_from_title(title_raw) or "N/A"
+        year      = _extract_year_from_title(title_raw) or "n/a"
 
         pelicula_url = r.get("stream_url") or ""
 
@@ -2103,12 +2310,12 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
             "imagen_url":            img_final,
             "pelicula_url":          pelicula_url,
             "descripcion":           "Sin descripción disponible.",
-            "fecha_lanzamiento":     "",
-            "duracion":              "",
-            "idioma_original":       "",
-            "popularidad":           0,
-            "puntuacion":            0,
-            "generos":               "",
+            "fecha_lanzamiento":     "n/a",
+            "duracion":              "n/a",
+            "idioma_original":       "n/a",
+            "popularidad":           "0",
+            "puntuacion":            "0",
+            "generos":               "n/a",
             "año":                   year,
             "id":                    r.get("id"),
             "size":                  _nn_str(r.get("size"), "N/A"),
@@ -2118,7 +2325,7 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /search
+# ENDPOINT /search (MEJORADO con soporte para búsquedas combinadas)
 # ---------------------------------------------------------------------------
 @app.get("/search")
 async def search(
@@ -2139,7 +2346,23 @@ async def search(
                 "q, year, genre, language, desde, hasta, canal"
             ),
         )
-    if q is not None and len(q.strip()) < 3:
+    
+    # Si hay query q, parsear búsqueda combinada
+    parsed_query = {}
+    if q:
+        parsed_query = _parse_search_query(q)
+        # Si el parseo encontró año o género, usarlos
+        if parsed_query.get("year") and not year:
+            year = parsed_query["year"]
+        if parsed_query.get("year_start") and parsed_query.get("year_end"):
+            desde = parsed_query["year_start"]
+            hasta = parsed_query["year_end"]
+        if parsed_query.get("genre") and not genre:
+            genre = parsed_query["genre"]
+        # Actualizar q con el texto limpio
+        q = parsed_query["text"] or q
+    
+    if q is not None and len(q.strip()) < 3 and q.strip():
         raise HTTPException(
             status_code=400,
             detail="El parámetro 'q' debe tener al menos 3 caracteres",
@@ -2186,7 +2409,9 @@ async def search(
             results = []
             try:
                 if q:
-                    msg_iter = client.iter_messages(entity, search=q.strip())
+                    # Usar el título limpio para búsqueda
+                    search_term = _advanced_title_cleaner(q)
+                    msg_iter = client.iter_messages(entity, search=search_term)
 
                     async for message in msg_iter:
                         if message.media and (message.video or message.document):
@@ -2227,7 +2452,10 @@ async def search(
             if key not in seen:
                 seen.add(key); unique.append(result)
 
+        # Ordenar por saga/número de capítulo
         unique.sort(key=extract_chapter_number)
+        # Aplicar ordenamiento por saga mejorado
+        unique = _sort_by_saga(unique)
         final_results = unique
 
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
@@ -2384,6 +2612,9 @@ async def catalog():
 
         sample_size = min(50, len(pool))
         sample      = random.sample(pool, sample_size) if sample_size > 0 else []
+
+        # Ordenar muestra por saga
+        sample = _sort_by_saga(sample)
 
         try:
             enriched = await asyncio.wait_for(
