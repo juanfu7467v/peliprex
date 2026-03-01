@@ -80,16 +80,6 @@ MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",     
 PERSISTENT_CACHE_PATH = "/data/cache_peliculas.json"
 CACHE_SAVE_EVERY      = 10
 
-# 🔧 CAMBIO 1: Ruta del volumen para películas con datos completos
-PELIS_CACHE_PATH = "/app/data/pelis_cache.json"
-
-# ---------------------------------------------------------------------------
-# 🔧 CAMBIO 2: Cachés en memoria para resultados de IA (evita errores 429)
-# Guarda respuestas de Google KG y Gemini para no repetir consultas
-# ---------------------------------------------------------------------------
-_google_kg_cache: dict = {}
-_gemini_cache: dict    = {}
-
 # ---------------------------------------------------------------------------
 # STREAMING (FIX DEFINITIVO)
 # ---------------------------------------------------------------------------
@@ -111,7 +101,25 @@ TARGET_THUMB_HEIGHT = 750
 # ---------------------------------------------------------------------------
 # 🔧 LÍMITES DE CONCURRENCIA PARA THUMBNAILS
 # ---------------------------------------------------------------------------
+# Máximo de procesos FFmpeg paralelos
 THUMB_FFMPEG_SEM_LIMIT = max(1, min(6, int(os.getenv("THUMB_FFMPEG_SEM_LIMIT", "3"))))
+
+# ---------------------------------------------------------------------------
+# ✅ FFmpeg ajustes solicitados
+# - Captura más temprana (10s/5s) en vez de 60s
+# - Timeout subido a 15s (configurable)
+# ---------------------------------------------------------------------------
+FFMPEG_TIMEOUT = float(os.getenv("FFMPEG_TIMEOUT", "15"))
+
+# ---------------------------------------------------------------------------
+# ✅ Cache IA (persistente) para reducir 429
+# ---------------------------------------------------------------------------
+AI_CACHE_KEY = "__ai_cache__"
+AI_CACHE_TTL_OK_S    = int(os.getenv("AI_CACHE_TTL_OK_S",    str(30 * 24 * 3600)))  # 30 días
+AI_CACHE_TTL_NONE_S  = int(os.getenv("AI_CACHE_TTL_NONE_S",  str(24 * 3600)))       # 24h (negative cache)
+AI_CACHE_TTL_429_S   = int(os.getenv("AI_CACHE_TTL_429_S",   str(6 * 3600)))        # 6h cooldown
+AI_CACHE_TTL_ERR_S   = int(os.getenv("AI_CACHE_TTL_ERR_S",   str(30 * 60)))         # 30 min
+AI_SEM_LIMIT         = max(1, min(4, int(os.getenv("AI_SEM_LIMIT", "2"))))          # limita IA
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
@@ -318,67 +326,6 @@ async def _save_persistent_cache(cache_dict: dict) -> None:
     await asyncio.to_thread(_write)
 
 
-# ---------------------------------------------------------------------------
-# 🔧 CAMBIO 3: Caché de películas con datos completos → /app/data/pelis_cache.json
-# Se guarda automáticamente cuando una película tiene poster + año + descripción
-# ---------------------------------------------------------------------------
-def _ensure_pelis_cache_dir():
-    try:
-        os.makedirs(os.path.dirname(PELIS_CACHE_PATH), exist_ok=True)
-    except Exception:
-        pass
-
-
-async def _load_pelis_cache() -> dict:
-    """Carga el caché de películas completas desde el volumen persistente."""
-    _ensure_pelis_cache_dir()
-
-    def _read():
-        try:
-            if not os.path.exists(PELIS_CACHE_PATH):
-                return {}
-            with open(PELIS_CACHE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            print(f"⚠️  Error cargando pelis_cache: {e}")
-            return {}
-
-    return await asyncio.to_thread(_read)
-
-
-async def _save_pelis_cache(cache_dict: dict) -> None:
-    """Guarda el caché de películas completas en el volumen persistente."""
-    _ensure_pelis_cache_dir()
-
-    def _write():
-        try:
-            tmp_path = PELIS_CACHE_PATH + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(cache_dict, f, ensure_ascii=False)
-            os.replace(tmp_path, PELIS_CACHE_PATH)
-        except Exception as e:
-            print(f"⚠️  Error guardando pelis_cache: {e}")
-
-    await asyncio.to_thread(_write)
-
-
-def _metadata_is_complete(metadata: dict) -> bool:
-    """
-    Verifica si los metadatos tienen los 3 campos mínimos para guardarse
-    en pelis_cache: poster (imagen_url) + año + descripción (sinopsis).
-    """
-    if not isinstance(metadata, dict):
-        return False
-    has_image = bool((metadata.get("imagen_url") or "").strip())
-    has_year  = bool((str(metadata.get("año") or "")).strip() not in ("", "N/A"))
-    has_desc  = bool((metadata.get("sinopsis") or "").strip())
-    return has_image and has_year and has_desc
-
-
-# ---------------------------------------------------------------------------
-# NORMALIZACIÓN
-# ---------------------------------------------------------------------------
 def normalize_title(title: str) -> str:
     title = (title or "").strip().lower()
     title = unicodedata.normalize("NFD", title)
@@ -519,38 +466,102 @@ def _youtube_thumb_from_stream_url(stream_url):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 4: _extract_video_frame — ESTRATEGIA DE SEEK OPTIMIZADA
-#
-# CAMBIOS RESPECTO A LA VERSIÓN ANTERIOR:
-#   - Eliminado seek=60s (causaba timeouts porque el video no estaba listo)
-#   - Nuevo primer intento: seek=5s con timeout=15s (más rápido y confiable)
-#   - Nuevo segundo intento: seek=10s con timeout=15s
-#   - FFMPEG_TIMEOUT aumentado de 8s → 15s en los primeros intentos
-#
-# NUEVA ESTRATEGIA:
-#   1.  5s  pre-seek  15s timeout  → Rápido, Telegram entrega stream en <5s
-#   2. 10s  pre-seek  15s timeout  → Segundo intento, aún muy confiable
-#   3.  3s  pre-seek  12s timeout  → Probado y funcional (confirmado en logs)
-#   4.  1s  post-seek 12s timeout  → Decodifica desde inicio, muy confiable
-#   5.  0s  pre-seek  10s timeout  → Último recurso absoluto
-#
-# VENTAJA:
-#   - Antes: 60s timeout fallaba → esperaba 8s → perdía tiempo valioso
-#   - Ahora: 5s es alcanzable en el primer intento → miniatura más rápida
-#   - Total peor caso: 15+15+12+12+10 = 64s (en segundo plano)
-#   - Caso típico: 3-5s en el primer intento (seek=5s)
+# ✅ Cache IA helpers (Google KG / Gemini) con persistencia
+# ---------------------------------------------------------------------------
+def _ai_cache_entry_ttl_s(status: str) -> int:
+    st = (status or "").lower()
+    if st == "ok":
+        return AI_CACHE_TTL_OK_S
+    if st == "none":
+        return AI_CACHE_TTL_NONE_S
+    if st == "429":
+        return AI_CACHE_TTL_429_S
+    if st == "err":
+        return AI_CACHE_TTL_ERR_S
+    return AI_CACHE_TTL_ERR_S
+
+
+async def _ai_cache_get(kind: str, key: str):
+    try:
+        ai_cache = getattr(app.state, "ai_cache", None)
+        if not isinstance(ai_cache, dict):
+            return None, None
+
+        k = f"{kind}:{key}"
+        entry = ai_cache.get(k)
+        if not isinstance(entry, dict):
+            return None, None
+
+        ts = entry.get("ts")
+        status = entry.get("status") or "err"
+        ttl_s = _ai_cache_entry_ttl_s(status)
+
+        if not isinstance(ts, (int, float)):
+            return None, None
+
+        if (time.time() - float(ts)) > float(ttl_s):
+            return None, None
+
+        return entry.get("data"), status
+    except Exception:
+        return None, None
+
+
+async def _ai_cache_set(kind: str, key: str, data, status: str):
+    try:
+        ai_cache = getattr(app.state, "ai_cache", None)
+        if not isinstance(ai_cache, dict):
+            return
+        k = f"{kind}:{key}"
+        async with getattr(app.state, "ai_cache_lock", asyncio.Lock()):
+            ai_cache[k] = {
+                "ts": time.time(),
+                "status": (status or "err"),
+                "data": data,
+            }
+            # marcar persistencia (se guarda junto con meta_cache)
+            setattr(app.state, "meta_cache_dirty", True)
+    except Exception:
+        return
+
+
+def _meta_is_full_enough_for_persist(meta: dict) -> bool:
+    try:
+        if not isinstance(meta, dict):
+            return False
+        img = meta.get("imagen_url")
+        yr  = meta.get("año")
+        syn = meta.get("sinopsis")
+        if _is_placeholder_image(img):
+            return False
+        if not (isinstance(img, str) and img.strip()):
+            return False
+        if not (isinstance(yr, str) and yr.strip() and len(yr.strip()) >= 4):
+            return False
+        if not (isinstance(syn, str) and syn.strip()):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 🔧 FIX PRINCIPAL: _extract_video_frame — SEEK OPTIMIZADO (10s/5s) + TIMEOUT 15s
 # ---------------------------------------------------------------------------
 async def _extract_video_frame(message_id: int, ch: int) -> bytes | None:
     """
     Extrae un frame del video usando el endpoint /stream local via HTTP.
     FFmpeg hace range requests directos sin descargar el archivo completo.
 
-    🔧 ESTRATEGIA OPTIMIZADA (seek más cortos primero):
-      1.  5s  pre-seek  15s timeout  → Primer intento rápido (CAMBIADO: era 60s/8s)
-      2. 10s  pre-seek  15s timeout  → Segundo intento (CAMBIADO: era 5s/12s)
-      3.  3s  pre-seek  12s timeout  → Confirmado funcional en logs
-      4.  1s  post-seek 12s timeout  → Decodifica desde inicio, muy confiable
-      5.  0s  pre-seek  10s timeout  → Fallback absoluto
+    Estrategia de seek (en orden) — ajustada:
+      1. 10s  pre-seek   timeout=15s
+      2.  5s  pre-seek   timeout=15s
+      3.  3s  pre-seek   timeout=15s
+      4.  1s  post-seek  timeout=15s
+      5.  0s  pre-seek   timeout=12s
+
+    Opciones HTTP especiales para streams de Telegram:
+      -reconnect, -reconnect_streamed, -rw_timeout, -probesize, -analyzeduration
     """
     out_path = None
     try:
@@ -558,31 +569,14 @@ async def _extract_video_frame(message_id: int, ch: int) -> bytes | None:
         out_path   = tempfile.mktemp(suffix="_thumb.jpg")
 
         def _run_ffmpeg_via_stream() -> bool:
-            """
-            Intenta extraer frame con estrategia de seek progresivamente
-            más conservadora. Cada intento tiene su propio timeout.
-
-            🔧 CAMBIO PRINCIPAL:
-              - seek=5s/15s como PRIMER intento (antes era seek=60s/8s)
-              - seek=10s/15s como SEGUNDO intento (antes era seek=5s/12s)
-              - Eliminado seek=60s que causaba timeouts frecuentes
-
-            pre_seek=True:  -ss ANTES de -i (seek rápido por contenedor)
-            pre_seek=False: -i ANTES de -ss (decodifica hasta ese punto)
-
-            Retorna True si generó una imagen JPEG válida (>500 bytes).
-            """
-            # 🔧 CAMBIO: seek=5s/15s primero, seek=10s/15s segundo
-            # (seek=60s eliminado — causaba timeouts porque el video no estaba listo)
             strategies = [
-                ( 5, True,  15),  # 🔧 NUEVO: 5s primero, timeout 15s (era 60s/8s)
-                (10, True,  15),  # 🔧 NUEVO: 10s segundo, timeout 15s (era 5s/12s)
-                ( 3, True,  12),  # Probado y funcional (confirmado en logs)
-                ( 1, False, 12),  # post-seek: decodifica desde inicio, muy confiable
-                ( 0, True,  10),  # Fallback absoluto
+                (10, True,  int(FFMPEG_TIMEOUT)),
+                ( 5, True,  int(FFMPEG_TIMEOUT)),
+                ( 3, True,  int(FFMPEG_TIMEOUT)),
+                ( 1, False, int(FFMPEG_TIMEOUT)),
+                ( 0, True,  12),
             ]
 
-            # Opciones HTTP comunes para todos los intentos
             http_opts = [
                 "-reconnect",          "1",
                 "-reconnect_streamed", "1",
@@ -695,13 +689,6 @@ async def _background_frame_extract(
     entity,
     done_event: asyncio.Event,
 ) -> None:
-    """
-    Extrae miniatura del video en segundo plano con control de concurrencia.
-    Orden de intentos:
-      1. Foto del mensaje (instantáneo si existe)
-      2. Thumbnail embebido del documento (instantáneo si existe)
-      3. FFmpeg vía stream HTTP (🔧 seeks optimizados: 5s, 10s, 3s, 1s, 0s)
-    """
     thumb_data: bytes | None = None
     try:
         message = await client.get_messages(entity, ids=message_id)
@@ -709,7 +696,6 @@ async def _background_frame_extract(
             print(f"   ℹ️  Sin miniatura disponible para msg {message_id} (mensaje no encontrado)")
             return
 
-        # ── Intento 1: foto del mensaje ──
         if hasattr(message, "photo") and message.photo:
             try:
                 thumb_data = await asyncio.wait_for(
@@ -719,7 +705,6 @@ async def _background_frame_extract(
             except Exception:
                 thumb_data = None
 
-        # ── Intento 2: miniatura embebida del documento ──
         if not thumb_data and message.document and message.document.thumbs:
             try:
                 thumb_data = await asyncio.wait_for(
@@ -729,7 +714,6 @@ async def _background_frame_extract(
             except Exception:
                 thumb_data = None
 
-        # ── Intento 3: extracción real con FFmpeg vía stream HTTP ──
         if not thumb_data:
             is_video = (
                 message.document is not None
@@ -751,7 +735,6 @@ async def _background_frame_extract(
                     print(f"   ⚠️  Error extrayendo frame msg {message_id}: {ex}")
                     thumb_data = None
 
-        # ── Almacenar en caché si se obtuvo imagen ──
         if thumb_data:
             processed   = _crop_cover_to_poster(thumb_data)
             mime        = "image/jpeg"
@@ -776,10 +759,6 @@ async def _background_frame_extract(
 # 🆕 _prelaunch_thumb_extractions
 # ---------------------------------------------------------------------------
 async def _prelaunch_thumb_extractions(results: list) -> None:
-    """
-    Lanza en segundo plano la extracción de miniatura para cada resultado.
-    Se llama desde /search sin await para no bloquear la respuesta.
-    """
     try:
         thumb_cache      = getattr(app.state, "thumb_cache",           {})
         in_progress      = getattr(app.state, "thumb_in_progress",      {})
@@ -850,22 +829,33 @@ async def lifespan(app: FastAPI):
     app.state.thumb_in_progress      = {}
     app.state.thumb_in_progress_lock = asyncio.Lock()
 
-    # 🔧 CAMBIO 5: Inicializar caché de películas completas
-    app.state.pelis_cache      = {}
-    app.state.pelis_cache_lock = asyncio.Lock()
+    # ✅ Cache IA + lock + semáforo para limitar llamadas y bajar 429
+    app.state.ai_cache      = {}
+    app.state.ai_cache_lock = asyncio.Lock()
+    app.state.ai_sem        = asyncio.Semaphore(AI_SEM_LIMIT)
 
-    app.state.meta_cache = await _load_persistent_cache()
+    # Throttle de guardado persistente (evita writes excesivos)
+    app.state.last_persist_save_ts = 0.0
+
+    loaded = await _load_persistent_cache()
+    # Extraer cache IA persistida (si existe) sin romper formato anterior
+    ai_loaded = {}
+    if isinstance(loaded, dict) and AI_CACHE_KEY in loaded and isinstance(loaded.get(AI_CACHE_KEY), dict):
+        ai_loaded = loaded.get(AI_CACHE_KEY) or {}
+        try:
+            del loaded[AI_CACHE_KEY]
+        except Exception:
+            pass
+
+    app.state.meta_cache = loaded if isinstance(loaded, dict) else {}
+    app.state.ai_cache   = ai_loaded if isinstance(ai_loaded, dict) else {}
+
     print(f"🧠 Caché persistente cargada: {len(app.state.meta_cache)} entradas")
-
-    # 🔧 CAMBIO 5: Cargar pelis_cache desde el volumen
-    app.state.pelis_cache = await _load_pelis_cache()
-    print(f"🎬 Pelis cache cargada: {len(app.state.pelis_cache)} películas completas")
-
+    print(f"🤖 Caché IA cargada: {len(app.state.ai_cache)} entradas")
     print(f"⚙️  Semáforo FFmpeg: max={THUMB_FFMPEG_SEM_LIMIT} procesos paralelos")
     print(f"⚙️  Puerto interno para thumbnails: {INTERNAL_PORT}")
-    # 🔧 CAMBIO 4: Actualizado mensaje de estrategia
-    print(f"⚙️  Estrategia seeks: [5s/15s, 10s/15s, 3s/12s, 1s-post/12s, 0s/10s]")
-    print(f"⚙️  Cache IA activo: Google KG + Gemini (evita errores 429)")
+    print(f"⚙️  Estrategia seeks: [10s/{int(FFMPEG_TIMEOUT)}s, 5s/{int(FFMPEG_TIMEOUT)}s, 3s/{int(FFMPEG_TIMEOUT)}s, 1s-post/{int(FFMPEG_TIMEOUT)}s, 0s/12s]")
+    print(f"⚙️  IA semáforo: max={AI_SEM_LIMIT}")
 
     try:
         main_entity = await client.get_entity(CHANNEL_IDENTIFIER)
@@ -893,8 +883,8 @@ async def lifespan(app: FastAPI):
         )
         app.state.entities    = [app.state.entity] + list(backup_entities)
         app.state.channels_ready = True
-        loaded = sum(1 for e in app.state.entities if e is not None)
-        print(f"✅ Todos los canales cargados: {loaded} disponibles")
+        loaded_n = sum(1 for e in app.state.entities if e is not None)
+        print(f"✅ Todos los canales cargados: {loaded_n} disponibles")
 
         async def _warmup_search_cache():
             try:
@@ -924,15 +914,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Guardar cache al apagar si está dirty
     if getattr(app.state, "meta_cache_dirty", False):
         print("💾 Guardando caché pendiente antes de apagar...")
-        await _save_persistent_cache(app.state.meta_cache)
-
-    # 🔧 CAMBIO 5: Guardar pelis_cache al apagar
-    pelis_c = getattr(app.state, "pelis_cache", {})
-    if pelis_c:
-        print(f"💾 Guardando pelis_cache ({len(pelis_c)} entradas) antes de apagar...")
-        await _save_pelis_cache(pelis_c)
+        # Empaquetar IA en el mismo JSON sin cambiar endpoints ni respuestas
+        to_save = dict(getattr(app.state, "meta_cache", {}) or {})
+        to_save[AI_CACHE_KEY] = dict(getattr(app.state, "ai_cache", {}) or {})
+        await _save_persistent_cache(to_save)
 
     await client.disconnect()
 
@@ -959,7 +947,6 @@ async def health_check():
         "channels_ready":       getattr(app.state, "channels_ready", False),
         "channels_loaded":      channels_up,
         "cache_entries":        len(getattr(app.state, "meta_cache", {})),
-        "pelis_cache_entries":  len(getattr(app.state, "pelis_cache", {})),  # 🔧 CAMBIO 5
         "thumb_cache_entries":  len(getattr(app.state, "thumb_cache", {})),
         "thumbs_in_progress":   in_progress_count,
         "internal_port":        INTERNAL_PORT,
@@ -1331,8 +1318,7 @@ async def _noop():
 
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 2A: GOOGLE KNOWLEDGE GRAPH con caché en memoria
-# Guarda respuestas para evitar repetir consultas y reducir errores 429
+# GOOGLE KNOWLEDGE GRAPH (con cache IA persistente)
 # ---------------------------------------------------------------------------
 async def _google_kg_search(
     http,
@@ -1342,11 +1328,15 @@ async def _google_kg_search(
     if not GOOGLE_KG_API_KEY:
         return None
 
-    # 🔧 CAMBIO: verificar caché en memoria antes de llamar a la API
-    _ck = f"{normalize_title(query_title)}::{year or ''}"
-    if _ck in _google_kg_cache:
-        print(f"   📦 Google KG [CACHE HIT] → '{query_title}' (evitado 429)")
-        return _google_kg_cache[_ck]
+    ck = _cache_key_from_query(query_title, year)
+    cached_data, cached_status = await _ai_cache_get("kg", ck)
+    if cached_status in ("ok", "none", "429", "err"):
+        if cached_status == "ok" and isinstance(cached_data, dict):
+            return cached_data
+        if cached_status in ("none", "429"):
+            return None
+        if cached_status == "err" and cached_data is None:
+            return None
 
     try:
         def _is_str(x) -> bool:
@@ -1433,13 +1423,20 @@ async def _google_kg_search(
             "types":     ["Movie", "TVSeries"],
             "languages": ["es", "en"],
         }
-        r = await http.get("https://kgsearch.googleapis.com/v1/entities:search", params=params)
+
+        # ✅ limitar concurrencia IA
+        async with getattr(app.state, "ai_sem", asyncio.Semaphore(1)):
+            r = await http.get("https://kgsearch.googleapis.com/v1/entities:search", params=params)
+
+        if r.status_code == 429:
+            await _ai_cache_set("kg", ck, None, "429")
+            return None
+
         r.raise_for_status()
         data  = r.json()
         items = _safe_get(data, "itemListElement", []) or []
         if not isinstance(items, list) or not items:
-            # 🔧 CAMBIO: guardar None en caché para evitar reintentos fallidos
-            _google_kg_cache[_ck] = None
+            await _ai_cache_set("kg", ck, None, "none")
             return None
 
         best = None
@@ -1454,7 +1451,7 @@ async def _google_kg_search(
                 res = item.get("result") if isinstance(item, dict) else None
                 if isinstance(res, dict): best = res; break
         if not isinstance(best, dict) or not best:
-            _google_kg_cache[_ck] = None
+            await _ai_cache_set("kg", ck, None, "none")
             return None
 
         name         = _strip_text(best.get("name")) or query_title
@@ -1478,8 +1475,7 @@ async def _google_kg_search(
             f"año={year_out} img={'✓' if imagen_url else '✗'} "
             f"sinopsis={'✓' if sinopsis else '✗'}"
         )
-
-        result = {
+        out = {
             "source":                "google_kg",
             "tmdb_id":               None,
             "media_type":            media_type,
@@ -1496,14 +1492,13 @@ async def _google_kg_search(
             "descripcion_detallada": short_desc.strip() if isinstance(short_desc, str) and short_desc.strip() else None,
         }
 
-        # 🔧 CAMBIO: guardar resultado en caché para evitar llamadas repetidas
-        _google_kg_cache[_ck] = result
-        return result
+        await _ai_cache_set("kg", ck, out, "ok")
+        return out
 
     except Exception as e:
+        # Si es rate limit enmascarado por excepción, lo cacheamos igual como err corto
+        await _ai_cache_set("kg", ck, None, "err")
         print(f"⚠️  Error de Google KG ({query_title}): {e}")
-        # 🔧 CAMBIO: en caso de error 429 u otro, NO guardar en caché
-        # para permitir reintento posterior (solo guardamos éxitos y vacíos)
         return None
 
 
@@ -1686,8 +1681,7 @@ async def _tvmaze_fetch(
 
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 2B: GEMINI AI con caché en memoria
-# Limita llamadas a la API y guarda respuestas para evitar errores 429
+# GEMINI AI: completa metadatos faltantes (SOLO EN /search, LIMITADO A 10) + cache IA
 # ---------------------------------------------------------------------------
 _GEMINI_CALL_COUNTER = {"count": 0}
 
@@ -1701,15 +1695,21 @@ async def _gemini_complete_metadata(
     if not GEMINI_API_KEY:
         return None
 
+    # Cache IA: evita repetir Gemini y reduce 429
+    ck = _cache_key_from_query(title, year)
+    cached_data, cached_status = await _ai_cache_get("gemini", ck)
+    if cached_status in ("ok", "none", "429", "err"):
+        if cached_status == "ok" and isinstance(cached_data, dict):
+            return cached_data
+        if cached_status in ("none", "429"):
+            return None
+        if cached_status == "err" and cached_data is None:
+            return None
+
     if _GEMINI_CALL_COUNTER["count"] >= 10:
         print(f"   ⚠️  Límite de IA (10) alcanzado, no se usa Gemini para '{title}'")
+        await _ai_cache_set("gemini", ck, None, "none")
         return None
-
-    # 🔧 CAMBIO: verificar caché en memoria antes de llamar a Gemini
-    _ck_gem = f"{normalize_title(title)}::{year or ''}"
-    if _ck_gem in _gemini_cache:
-        print(f"   📦 Gemini [CACHE HIT] → '{title}' (evitado 429)")
-        return _gemini_cache[_ck_gem]
 
     try:
         _GEMINI_CALL_COUNTER["count"] += 1
@@ -1737,17 +1737,25 @@ async def _gemini_complete_metadata(
             },
         }
 
-        r = await http.post(
-            GEMINI_API_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-            timeout=5.0,
-        )
+        async with getattr(app.state, "ai_sem", asyncio.Semaphore(1)):
+            r = await http.post(
+                GEMINI_API_URL,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+                timeout=5.0,
+            )
+
+        if r.status_code == 429:
+            await _ai_cache_set("gemini", ck, None, "429")
+            print(f"⚠️  Gemini rate limit (429) para '{title}' — usando cache cooldown")
+            return None
+
         r.raise_for_status()
 
         data       = r.json()
         candidates = data.get("candidates") or []
         if not candidates:
+            await _ai_cache_set("gemini", ck, None, "none")
             return None
 
         text = (
@@ -1762,20 +1770,20 @@ async def _gemini_complete_metadata(
 
         result = json.loads(text)
         if not isinstance(result, dict):
+            await _ai_cache_set("gemini", ck, None, "none")
             return None
 
         print(f"   🤖 Gemini ({_GEMINI_CALL_COUNTER['count']}/10) → completó metadatos para '{title}'")
-
-        # 🔧 CAMBIO: guardar resultado en caché para evitar llamadas repetidas
-        _gemini_cache[_ck_gem] = result
+        await _ai_cache_set("gemini", ck, result, "ok")
         return result
 
     except json.JSONDecodeError:
         print(f"⚠️  Gemini devolvió JSON inválido para '{title}'")
+        await _ai_cache_set("gemini", ck, None, "err")
         return None
     except Exception as e:
         print(f"⚠️  Gemini error ({title}): {e}")
-        # 🔧 CAMBIO: NO guardar errores en caché (puede ser error 429 temporal)
+        await _ai_cache_set("gemini", ck, None, "err")
         return None
 
 
@@ -1828,7 +1836,7 @@ def _merge_metadata_with_kg(
 
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 5: CACHÉ — get / set con dirty flag + guardado en pelis_cache
+# CACHÉ: get / set con dirty flag
 # ---------------------------------------------------------------------------
 async def _meta_cache_get(cache_key: str):
     meta_cache = getattr(app.state, "meta_cache", None)
@@ -1845,37 +1853,32 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
     async with app.state.meta_cache_lock:
         app.state.meta_cache[cache_key] = metadata
         app.state.meta_cache_dirty      = True
+
         total = len(app.state.meta_cache)
+
+        # ✅ Guardado normal cada N entradas (igual que antes)
         if total % CACHE_SAVE_EVERY == 0:
-            await _save_persistent_cache(app.state.meta_cache)
+            to_save = dict(app.state.meta_cache)
+            to_save[AI_CACHE_KEY] = dict(getattr(app.state, "ai_cache", {}) or {})
+            await _save_persistent_cache(to_save)
             app.state.meta_cache_dirty = False
+            app.state.last_persist_save_ts = time.time()
 
-    # 🔧 CAMBIO 5: Si los metadatos tienen poster + año + descripción,
-    # guardar también en pelis_cache (/app/data/pelis_cache.json)
-    if _metadata_is_complete(metadata):
-        try:
-            pelis_cache      = getattr(app.state, "pelis_cache",      {})
-            pelis_cache_lock = getattr(app.state, "pelis_cache_lock", asyncio.Lock())
-
-            async with pelis_cache_lock:
-                # Solo guardar si es entrada nueva o tiene más datos que la existente
-                existing = pelis_cache.get(cache_key)
-                if not existing or not _metadata_is_complete(existing):
-                    pelis_cache[cache_key] = metadata
-                    total_pelis = len(pelis_cache)
-                    # Guardar en disco cada 10 entradas nuevas
-                    if total_pelis % CACHE_SAVE_EVERY == 0:
-                        await _save_pelis_cache(pelis_cache)
-                        print(f"   💾 Pelis cache guardado: {total_pelis} entradas")
-        except Exception as e:
-            print(f"⚠️  Error guardando en pelis_cache: {e}")
+        # ✅ Guardado “inteligente” si ya tenemos poster + año + sinopsis
+        # (throttle para no saturar disco)
+        if _meta_is_full_enough_for_persist(metadata):
+            now = time.time()
+            last_ts = float(getattr(app.state, "last_persist_save_ts", 0.0) or 0.0)
+            if (now - last_ts) > 30.0:
+                to_save = dict(app.state.meta_cache)
+                to_save[AI_CACHE_KEY] = dict(getattr(app.state, "ai_cache", {}) or {})
+                await _save_persistent_cache(to_save)
+                app.state.meta_cache_dirty = False
+                app.state.last_persist_save_ts = now
 
 
 # ---------------------------------------------------------------------------
-# 🔧 CAMBIO 3: ENRIQUECIMIENTO PRINCIPAL
-# Prioridad de imagen: TMDB → KG → TVMaze → IA (Gemini) → FFmpeg (último recurso)
-# catalog_mode=True  → /catalog: NO añade thumb de Telegram cuando no hay imagen de API
-# catalog_mode=False → /search:  SÍ añade thumb de Telegram como fallback final
+# 🔧 ENRIQUECIMIENTO PRINCIPAL (prioriza TMDB antes que KG/Gemini)
 # ---------------------------------------------------------------------------
 async def enrich_results_with_tmdb(
     results: list,
@@ -1903,13 +1906,6 @@ async def enrich_results_with_tmdb(
             if not meta:
                 meta = await _meta_cache_get(ck)
 
-                # 🔧 CAMBIO 3: También revisar pelis_cache como fuente prioritaria
-                if not meta:
-                    pelis_cache = getattr(app.state, "pelis_cache", {})
-                    meta = pelis_cache.get(ck)
-                    if meta:
-                        print(f"   🎬 Pelis cache HIT → '{query_title}'")
-
                 need_repair = isinstance(meta, dict) and (
                     _is_placeholder_image(meta.get("imagen_url")) or
                     not meta.get("sinopsis")   or
@@ -1920,12 +1916,13 @@ async def enrich_results_with_tmdb(
                 if (not meta) or need_repair:
                     if new_counter["n"] >= limit_new:
                         pelicula_url = r.get("stream_url") or ""
-                        # 🔧 CAMBIO 3: Prioridad imagen: APIs → FFmpeg → YouTube
-                        # En catalog_mode: sin imagen de API → excluir (imagen vacía)
                         if catalog_mode:
-                            img_final = ""
+                            # ✅ /catalog: si no se puede enriquecer por límite, usar último recurso:
+                            # API poster no disponible → thumb Telegram/YouTube (para no descartar por imagen)
+                            thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
+                            yt    = _youtube_thumb_from_stream_url(pelicula_url)
+                            img_final = thumb or yt or ""
                         else:
-                            # /search: FFmpeg como fallback (último recurso)
                             thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
                             yt    = _youtube_thumb_from_stream_url(pelicula_url)
                             img_final = thumb or yt or ""
@@ -1948,34 +1945,33 @@ async def enrich_results_with_tmdb(
 
                     new_counter["n"] += 1
 
-                    # 🔧 CAMBIO 3: Orden de prioridad explícito:
-                    # 1. TMDB (más completo, tiene poster oficial)
-                    # 2. Google KG (complementa texto, puede tener imagen)
-                    # 3. TVMaze (solo si faltan imagen o sinopsis)
-                    # 4. Gemini (solo si faltan sinopsis/géneros, y con caché)
-                    # 5. FFmpeg (solo en /search, como último recurso para imagen)
                     kg = tmdb = tvmaze = None
 
+                    # ✅ PRIORIDAD: TMDB primero. Solo luego KG/TVMaze si faltan datos.
                     async with semaphore:
-                        # Paso 1+2: TMDB y KG en paralelo (ambas APIs con poster)
-                        kg_coro   = (_google_kg_search(http, query_title, year) if GOOGLE_KG_API_KEY else _noop())
-                        tmdb_coro = (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
-                        kg, tmdb  = await asyncio.gather(kg_coro, tmdb_coro)
+                        tmdb = await (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
+
+                        need_image = not (isinstance(tmdb, dict) and tmdb.get("imagen_url"))
+                        need_text  = not (isinstance(tmdb, dict) and tmdb.get("sinopsis") and tmdb.get("año"))
+
+                        # KG solo si hace falta imagen o texto clave
+                        if (GOOGLE_KG_API_KEY and (need_image or need_text)):
+                            kg = await _google_kg_search(http, query_title, year)
 
                         combined_has_image    = bool(
                             (isinstance(tmdb, dict) and tmdb.get("imagen_url")) or
                             (isinstance(kg,   dict) and kg.get("imagen_url"))
                         )
                         combined_has_synopsis = bool(
-                            (isinstance(kg,   dict) and kg.get("sinopsis")) or
-                            (isinstance(tmdb, dict) and tmdb.get("sinopsis"))
+                            (isinstance(tmdb, dict) and tmdb.get("sinopsis")) or
+                            (isinstance(kg,   dict) and kg.get("sinopsis"))
                         )
                         combined_has_year     = bool(
-                            (isinstance(kg,   dict) and kg.get("año")) or
-                            (isinstance(tmdb, dict) and tmdb.get("año"))
+                            (isinstance(tmdb, dict) and tmdb.get("año")) or
+                            (isinstance(kg,   dict) and kg.get("año"))
                         )
 
-                        # Paso 3: TVMaze solo si falta imagen o sinopsis
+                        # TVMaze solo si aún faltan campos
                         if not (combined_has_image and combined_has_synopsis and combined_has_year):
                             tvmaze = await _tvmaze_fetch(http, query_title, year)
 
@@ -1985,7 +1981,7 @@ async def enrich_results_with_tmdb(
                         fallback_year=fallback_year_title or year,
                     )
 
-                    # Paso 4: Gemini solo si faltan sinopsis/géneros (con caché activo)
+                    # Gemini: solo para texto faltante (no para posters)
                     if use_gemini and GEMINI_API_KEY and not (meta.get("sinopsis") and meta.get("generos")):
                         gemini_data = await _gemini_complete_metadata(
                             http, fallback_title, year, meta
@@ -2012,15 +2008,16 @@ async def enrich_results_with_tmdb(
             if _is_placeholder_image(meta_img):
                 meta_img = None
 
-            # 🔧 CAMBIO 3: Lógica de imagen con prioridad explícita:
-            # TMDB/KG/TVMaze → Gemini (si tiene img) → FFmpeg → YouTube → vacío
+            # ✅ Lógica de imagen ajustada según requerimiento:
+            # Primero APIs (meta_img) → si no hay, IA (KG ya intentó) → último recurso /thumb (FFmpeg) o YouTube
+            thumb_img  = _thumb_url_for_message(r.get("id"), pelicula_url)
+            yt_img     = _youtube_thumb_from_stream_url(pelicula_url)
+
             if catalog_mode:
-                # /catalog: SOLO imagen de API oficial — sin FFmpeg
-                imagen_url = meta_img or ""
+                # /catalog: antes era solo API; ahora: si no hay API, usar thumb/yt como ÚLTIMO recurso
+                imagen_url = meta_img or thumb_img or yt_img or ""
             else:
-                # /search: APIs primero, FFmpeg como penúltimo, YouTube como último
-                thumb_img  = _thumb_url_for_message(r.get("id"), pelicula_url)
-                yt_img     = _youtube_thumb_from_stream_url(pelicula_url)
+                # /search: igual esquema de respuesta, solo priorización: API → thumb → yt → vacío
                 imagen_url = meta_img or thumb_img or yt_img or ""
 
             descripcion = (meta.get("sinopsis") if isinstance(meta, dict) else None) or "Sin descripción disponible."
@@ -2082,12 +2079,9 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
 
         pelicula_url = r.get("stream_url") or ""
 
-        if catalog_mode:
-            img_final = ""
-        else:
-            thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
-            yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
-            img_final = thumb_img or yt_img or ""
+        thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
+        yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
+        img_final = thumb_img or yt_img or ""
 
         formatted.append({
             "titulo":                titulo,
@@ -2110,8 +2104,6 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
 
 # ---------------------------------------------------------------------------
 # ENDPOINT /search
-# ✅ Pre-lanza extracción de miniaturas antes de devolver respuesta
-# ✅ Devuelve TODOS los resultados coincidentes (sin cap de 50)
 # ---------------------------------------------------------------------------
 @app.get("/search")
 async def search(
@@ -2309,8 +2301,6 @@ async def search(
 
 # ---------------------------------------------------------------------------
 # ENDPOINT /catalog
-# ✅ catalog_mode=True → NO genera miniaturas desde Telegram
-# ✅ Filtra resultados sin poster de API (imagen_url vacía)
 # ---------------------------------------------------------------------------
 @app.get("/catalog")
 async def catalog():
@@ -2385,7 +2375,7 @@ async def catalog():
                 enrich_results_with_tmdb(
                     sample,
                     max_new=MAX_ENRICH_NEW,
-                    catalog_mode=True,
+                    catalog_mode=True,      # ✅ Sigue siendo catalog_mode, pero ahora no descarta por imagen vacía
                 ),
                 timeout=8.0,
             )
@@ -2393,6 +2383,7 @@ async def catalog():
             print("⚠️  /catalog enrichment timeout — devolviendo formato básico")
             enriched = _format_results_without_apis(sample, catalog_mode=True)
 
+        # ✅ Ya NO descartamos agresivamente por imagen vacía si logramos /thumb o /ytthumb
         enriched_with_poster = [
             item for item in enriched
             if item.get("imagen_url", "").strip()
@@ -2400,7 +2391,7 @@ async def catalog():
 
         print(
             f"📚 /catalog: {len(sample)} muestreados → "
-            f"{len(enriched_with_poster)} con poster de API "
+            f"{len(enriched_with_poster)} con imagen "
             f"(descartados: {len(enriched) - len(enriched_with_poster)})"
         )
 
@@ -2455,7 +2446,7 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 # ---------------------------------------------------------------------------
-# 🔧 ENDPOINT /thumb/{message_id}
+# ENDPOINT /thumb/{message_id}
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
@@ -2463,7 +2454,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         thumb_cache = getattr(app.state, "thumb_cache", {})
         cache_key   = f"{message_id}:{ch}"
 
-        # ── PASO 1: Verificar caché RAM ──────────────────────────────────────
         async with app.state.thumb_cache_lock:
             cached = thumb_cache.get(cache_key)
             if cached:
@@ -2471,7 +2461,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        # ── PASO 2: Resolver entidad del canal ───────────────────────────────
         entities = getattr(app.state, "entities", [app.state.entity])
         entity   = (
             entities[ch]
@@ -2479,7 +2468,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             else app.state.entity
         )
 
-        # ── PASO 3: Obtener mensaje de Telegram ──────────────────────────────
         message = await asyncio.wait_for(
             client.get_messages(entity, ids=message_id),
             timeout=3.0,
@@ -2489,7 +2477,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
 
         thumb_data: bytes | None = None
 
-        # ── PASO 4a: Foto adjunta al mensaje ─────────────────────────────────
         if hasattr(message, "photo") and message.photo:
             try:
                 thumb_data = await asyncio.wait_for(
@@ -2499,7 +2486,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             except Exception:
                 thumb_data = None
 
-        # ── PASO 4b: Miniatura embebida en el documento ──────────────────────
         if not thumb_data and message.document and message.document.thumbs:
             try:
                 thumb_data = await asyncio.wait_for(
@@ -2509,7 +2495,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             except Exception:
                 thumb_data = None
 
-        # ── PASO 5: Si hay miniatura embebida → procesar y devolver ─────────
         if thumb_data:
             processed = _crop_cover_to_poster(thumb_data)
             mime      = "image/jpeg"
@@ -2518,7 +2503,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 thumb_cache[cache_key] = (time.monotonic(), processed, mime)
             return Response(content=processed, media_type=mime)
 
-        # ── PASO 6: Sin miniatura embebida → gestionar extracción en segundo plano
         is_video = (
             message.document is not None
             and message.file  is not None
@@ -2549,7 +2533,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             else:
                 done_event_ref = in_progress[cache_key]
 
-        # ── PASO 7: Esperar hasta 3.5s para respuesta < 5s total ────────────
         try:
             await asyncio.wait_for(
                 asyncio.shield(done_event_ref.wait()),
@@ -2565,7 +2548,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        # ── PASO 8: Aún no disponible ────────────────────────────────────────
         raise HTTPException(
             status_code=404,
             detail="Miniatura procesándose en segundo plano (reintentar en unos segundos)",
@@ -2678,4 +2660,68 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
             headers = {
                 "Content-Type":      content_type,
-                "
+                "Accept-Ranges":     "bytes",
+                "Content-Length":    str(content_length),
+                "Cache-Control":     "no-store",
+                "X-Accel-Buffering": "no",
+            }
+
+            return StreamingResponse(
+                chunk_generator_full(start, content_length),
+                status_code=200,
+                headers=headers,
+                media_type=content_type,
+            )
+
+        start, end     = byte_range
+        content_length = (end - start) + 1
+
+        if content_length <= 0:
+            return Response(
+                status_code=416,
+                content=b"",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+
+        async def chunk_generator_range(offset: int, limit: int):
+            try:
+                async for chunk in client.iter_download(
+                    message.media,
+                    offset=offset,
+                    limit=limit,
+                    chunk_size=STREAM_CHUNK_SIZE,
+                ):
+                    yield chunk
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+
+        headers = {
+            "Content-Type":      content_type,
+            "Accept-Ranges":     "bytes",
+            "Content-Range":     f"bytes {start}-{end}/{file_size}",
+            "Content-Length":    str(content_length),
+            "Cache-Control":     "no-store",
+            "X-Accel-Buffering": "no",
+        }
+
+        return StreamingResponse(
+            chunk_generator_range(start, content_length),
+            status_code=206,
+            headers=headers,
+            media_type=content_type,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"⚠️  Error de streaming: {e}")
+        raise HTTPException(status_code=500, detail="Error de streaming")
+
+
+# ---------------------------------------------------------------------------
+# ENTRYPOINT
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=INTERNAL_PORT)
