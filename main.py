@@ -757,14 +757,33 @@ async def _background_frame_extract(
             except Exception:
                 thumb_data = None
 
-        # ✅ PRIORIDAD 2: miniatura nativa desde message.document.thumbs
+        # ✅ PRIORIDAD 2: miniatura nativa desde message.video.thumbs
+        #    En Telethon, message.video devuelve el Document si es un video
+        if not thumb_data:
+            video_obj = getattr(message, "video", None)
+            if video_obj and hasattr(video_obj, "thumbs") and video_obj.thumbs:
+                best = _get_best_native_thumb(video_obj.thumbs)
+                if best:
+                    try:
+                        raw = await asyncio.wait_for(
+                            client.download_media(video_obj, bytes, thumb=best),
+                            timeout=4.0,
+                        )
+                        if raw and len(raw) > 200:
+                            thumb_data = raw
+                            print(f"   🎬 Miniatura nativa (video.thumbs) obtenida para msg {message_id}")
+                    except Exception:
+                        thumb_data = None
+
+        # ✅ PRIORIDAD 3: miniatura nativa desde message.document.thumbs
         #    (aquí es donde Telegram guarda las miniaturas de los videos en Telethon)
+        #    FIX: pasar document como media principal y best como parámetro thumb
         if not thumb_data and message.document and message.document.thumbs:
             best = _get_best_native_thumb(message.document.thumbs)
             if best:
                 try:
                     raw = await asyncio.wait_for(
-                        client.download_media(best, bytes),
+                        client.download_media(message.document, bytes, thumb=best),
                         timeout=4.0,
                     )
                     if raw and len(raw) > 200:
@@ -773,7 +792,8 @@ async def _background_frame_extract(
                 except Exception:
                     thumb_data = None
 
-        # ✅ PRIORIDAD 3: miniatura desde message.media.thumbs (acceso directo al media)
+        # ✅ PRIORIDAD 4: miniatura desde message.media.thumbs (acceso directo al media)
+        #    FIX: pasar media_obj como media principal y best como parámetro thumb
         if not thumb_data:
             media_obj = getattr(message, "media", None)
             media_thumbs = getattr(media_obj, "thumbs", None) if media_obj else None
@@ -782,12 +802,12 @@ async def _background_frame_extract(
                 if best:
                     try:
                         raw = await asyncio.wait_for(
-                            client.download_media(best, bytes),
+                            client.download_media(media_obj, bytes, thumb=best),
                             timeout=4.0,
                         )
                         if raw and len(raw) > 200:
                             thumb_data = raw
-                            print(f"   🎬 Miniatura nativa (media.thumbs) obtenida para msg {message_id}")
+                            print(f"   🖼️  Miniatura nativa (media.thumbs) obtenida para msg {message_id}")
                     except Exception:
                         thumb_data = None
 
@@ -2967,14 +2987,33 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             except Exception:
                 thumb_data = None
 
-        # ✅ PRIORIDAD 2: miniatura nativa desde message.document.thumbs
+        # ✅ PRIORIDAD 2: miniatura nativa desde message.video.thumbs
+        #    En Telethon, message.video devuelve el Document si es un video
+        if not thumb_data:
+            video_obj = getattr(message, "video", None)
+            if video_obj and hasattr(video_obj, "thumbs") and video_obj.thumbs:
+                best = _get_best_native_thumb(video_obj.thumbs)
+                if best:
+                    try:
+                        raw = await asyncio.wait_for(
+                            client.download_media(video_obj, bytes, thumb=best),
+                            timeout=2.5,
+                        )
+                        if raw and len(raw) > 200:
+                            thumb_data = raw
+                            print(f"   🎬 Miniatura nativa (video.thumbs) obtenida para msg {message_id}")
+                    except Exception:
+                        thumb_data = None
+
+        # ✅ PRIORIDAD 3: miniatura nativa desde message.document.thumbs
         #    (aquí es donde Telegram guarda las miniaturas de los videos en Telethon)
+        #    FIX: pasar document como media principal y best como parámetro thumb
         if not thumb_data and message.document and message.document.thumbs:
             best = _get_best_native_thumb(message.document.thumbs)
             if best:
                 try:
                     raw = await asyncio.wait_for(
-                        client.download_media(best, bytes),
+                        client.download_media(message.document, bytes, thumb=best),
                         timeout=2.5,
                     )
                     if raw and len(raw) > 200:
@@ -2983,7 +3022,8 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 except Exception:
                     thumb_data = None
 
-        # ✅ PRIORIDAD 3: miniatura desde message.media.thumbs (acceso directo al media)
+        # ✅ PRIORIDAD 4: miniatura desde message.media.thumbs (acceso directo al media)
+        #    FIX: pasar media_obj como media principal y best como parámetro thumb
         if not thumb_data:
             media_obj = getattr(message, "media", None)
             media_thumbs = getattr(media_obj, "thumbs", None) if media_obj else None
@@ -2992,12 +3032,12 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if best:
                     try:
                         raw = await asyncio.wait_for(
-                            client.download_media(best, bytes),
+                            client.download_media(media_obj, bytes, thumb=best),
                             timeout=2.5,
                         )
                         if raw and len(raw) > 200:
                             thumb_data = raw
-                            print(f"   🎬 Miniatura nativa (media.thumbs) obtenida para msg {message_id}")
+                            print(f"   🖼️  Miniatura nativa (media.thumbs) obtenida para msg {message_id}")
                     except Exception:
                         thumb_data = None
 
