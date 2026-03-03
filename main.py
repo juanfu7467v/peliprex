@@ -163,6 +163,16 @@ _REQUIRED_CHANNELS = [
     '@dramaesp',
     '@SportsTV90',
     '@peliculasynoticias',
+    '@DramaespCHAT',
+    '@PeliculasCristianasLatino',
+    '@infantilesvideos',
+    '@Series_Bpb',
+    '@videos_infantiles_2024
+    '@hardc0rexxx',
+    '@anal_fisting',
+    '@phettheesam',
+    '@ParaisoAnal',
+    '@tsgirl',     	          	                                             	                                                
 ]
 
 
