@@ -81,7 +81,7 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN / LÍMITES
 # ---------------------------------------------------------------------------
-MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "10"))))
+MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "5"))))  # 🔧 Ajustado a 5 para evitar 429
 CATALOG_POOL_TTL          = max(60,         int(os.getenv("CATALOG_POOL_TTL",          "600")))
 CATALOG_FETCH_CONCURRENCY = max(1,  min(10, int(os.getenv("CATALOG_FETCH_CONCURRENCY", "5"))))
 MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",            "25"))))
@@ -113,7 +113,7 @@ TARGET_THUMB_HEIGHT = 750
 AI_CACHE_KEY = "__ai_cache__"
 AI_CACHE_TTL_OK_S    = int(os.getenv("AI_CACHE_TTL_OK_S",    str(30 * 24 * 3600)))
 AI_CACHE_TTL_NONE_S  = int(os.getenv("AI_CACHE_TTL_NONE_S",  str(24 * 3600)))
-AI_CACHE_TTL_429_S   = int(os.getenv("AI_CACHE_TTL_429_S",   str(6 * 3600)))
+AI_CACHE_TTL_429_S   = int(os.getenv("AI_CACHE_TTL_429_S",   str(10 * 3600)))  # 🔧 Aumentado a 10 minutos (600s) para evitar 429
 AI_CACHE_TTL_ERR_S   = int(os.getenv("AI_CACHE_TTL_ERR_S",   str(30 * 60)))
 AI_SEM_LIMIT         = max(1, min(4, int(os.getenv("AI_SEM_LIMIT", "2"))))
 
@@ -163,6 +163,16 @@ _REQUIRED_CHANNELS = [
     '@dramaesp',
     '@SportsTV90',
     '@peliculasynoticias',
+    '@DramaespCHAT',
+    '@PeliculasCristianasLatino',
+    '@infantilesvideos',
+    '@Series_Bpb',
+    '@videos_infantiles_2024',
+    '@hardc0rexxx',
+    '@anal_fisting',
+    '@phettheesam',
+    '@ParaisoAnal',
+    '@tsgirl',     	          	                                             	                                                
 ]
 
 
@@ -716,11 +726,105 @@ async def _find_poster_in_nearby_messages(
         return None
 
 
+# ---------------------------------------------------------------------------
+# ✅ SOLUCIÓN DEFINITIVA: pre-carga de entidades para client2
+# ---------------------------------------------------------------------------
+async def _preload_entities_for_client2():
+    """
+    Pre-resuelve todas las entidades de canales para client2 (SESSION_STRING_2).
+    Esto evita el error "Invalid channel object" cuando client2 intenta usar
+    una entidad que fue resuelta por client1.
+    Se ejecuta en background después de que todos los canales se cargaron.
+    """
+    if len(_telegram_clients) < 2:
+        return
+    cl2 = _telegram_clients[1]
+    sem = asyncio.Semaphore(3)  # 3 resoluciones concurrentes para no saturar
+    total = 0
+    failed = 0
+
+    all_usernames = [CHANNEL_IDENTIFIER] + list(BACKUP_CHANNELS)
+
+    async def _resolve_one(ch_entities_idx: int, username: str):
+        nonlocal total, failed
+        async with sem:
+            try:
+                await asyncio.sleep(0.3)  # pausa para evitar flood
+                ent = await asyncio.wait_for(cl2.get_entity(username), timeout=8.0)
+                _entities_per_client[1][ch_entities_idx] = ent
+                total += 1
+            except Exception as _e:
+                failed += 1
+                # Fallback: copiar entidad de client0 si existe
+                ent0 = _entities_per_client[0].get(ch_entities_idx)
+                if ent0 is not None:
+                    _entities_per_client[1][ch_entities_idx] = ent0
+
+    tasks = [
+        _resolve_one(i, uname)
+        for i, uname in enumerate(all_usernames)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    print(f"✅ Entidades client2 pre-cargadas: {total} OK, {failed} fallback/error")
 
 
 # ---------------------------------------------------------------------------
-# LIFESPAN
+# ✅ FUNCIÓN CORREGIDA: Obtener cliente y entidad (SOLUCIÓN DEFINITIVA)
+# ch_idx es el índice en app.state.entities (0 = canal principal)
 # ---------------------------------------------------------------------------
+async def get_tg_client_and_channel(ch_idx: int):
+    """
+    Retorna (cliente, entidad) para el índice ch_idx que corresponde a
+    app.state.entities[ch_idx]:
+      entities[0]   = canal principal (@PEELYE)
+      entities[i]   = BACKUP_CHANNELS[i-1]  (i >= 1)
+
+    Usa rotación Round Robin entre clientes, pero SIEMPRE obtiene la entidad
+    correcta para el cliente seleccionado (usando _get_or_resolve_entity).
+    Si el cliente seleccionado falla, hace fallback al otro cliente.
+    """
+    if not _telegram_clients:
+        print("⚠️  No hay clientes de Telegram disponibles")
+        return None, None
+
+    total_clients = len(_telegram_clients)
+
+    # Rotación Round Robin
+    idx = _client_rr_index["idx"]
+    _client_rr_index["idx"] = (idx + 1) % total_clients
+    client_idx = idx % total_clients
+
+    # Intentar con el cliente seleccionado primero, luego con el otro
+    for attempt_offset in range(total_clients):
+        ci = (client_idx + attempt_offset) % total_clients
+        cl = _telegram_clients[ci]
+
+        # Verificar/reconectar
+        try:
+            if not cl.is_connected():
+                print(f"🔄 Cliente {ci} desconectado — reconectando...")
+                await asyncio.wait_for(cl.connect(), timeout=8.0)
+        except Exception as _ce:
+            print(f"⚠️  No se pudo reconectar cliente {ci}: {_ce}")
+            continue
+
+        # Obtener entidad correcta para ESTE cliente
+        try:
+            entity = await _get_or_resolve_entity(ci, ch_idx)
+        except Exception as _ee:
+            print(f"⚠️  _get_or_resolve_entity error ci={ci} ch={ch_idx}: {_ee}")
+            entity = None
+
+        if entity is not None:
+            return cl, entity
+
+        print(f"⚠️  get_tg_client_and_channel: entidad None para cliente={ci} ch={ch_idx}")
+
+    print(f"❌  get_tg_client_and_channel: ningún cliente disponible para ch={ch_idx}")
+    return None, None
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("📡 Conectando a Telegram...")
@@ -796,6 +900,19 @@ async def lifespan(app: FastAPI):
         loaded_n = sum(1 for e in app.state.entities if e is not None)
         print(f"✅ Todos los canales cargados: {loaded_n} disponibles")
 
+        # ✅ NUEVO: Pre-rellenar caché de entidades para client 0 (evita overhead)
+        global _entities_per_client
+        while len(_entities_per_client) < len(_telegram_clients):
+            _entities_per_client.append({})
+        for _i, _ent in enumerate(app.state.entities):
+            if _ent is not None:
+                _entities_per_client[0][_i] = _ent
+        print(f"✅ Caché entidades client0: {len(_entities_per_client[0])} entradas")
+
+        # ✅ NUEVO: Pre-resolver entidades para client2 en background (evita "Invalid channel object")
+        if len(_telegram_clients) > 1:
+            asyncio.create_task(_preload_entities_for_client2())
+
         async def _warmup_search_cache():
             try:
                 sem_w = asyncio.Semaphore(SEARCH_CHANNEL_WARMUP_CONCURRENCY)
@@ -862,6 +979,64 @@ else:
 
 # Índice global para rotación Round Robin
 _client_rr_index: dict = {"idx": 0}
+
+# ✅ NUEVO: Caché de entidades por cliente [client_idx][ch_entities_idx] = entity
+# Esto evita el bug de "Invalid channel object" al usar entity de client1 con client2
+_entities_per_client: list = [{}, {}]   # índices 0..1; se expande si hay más clientes
+
+
+async def _get_or_resolve_entity(client_idx: int, ch_entities_idx: int):
+    """
+    Retorna la entidad de canal para un cliente específico.
+    - client_idx 0 → usa app.state.entities[ch_entities_idx] (ya resuelto en startup)
+    - client_idx 1+ → resuelve la entidad con ese cliente y la cachea
+    Si falla, hace fallback a la entidad de client_idx=0.
+    """
+    global _entities_per_client
+    # Asegurar tamaño de la lista
+    while len(_entities_per_client) <= client_idx:
+        _entities_per_client.append({})
+
+    cache = _entities_per_client[client_idx]
+
+    # ── Caché hit ──────────────────────────────────────────────────────────────
+    if ch_entities_idx in cache:
+        return cache[ch_entities_idx]
+
+    # ── Para client 0 usa app.state.entities (ya resuelto al arrancar) ─────────
+    entities_state = getattr(app.state, "entities", [])
+    if client_idx == 0:
+        ent = entities_state[ch_entities_idx] if ch_entities_idx < len(entities_state) else None
+        if ent is not None:
+            cache[ch_entities_idx] = ent
+        return ent
+
+    # ── Para otros clientes: resolver con ese cliente y cachear ────────────────
+    if ch_entities_idx == 0:
+        username = CHANNEL_IDENTIFIER
+    elif (ch_entities_idx - 1) < len(BACKUP_CHANNELS):
+        username = BACKUP_CHANNELS[ch_entities_idx - 1]
+    else:
+        # Fuera de rango → fallback a client 0
+        ent = entities_state[ch_entities_idx] if ch_entities_idx < len(entities_state) else None
+        return ent
+
+    cl = _telegram_clients[client_idx] if client_idx < len(_telegram_clients) else None
+    if not cl:
+        ent = entities_state[ch_entities_idx] if ch_entities_idx < len(entities_state) else None
+        return ent
+
+    try:
+        ent = await asyncio.wait_for(cl.get_entity(username), timeout=6.0)
+        cache[ch_entities_idx] = ent
+        return ent
+    except Exception as _e:
+        print(f"⚠️  _get_or_resolve_entity cliente={client_idx} ch={ch_entities_idx}: {_e}")
+        # Fallback a entidad de client 0 (puede funcionar para canales públicos)
+        ent = entities_state[ch_entities_idx] if ch_entities_idx < len(entities_state) else None
+        if ent is not None:
+            cache[ch_entities_idx] = ent   # cachear el fallback para evitar reintentar
+        return ent
 
 
 async def get_active_client() -> TelegramClient | None:
@@ -1396,31 +1571,44 @@ async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) ->
     if entity is None:
         return []
     results = []
-    # ✅ MULTI-CUENTA: Usar cliente rotativo para repartir carga entre cuentas
-    _active_client = _get_next_client()
+    # ✅ CORREGIDO: Usar el par (cliente, entidad) correcto para evitar "Invalid channel object"
+    # Usar get_tg_client_and_channel que ahora resuelve la entidad correcta por cliente
+    try:
+        _active_cl, _active_entity = await get_tg_client_and_channel(ch_index)
+    except Exception:
+        _active_cl, _active_entity = None, None
+
+    # Si no se pudo resolver, usar el cliente por defecto con la entidad recibida
+    if not _active_cl or _active_entity is None:
+        _active_cl = _get_next_client()
+        _active_entity = entity
+
     await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
-    async for message in _active_client.iter_messages(entity, limit=limit):
-        if message.media and (message.video or message.document):
-            caption     = message.text or ""
-            title       = _extract_title_from_caption(caption)
-            # ✅ MEJORA: Limpiar descripción (eliminar links, menciones, limitar longitud)
-            description = _clean_description(caption, max_len=300)
-            direct_link = (
-                f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
-                if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
-            )
-            results.append({
-                "id":          message.id,
-                "title":       title,
-                "description": description,
-                "size":        (
-                    f"{round(message.file.size / (1024 * 1024), 2)} MB"
-                    if message.file else "n/a"
-                ),
-                "stream_url":  direct_link,
-            })
-            if len(results) >= 50:
-                break
+    try:
+        async for message in _active_cl.iter_messages(_active_entity, limit=limit):
+            if message.media and (message.video or message.document):
+                caption     = message.text or ""
+                title       = _extract_title_from_caption(caption)
+                # ✅ MEJORA: Limpiar descripción (eliminar links, menciones, limitar longitud)
+                description = _clean_description(caption, max_len=300)
+                direct_link = (
+                    f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
+                    if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
+                )
+                results.append({
+                    "id":          message.id,
+                    "title":       title,
+                    "description": description,
+                    "size":        (
+                        f"{round(message.file.size / (1024 * 1024), 2)} MB"
+                        if message.file else "n/a"
+                    ),
+                    "stream_url":  direct_link,
+                })
+                if len(results) >= 50:
+                    break
+    except Exception as _fe:
+        print(f"⚠️  _fetch_recent_media_from_channel ch={ch_index}: {_fe}")
     return results
 
 
@@ -2587,11 +2775,15 @@ async def search(
                 return []
             results = []
             try:
-                # ✅ MULTI-CUENTA: Usar cliente rotativo para distribuir la carga
-                _active_client = _get_next_client()
+                # ✅ CORREGIDO: obtener entidad correcta para el cliente seleccionado
+                _active_cl, _active_ent = await get_tg_client_and_channel(ch_index)
+                if not _active_cl or _active_ent is None:
+                    _active_cl  = _get_next_client()
+                    _active_ent = entity   # fallback: entidad recibida
+
                 await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
                 if effective_text:
-                    msg_iter = _active_client.iter_messages(entity, search=effective_text.strip())
+                    msg_iter = _active_cl.iter_messages(_active_ent, search=effective_text.strip())
 
                     async for message in msg_iter:
                         if message.media and (message.video or message.document):
@@ -2614,9 +2806,9 @@ async def search(
                                 "stream_url":  direct_link,
                             })
                 else:
-                    results = await _get_recent_media_cached(ch_index, entity)
+                    results = await _get_recent_media_cached(ch_index, _active_ent)
 
-                print(f"   📺 Canal [{ch_index}] ({entity.title}): {len(results)} resultado(s)")
+                print(f"   📺 Canal [{ch_index}] ({getattr(_active_ent, 'title', ch_index)}): {len(results)} resultado(s)")
             except Exception as e:
                 print(f"⚠️  Error en canal [{ch_index}] ({getattr(entity, 'title', ch_index)}): {e}")
             return results
@@ -2743,14 +2935,18 @@ async def catalog():
                 if entity is None: return []
                 results = []
                 try:
-                    # ✅ MULTI-CUENTA: Usar cliente rotativo para repartir carga
-                    _active_client = _get_next_client()
+                    # ✅ CORREGIDO: obtener entidad correcta para el cliente seleccionado
+                    _active_cl, _active_ent = await get_tg_client_and_channel(ch_index)
+                    if not _active_cl or _active_ent is None:
+                        _active_cl  = _get_next_client()
+                        _active_ent = entity   # fallback
+
                     # ✅ OPT: Offset aleatorio para catálogo variado en cada solicitud
                     random_offset = random.randint(0, 100)
                     async with fetch_sem:
                         await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
-                        async for message in _active_client.iter_messages(
-                            entity,
+                        async for message in _active_cl.iter_messages(
+                            _active_ent,
                             limit=CATALOG_LIMIT_PER_CHANNEL,
                             add_offset=random_offset,
                         ):
@@ -2883,15 +3079,16 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /thumb/{message_id}
+# ✅ ENDPOINT /thumb/{message_id} CORREGIDO (usa get_tg_client_and_channel)
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
     try:
-        # ✅ Usar cliente activo con reconexión automática
-        active_client = await get_active_client()
-        if not active_client:
-            raise HTTPException(status_code=503, detail="Telegram desconectado")
+        # ✅ Usar la nueva función segura para obtener cliente y entidad
+        cl, entity = await get_tg_client_and_channel(ch)
+
+        if not cl or not entity:
+            raise HTTPException(status_code=404, detail="Canal no encontrado")
 
         thumb_cache = getattr(app.state, "thumb_cache", {})
         cache_key   = f"{message_id}:{ch}"
@@ -2903,15 +3100,8 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
-            entities[ch]
-            if (0 <= ch < len(entities) and entities[ch] is not None)
-            else app.state.entity
-        )
-
         message = await asyncio.wait_for(
-            active_client.get_messages(entity, ids=message_id),
+            cl.get_messages(entity, ids=message_id),
             timeout=3.0,
         )
         if not message:
@@ -2922,7 +3112,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         # ✅ PRIORIDAD 0: Buscar póster en mensajes cercanos (antes o después del video)
         #    Muchos canales suben el póster como foto separada junto al video
         try:
-            poster = await _find_poster_in_nearby_messages(entity, message_id, active_client)
+            poster = await _find_poster_in_nearby_messages(entity, message_id, cl)
             if poster and len(poster) > 500:
                 thumb_data = poster
         except Exception:
@@ -2932,7 +3122,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         if not thumb_data and hasattr(message, "photo") and message.photo:
             try:
                 thumb_data = await asyncio.wait_for(
-                    active_client.download_media(message.photo, bytes),
+                    cl.download_media(message.photo, bytes),
                     timeout=2.5,
                 )
                 if thumb_data:
@@ -2949,7 +3139,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if best:
                     try:
                         raw = await asyncio.wait_for(
-                            active_client.download_media(video_obj, bytes, thumb=best),
+                            cl.download_media(video_obj, bytes, thumb=best),
                             timeout=2.5,
                         )
                         if raw and len(raw) > 200:
@@ -2966,7 +3156,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if best:
                 try:
                     raw = await asyncio.wait_for(
-                        active_client.download_media(message.document, bytes, thumb=best),
+                        cl.download_media(message.document, bytes, thumb=best),
                         timeout=2.5,
                     )
                     if raw and len(raw) > 200:
@@ -2985,7 +3175,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if best:
                     try:
                         raw = await asyncio.wait_for(
-                            active_client.download_media(media_obj, bytes, thumb=best),
+                            cl.download_media(media_obj, bytes, thumb=best),
                             timeout=2.5,
                         )
                         if raw and len(raw) > 200:
@@ -3082,30 +3272,32 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id}
+# ✅ ENDPOINT /stream/{message_id} CORREGIDO (usa get_tg_client_and_channel)
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
     try:
-        # ✅ Usar cliente activo con reconexión automática
-        active_client = await get_active_client()
-        if not active_client:
-            raise HTTPException(status_code=503, detail="Telegram desconectado")
+        # ✅ CORREGIDO: usar entidad correcta según ch (app.state.entities[ch])
+        cl, entity = await get_tg_client_and_channel(ch)
 
-        entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
-            entities[ch]
-            if (0 <= ch < len(entities) and entities[ch] is not None)
-            else app.state.entity
-        )
+        if not cl or not entity:
+            raise HTTPException(status_code=404, detail="Canal no encontrado")
 
-        message = await active_client.get_messages(entity, ids=message_id)
+        # ✅ FIX: timeout en get_messages para evitar hang infinito
+        try:
+            message = await asyncio.wait_for(
+                cl.get_messages(entity, ids=message_id),
+                timeout=12.0,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Timeout obteniendo mensaje")
+
         if not message or not message.file:
             raise HTTPException(status_code=404, detail="Video no encontrado")
 
         file_size = int(message.file.size or 0)
         if file_size <= 0:
-            raise HTTPException(status_code=404, detail="Video no encontrado")
+            raise HTTPException(status_code=404, detail="Video no encontrado (tamaño cero)")
 
         range_header  = request.headers.get("range")
         byte_range    = _parse_range_header(range_header, file_size)
@@ -3117,7 +3309,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
             async def chunk_generator_full(offset: int, limit: int):
                 try:
-                    async for chunk in active_client.iter_download(
+                    async for chunk in cl.iter_download(
                         message.media,
                         offset=offset,
                         limit=limit,
@@ -3157,7 +3349,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
         async def chunk_generator_range(offset: int, limit: int):
             try:
-                async for chunk in active_client.iter_download(
+                async for chunk in cl.iter_download(
                     message.media,
                     offset=offset,
                     limit=limit,
@@ -3188,8 +3380,11 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
     except HTTPException:
         raise
+    except asyncio.TimeoutError:
+        print(f"⚠️  Timeout en /stream/{message_id}?ch={ch}")
+        raise HTTPException(status_code=504, detail="Timeout de streaming")
     except Exception as e:
-        print(f"⚠️  Error de streaming: {e}")
+        print(f"⚠️  Error de streaming /stream/{message_id}?ch={ch}: {e}")
         raise HTTPException(status_code=500, detail="Error de streaming")
 
 
