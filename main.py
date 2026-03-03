@@ -81,7 +81,7 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN / LÍMITES
 # ---------------------------------------------------------------------------
-MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "5"))))  # 🔧 Ajustado a 5 para evitar 429
+MAX_CONCURRENCY           = max(5,  min(15, int(os.getenv("MAX_CONCURRENCY",           "10"))))
 CATALOG_POOL_TTL          = max(60,         int(os.getenv("CATALOG_POOL_TTL",          "600")))
 CATALOG_FETCH_CONCURRENCY = max(1,  min(10, int(os.getenv("CATALOG_FETCH_CONCURRENCY", "5"))))
 MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",            "25"))))
@@ -113,7 +113,7 @@ TARGET_THUMB_HEIGHT = 750
 AI_CACHE_KEY = "__ai_cache__"
 AI_CACHE_TTL_OK_S    = int(os.getenv("AI_CACHE_TTL_OK_S",    str(30 * 24 * 3600)))
 AI_CACHE_TTL_NONE_S  = int(os.getenv("AI_CACHE_TTL_NONE_S",  str(24 * 3600)))
-AI_CACHE_TTL_429_S   = int(os.getenv("AI_CACHE_TTL_429_S",   str(10 * 3600)))  # 🔧 Aumentado a 10 minutos (600s) para evitar 429
+AI_CACHE_TTL_429_S   = int(os.getenv("AI_CACHE_TTL_429_S",   str(6 * 3600)))
 AI_CACHE_TTL_ERR_S   = int(os.getenv("AI_CACHE_TTL_ERR_S",   str(30 * 60)))
 AI_SEM_LIMIT         = max(1, min(4, int(os.getenv("AI_SEM_LIMIT", "2"))))
 
@@ -163,16 +163,6 @@ _REQUIRED_CHANNELS = [
     '@dramaesp',
     '@SportsTV90',
     '@peliculasynoticias',
-    '@DramaespCHAT',
-    '@PeliculasCristianasLatino',
-    '@infantilesvideos',
-    '@Series_Bpb',
-    '@videos_infantiles_2024',
-    '@hardc0rexxx',
-    '@anal_fisting',
-    '@phettheesam',
-    '@ParaisoAnal',
-    '@tsgirl',     	          	                                             	                                                
 ]
 
 
@@ -724,45 +714,6 @@ async def _find_poster_in_nearby_messages(
     except Exception as e:
         print(f"   ⚠️  Error buscando póster en mensajes cercanos: {e}")
         return None
-
-
-# ---------------------------------------------------------------------------
-# ✅ NUEVA FUNCIÓN: Obtener cliente y entidad de canal de forma segura (SOLUCIÓN DEFINITIVA)
-# ---------------------------------------------------------------------------
-async def get_tg_client_and_channel(ch_idx: int):
-    """
-    Retorna un par (cliente, entidad) para el índice de canal dado.
-    Realiza rotación automática de cuentas y resuelve la entidad completa.
-    Si falla, retorna (None, None).
-    """
-    # Rotación automática de cuentas
-    client1 = _telegram_clients[0] if len(_telegram_clients) > 0 else None
-    client2 = _telegram_clients[1] if len(_telegram_clients) > 1 else None
-
-    # Seleccionar cliente aleatorio si hay dos cuentas
-    if client2 and random.random() > 0.5:
-        cl = client2
-    else:
-        cl = client1 or client2
-
-    if not cl:
-        print("⚠️  No hay clientes de Telegram disponibles")
-        return None, None
-
-    try:
-        if ch_idx < 0 or ch_idx >= len(BACKUP_CHANNELS):
-            print(f"⚠️  Índice de canal inválido: {ch_idx}")
-            return None, None
-
-        channel_username = BACKUP_CHANNELS[ch_idx]
-
-        # ✅ SOLUCIÓN CLAVE: Resolver entidad completa
-        entity = await cl.get_entity(channel_username)
-
-        return cl, entity
-    except Exception as e:
-        print(f"⚠️  Error crítico obteniendo canal {ch_idx} ({BACKUP_CHANNELS[ch_idx] if 0 <= ch_idx < len(BACKUP_CHANNELS) else 'desconocido'}): {e}")
-        return None, None
 
 
 
@@ -2932,16 +2883,15 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 # ---------------------------------------------------------------------------
-# ✅ ENDPOINT /thumb/{message_id} CORREGIDO (usa get_tg_client_and_channel)
+# ENDPOINT /thumb/{message_id}
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
     try:
-        # ✅ Usar la nueva función segura para obtener cliente y entidad
-        cl, entity = await get_tg_client_and_channel(ch)
-
-        if not cl or not entity:
-            raise HTTPException(status_code=404, detail="Canal no encontrado")
+        # ✅ Usar cliente activo con reconexión automática
+        active_client = await get_active_client()
+        if not active_client:
+            raise HTTPException(status_code=503, detail="Telegram desconectado")
 
         thumb_cache = getattr(app.state, "thumb_cache", {})
         cache_key   = f"{message_id}:{ch}"
@@ -2953,8 +2903,15 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
+        entities = getattr(app.state, "entities", [app.state.entity])
+        entity   = (
+            entities[ch]
+            if (0 <= ch < len(entities) and entities[ch] is not None)
+            else app.state.entity
+        )
+
         message = await asyncio.wait_for(
-            cl.get_messages(entity, ids=message_id),
+            active_client.get_messages(entity, ids=message_id),
             timeout=3.0,
         )
         if not message:
@@ -2965,7 +2922,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         # ✅ PRIORIDAD 0: Buscar póster en mensajes cercanos (antes o después del video)
         #    Muchos canales suben el póster como foto separada junto al video
         try:
-            poster = await _find_poster_in_nearby_messages(entity, message_id, cl)
+            poster = await _find_poster_in_nearby_messages(entity, message_id, active_client)
             if poster and len(poster) > 500:
                 thumb_data = poster
         except Exception:
@@ -2975,7 +2932,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         if not thumb_data and hasattr(message, "photo") and message.photo:
             try:
                 thumb_data = await asyncio.wait_for(
-                    cl.download_media(message.photo, bytes),
+                    active_client.download_media(message.photo, bytes),
                     timeout=2.5,
                 )
                 if thumb_data:
@@ -2992,7 +2949,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if best:
                     try:
                         raw = await asyncio.wait_for(
-                            cl.download_media(video_obj, bytes, thumb=best),
+                            active_client.download_media(video_obj, bytes, thumb=best),
                             timeout=2.5,
                         )
                         if raw and len(raw) > 200:
@@ -3009,7 +2966,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             if best:
                 try:
                     raw = await asyncio.wait_for(
-                        cl.download_media(message.document, bytes, thumb=best),
+                        active_client.download_media(message.document, bytes, thumb=best),
                         timeout=2.5,
                     )
                     if raw and len(raw) > 200:
@@ -3028,7 +2985,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if best:
                     try:
                         raw = await asyncio.wait_for(
-                            cl.download_media(media_obj, bytes, thumb=best),
+                            active_client.download_media(media_obj, bytes, thumb=best),
                             timeout=2.5,
                         )
                         if raw and len(raw) > 200:
@@ -3125,18 +3082,24 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ✅ ENDPOINT /stream/{message_id} CORREGIDO (usa get_tg_client_and_channel)
+# ENDPOINT /stream/{message_id}
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
     try:
-        # ✅ Usar la nueva función segura para obtener cliente y entidad
-        cl, entity = await get_tg_client_and_channel(ch)
+        # ✅ Usar cliente activo con reconexión automática
+        active_client = await get_active_client()
+        if not active_client:
+            raise HTTPException(status_code=503, detail="Telegram desconectado")
 
-        if not cl or not entity:
-            raise HTTPException(status_code=404, detail="Canal no encontrado")
+        entities = getattr(app.state, "entities", [app.state.entity])
+        entity   = (
+            entities[ch]
+            if (0 <= ch < len(entities) and entities[ch] is not None)
+            else app.state.entity
+        )
 
-        message = await cl.get_messages(entity, ids=message_id)
+        message = await active_client.get_messages(entity, ids=message_id)
         if not message or not message.file:
             raise HTTPException(status_code=404, detail="Video no encontrado")
 
@@ -3154,7 +3117,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
             async def chunk_generator_full(offset: int, limit: int):
                 try:
-                    async for chunk in cl.iter_download(
+                    async for chunk in active_client.iter_download(
                         message.media,
                         offset=offset,
                         limit=limit,
@@ -3194,7 +3157,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
         async def chunk_generator_range(offset: int, limit: int):
             try:
-                async for chunk in cl.iter_download(
+                async for chunk in active_client.iter_download(
                     message.media,
                     offset=offset,
                     limit=limit,
