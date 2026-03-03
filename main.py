@@ -729,40 +729,47 @@ async def _find_poster_in_nearby_messages(
 # ---------------------------------------------------------------------------
 # ✅ NUEVA FUNCIÓN: Obtener cliente y entidad de canal de forma segura (SOLUCIÓN DEFINITIVA)
 # ---------------------------------------------------------------------------
+# Índice Round Robin dedicado para get_tg_client_and_channel (independiente del global)
+_tg_ch_rr_index: dict = {"idx": 0}
+
 async def get_tg_client_and_channel(ch_idx: int):
     """
     Retorna un par (cliente, entidad) para el índice de canal dado.
-    Realiza rotación automática de cuentas y resuelve la entidad completa.
+    Usa rotación Round Robin entre cuentas para balanceo uniforme.
+    Intenta todos los clientes disponibles antes de rendirse.
     Si falla, retorna (None, None).
     """
-    # Rotación automática de cuentas
-    client1 = _telegram_clients[0] if len(_telegram_clients) > 0 else None
-    client2 = _telegram_clients[1] if len(_telegram_clients) > 1 else None
-
-    # Seleccionar cliente aleatorio si hay dos cuentas
-    if client2 and random.random() > 0.5:
-        cl = client2
-    else:
-        cl = client1 or client2
-
-    if not cl:
+    if not _telegram_clients:
         print("⚠️  No hay clientes de Telegram disponibles")
         return None, None
 
-    try:
-        if ch_idx < 0 or ch_idx >= len(BACKUP_CHANNELS):
-            print(f"⚠️  Índice de canal inválido: {ch_idx}")
-            return None, None
-
-        channel_username = BACKUP_CHANNELS[ch_idx]
-
-        # ✅ SOLUCIÓN CLAVE: Resolver entidad completa
-        entity = await cl.get_entity(channel_username)
-
-        return cl, entity
-    except Exception as e:
-        print(f"⚠️  Error crítico obteniendo canal {ch_idx} ({BACKUP_CHANNELS[ch_idx] if 0 <= ch_idx < len(BACKUP_CHANNELS) else 'desconocido'}): {e}")
+    if ch_idx < 0 or ch_idx >= len(BACKUP_CHANNELS):
+        print(f"⚠️  Índice de canal inválido: {ch_idx}")
         return None, None
+
+    channel_username = BACKUP_CHANNELS[ch_idx]
+    total = len(_telegram_clients)
+
+    # Intentar con cada cliente en orden Round Robin
+    for attempt in range(total):
+        idx = _tg_ch_rr_index["idx"]
+        _tg_ch_rr_index["idx"] = (idx + 1) % total
+        cl = _telegram_clients[idx % total]
+
+        try:
+            # Reconectar si está desconectado
+            if not cl.is_connected():
+                await cl.connect()
+
+            # ✅ SOLUCIÓN CLAVE: Resolver entidad completa
+            entity = await cl.get_entity(channel_username)
+            return cl, entity
+        except Exception as e:
+            print(f"⚠️  Cliente {idx} falló para canal {ch_idx} ({channel_username}): {e}")
+            continue
+
+    print(f"⚠️  Todos los clientes fallaron para canal {ch_idx} ({channel_username})")
+    return None, None
 
 
 
@@ -2638,30 +2645,52 @@ async def search(
             try:
                 # ✅ MULTI-CUENTA: Usar cliente rotativo para distribuir la carga
                 _active_client = _get_next_client()
-                await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
+                await asyncio.sleep(0.1)  # Pausa mínima para evitar Flood Wait
                 if effective_text:
-                    msg_iter = _active_client.iter_messages(entity, search=effective_text.strip())
-
-                    async for message in msg_iter:
-                        if message.media and (message.video or message.document):
-                            caption     = message.text or ""
-                            title       = _extract_title_from_caption(caption)
-                            # ✅ MEJORA: Limpiar descripción antes de guardarla
-                            description = _clean_description(caption, max_len=300)
-                            direct_link = (
-                                f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
-                                if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
-                            )
-                            results.append({
-                                "id":          message.id,
-                                "title":       title,
-                                "description": description,
-                                "size":        (
-                                    f"{round(message.file.size / (1024 * 1024), 2)} MB"
-                                    if message.file else "n/a"
-                                ),
-                                "stream_url":  direct_link,
-                            })
+                    # ✅ FIX BÚSQUEDAS DUPLICADAS: limit=50 evita paginación múltiple en Telegram
+                    _search_text = effective_text.strip()
+                    try:
+                        msg_iter = _active_client.iter_messages(
+                            entity,
+                            search=_search_text,
+                            limit=50,  # ← CLAVE: impide que Telethon pagine varias veces
+                        )
+                        async for message in msg_iter:
+                            if message.media and (message.video or message.document):
+                                caption     = message.text or ""
+                                title       = _extract_title_from_caption(caption)
+                                description = _clean_description(caption, max_len=300)
+                                direct_link = (
+                                    f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
+                                    if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
+                                )
+                                results.append({
+                                    "id":          message.id,
+                                    "title":       title,
+                                    "description": description,
+                                    "size":        (
+                                        f"{round(message.file.size / (1024 * 1024), 2)} MB"
+                                        if message.file else "n/a"
+                                    ),
+                                    "stream_url":  direct_link,
+                                })
+                    except Exception as _search_err:
+                        err_str = str(_search_err)
+                        # ✅ FIX: Si el canal no soporta búsqueda (SearchRequest), filtrar localmente
+                        if "SearchRequest" in err_str or "Invalid channel object" in err_str or "channel" in err_str.lower():
+                            try:
+                                cached_items = await asyncio.wait_for(
+                                    _get_recent_media_cached(ch_index, entity),
+                                    timeout=SEARCH_CHANNEL_FETCH_TIMEOUT,
+                                )
+                                _q_norm = normalize_title(_search_text)
+                                for msg in cached_items:
+                                    if _q_norm in normalize_title(msg.get("title", "")):
+                                        results.append(msg)
+                            except Exception:
+                                pass
+                        else:
+                            raise  # Re-lanzar otros errores al except exterior
                 else:
                     results = await _get_recent_media_cached(ch_index, entity)
 
@@ -2941,7 +2970,11 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         cl, entity = await get_tg_client_and_channel(ch)
 
         if not cl or not entity:
-            raise HTTPException(status_code=404, detail="Canal no encontrado")
+            # ✅ FIX THUMBNAILS: Redirigir al placeholder en vez de error 404
+            return Response(
+                status_code=302,
+                headers={"Location": PLACEHOLDER_IMAGE_BASE},
+            )
 
         thumb_cache = getattr(app.state, "thumb_cache", {})
         cache_key   = f"{message_id}:{ch}"
@@ -2958,7 +2991,11 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
             timeout=3.0,
         )
         if not message:
-            raise HTTPException(status_code=404, detail="Miniatura no disponible (mensaje no encontrado)")
+            # ✅ FIX THUMBNAILS: Placeholder en vez de 404
+            return Response(
+                status_code=302,
+                headers={"Location": PLACEHOLDER_IMAGE_BASE},
+            )
 
         thumb_data: bytes | None = None
 
@@ -3065,10 +3102,25 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
     except HTTPException:
         raise
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=404, detail="Miniatura no disponible (timeout)")
+        # ✅ FIX THUMBNAILS: En lugar de 404, devolver placeholder para que el UI siempre tenga imagen
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as _ph2:
+                _r2 = await _ph2.get(PLACEHOLDER_IMAGE_BASE)
+                if _r2.status_code == 200 and _r2.content:
+                    return Response(content=_r2.content, media_type="image/jpeg")
+        except Exception:
+            pass
+        return Response(
+            status_code=302,
+            headers={"Location": PLACEHOLDER_IMAGE_BASE},
+        )
     except Exception as e:
         print(f"⚠️  Error en /thumb/{message_id}: {e}")
-        raise HTTPException(status_code=404, detail="Miniatura no disponible")
+        # ✅ FIX THUMBNAILS: Siempre redirigir al placeholder en vez de devolver 404
+        return Response(
+            status_code=302,
+            headers={"Location": PLACEHOLDER_IMAGE_BASE},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3146,7 +3198,25 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
         range_header  = request.headers.get("range")
         byte_range    = _parse_range_header(range_header, file_size)
-        content_type  = message.file.mime_type or "video/mp4"
+
+        # ✅ FIX DESCARGA AUTOMÁTICA: Normalizar MIME type a uno compatible con streaming inline
+        _raw_mime = (message.file.mime_type or "").lower().strip()
+        _VIDEO_MIME_MAP = {
+            "application/octet-stream": "video/mp4",
+            "video/x-matroska":         "video/mp4",
+            "video/x-msvideo":          "video/mp4",
+            "video/x-ms-wmv":           "video/mp4",
+            "video/mpeg":               "video/mp4",
+            "video/x-flv":              "video/mp4",
+            "video/3gpp":               "video/mp4",
+            "video/3gpp2":              "video/mp4",
+            "video/quicktime":          "video/mp4",
+            "video/x-m4v":              "video/mp4",
+        }
+        content_type = _VIDEO_MIME_MAP.get(_raw_mime, _raw_mime) if _raw_mime else "video/mp4"
+        # Garantizar que siempre sea un tipo video válido
+        if not content_type.startswith("video/"):
+            content_type = "video/mp4"
 
         if byte_range is None:
             start          = 0
@@ -3168,11 +3238,14 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                     return
 
             headers = {
-                "Content-Type":      content_type,
-                "Accept-Ranges":     "bytes",
-                "Content-Length":    str(content_length),
-                "Cache-Control":     "no-store",
-                "X-Accel-Buffering": "no",
+                "Content-Type":        content_type,
+                "Accept-Ranges":       "bytes",
+                "Content-Length":      str(content_length),
+                "Cache-Control":       "no-store",
+                "X-Accel-Buffering":   "no",
+                # ✅ FIX DESCARGA AUTOMÁTICA: forzar reproducción inline en el navegador
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
             }
 
             return StreamingResponse(
@@ -3208,12 +3281,15 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 return
 
         headers = {
-            "Content-Type":      content_type,
-            "Accept-Ranges":     "bytes",
-            "Content-Range":     f"bytes {start}-{end}/{file_size}",
-            "Content-Length":    str(content_length),
-            "Cache-Control":     "no-store",
-            "X-Accel-Buffering": "no",
+            "Content-Type":        content_type,
+            "Accept-Ranges":       "bytes",
+            "Content-Range":       f"bytes {start}-{end}/{file_size}",
+            "Content-Length":      str(content_length),
+            "Cache-Control":       "no-store",
+            "X-Accel-Buffering":   "no",
+            # ✅ FIX DESCARGA AUTOMÁTICA: forzar reproducción inline en el navegador
+            "Content-Disposition": "inline",
+            "X-Content-Type-Options": "nosniff",
         }
 
         return StreamingResponse(
