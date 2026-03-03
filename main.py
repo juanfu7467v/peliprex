@@ -167,7 +167,7 @@ _REQUIRED_CHANNELS = [
     '@PeliculasCristianasLatino',
     '@infantilesvideos',
     '@Series_Bpb',
-    '@videos_infantiles_2024
+    '@videos_infantiles_2024',
     '@hardc0rexxx',
     '@anal_fisting',
     '@phettheesam',
