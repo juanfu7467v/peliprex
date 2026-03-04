@@ -992,18 +992,25 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # ✅ MULTI-CUENTA: Inicialización de clientes Telegram con reconexión automática
 # ---------------------------------------------------------------------------
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+# Lista de clientes Telegram
+_telegram_clients = []
 
-# Construir lista de clientes activos (solo los que tienen sesión configurada)
-_telegram_clients: list = [client]
+# Cliente 1 (principal)
+client1 = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+_telegram_clients.append(client1)
+
+# Cliente 2 (secundario, si está configurado)
 if SESSION_STRING_2.strip():
-    _client2 = TelegramClient(StringSession(SESSION_STRING_2), API_ID, API_HASH)
-    _telegram_clients.append(_client2)
+    client2 = TelegramClient(StringSession(SESSION_STRING_2), API_ID, API_HASH)
+    _telegram_clients.append(client2)
     print(f"🔄 Multi-cuenta activada: {len(_telegram_clients)} cuentas de Telegram disponibles")
 else:
     print("ℹ️  SESSION_STRING_2 no configurado. Usando cuenta única.")
 
-# ✅ Sistema de rotación mejorado con cycle
+# Referencia al cliente principal para compatibilidad
+client = client1
+
+# ✅ Sistema de rotación mejorado con cycle - AHORA GLOBAL
 _client_cycle = cycle(_telegram_clients) if _telegram_clients else None
 
 
@@ -1013,7 +1020,7 @@ async def get_active_client() -> TelegramClient | None:
     Si el cliente seleccionado está desconectado, intenta reconectarlo
     automáticamente antes de retornarlo. Prueba todos los clientes disponibles.
     """
-    if not _telegram_clients:
+    if not _telegram_clients or not _client_cycle:
         return None
 
     total = len(_telegram_clients)
@@ -1045,7 +1052,7 @@ def _get_next_client() -> TelegramClient:
     Versión síncrona de rotación (usada en contextos no-async).
     No verifica conexión — usar get_active_client() cuando sea posible.
     """
-    if not _telegram_clients:
+    if not _telegram_clients or not _client_cycle:
         return None
     try:
         return next(_client_cycle)
@@ -3226,127 +3233,181 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id} - SIN MODIFICACIONES (solo headers mejorados)
+# ENDPOINT /stream/{message_id} - VERSIÓN MEJORADA CON SOPORTE COMPLETO DE STREAMING
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
+    """
+    Endpoint de streaming optimizado con:
+    - Rotación automática de clientes
+    - Manejo específico de FloodWait
+    - Soporte para range requests
+    - Headers correctos para reproducción en navegador
+    """
+    # Variable para tracking
+    client_used = None
+    
     try:
-        # ✅ Usar cliente activo con reconexión automática
-        active_client = await get_active_client()
-        if not active_client:
-            raise HTTPException(status_code=503, detail="Telegram desconectado")
+        # ✅ 1. Obtener cliente con rotación
+        client_used = await get_active_client()
+        if not client_used:
+            print(f"❌ No hay clientes Telegram disponibles para stream {message_id}")
+            raise HTTPException(status_code=503, detail="Servicio de streaming no disponible")
 
-        # ✅ Obtener entidad de canal de forma segura
-        entity, error = await _get_safe_entity(ch, active_client)
+        # ✅ 2. Obtener entidad de canal de forma segura
+        entity, error = await _get_safe_entity(ch, client_used)
         if error or not entity:
             print(f"⚠️ Error obteniendo entidad para streaming canal {ch}: {error}")
             raise HTTPException(status_code=404, detail="Canal no encontrado")
 
+        # ✅ 3. Obtener mensaje con timeout y manejo de errores específicos
         async with _client_semaphore:
             try:
                 message = await asyncio.wait_for(
-                    active_client.get_messages(entity, ids=message_id),
-                    timeout=3.0,
+                    client_used.get_messages(entity, ids=message_id),
+                    timeout=5.0,
                 )
             except errors.FloodWait as e:
-                print(f"⚠️ FloodWait en stream {message_id}: {e.seconds}s")
-                raise HTTPException(status_code=429, detail="Demasiadas solicitudes")
+                # Error específico de Telegram por exceso de solicitudes
+                wait_time = getattr(e, 'seconds', 30)
+                print(f"⚠️ FloodWait en stream {message_id}: esperar {wait_time}s")
+                raise HTTPException(
+                    status_code=429, 
+                    detail=f"Límite de Telegram alcanzado. Espera {wait_time} segundos"
+                )
+            except asyncio.TimeoutError:
+                print(f"⚠️ Timeout obteniendo mensaje {message_id}")
+                raise HTTPException(status_code=504, detail="Tiempo de espera agotado")
+            except Exception as e:
+                print(f"⚠️ Error obteniendo mensaje {message_id}: {type(e).__name__}: {e}")
+                raise HTTPException(status_code=500, detail="Error al obtener el video")
         
-        if not message or not message.file:
+        # ✅ 4. Validar que el mensaje existe y tiene archivo
+        if not message:
+            print(f"⚠️ Mensaje {message_id} no encontrado en canal {ch}")
             raise HTTPException(status_code=404, detail="Video no encontrado")
-
+        
+        if not message.file:
+            print(f"⚠️ Mensaje {message_id} no tiene archivo adjunto")
+            raise HTTPException(status_code=404, detail="El mensaje no contiene un archivo de video")
+        
+        # ✅ 5. Obtener información del archivo
         file_size = int(message.file.size or 0)
         if file_size <= 0:
-            raise HTTPException(status_code=404, detail="Video no encontrado")
+            print(f"⚠️ Archivo {message_id} tiene tamaño inválido: {file_size}")
+            raise HTTPException(status_code=404, detail="Archivo de video inválido")
+        
+        file_name = getattr(message.file, "name", f"video_{message_id}.mp4")
+        content_type = message.file.mime_type or "video/mp4"
+        
+        # Log para debugging (no en producción)
+        print(f"▶️ Streaming: msg={message_id}, canal={ch}, tamaño={file_size} bytes, tipo={content_type}")
 
-        range_header  = request.headers.get("range")
-        byte_range    = _parse_range_header(range_header, file_size)
-        content_type  = message.file.mime_type or "video/mp4"
-
-        if byte_range is None:
-            start          = 0
-            content_length = file_size
-
-            async def chunk_generator_full(offset: int, limit: int):
-                try:
-                    async with _client_semaphore:
-                        async for chunk in active_client.iter_download(
-                            message.media,
-                            offset=offset,
-                            limit=limit,
-                            chunk_size=STREAM_CHUNK_SIZE,
-                        ):
-                            yield chunk
-                except asyncio.CancelledError:
-                    return
-                except Exception as _se:
-                    print(f"⚠️  Stream interrumpido (full) msg {message_id}: {_se}")
-                    return
-
-            headers = {
-                "Content-Type":      content_type,
-                "Accept-Ranges":     "bytes",
-                "Content-Length":    str(content_length),
-                "Cache-Control":     "no-store",
-                "X-Accel-Buffering": "no",
-                "Content-Disposition": "inline",
-            }
-
-            return StreamingResponse(
-                chunk_generator_full(start, content_length),
-                status_code=200,
-                headers=headers,
-                media_type=content_type,
-            )
-
-        start, end     = byte_range
-        content_length = (end - start) + 1
-
-        if content_length <= 0:
-            return Response(
-                status_code=416,
-                content=b"",
-                headers={"Content-Range": f"bytes */{file_size}"},
-            )
-
-        async def chunk_generator_range(offset: int, limit: int):
+        # ✅ 6. Procesar solicitud de rango (para seek en video)
+        range_header = request.headers.get("range")
+        byte_range = _parse_range_header(range_header, file_size)
+        
+        # Función generadora de chunks
+        async def chunk_generator(offset: int, limit: int):
+            """Generador de chunks para streaming"""
+            bytes_sent = 0
             try:
                 async with _client_semaphore:
-                    async for chunk in active_client.iter_download(
+                    async for chunk in client_used.iter_download(
                         message.media,
                         offset=offset,
                         limit=limit,
                         chunk_size=STREAM_CHUNK_SIZE,
                     ):
-                        yield chunk
+                        if chunk:
+                            yield chunk
+                            bytes_sent += len(chunk)
+                            
+                        # Verificar si el cliente se desconectó
+                        if await request.is_disconnected():
+                            print(f"📡 Cliente desconectado durante stream {message_id}")
+                            break
+                            
             except asyncio.CancelledError:
+                print(f"⚠️ Stream cancelado por el cliente: {message_id}")
                 return
-            except Exception as _se:
-                print(f"⚠️  Stream interrumpido (range) msg {message_id}: {_se}")
+            except errors.FloodWait as e:
+                print(f"⚠️ FloodWait durante streaming {message_id}: {e.seconds}s")
+                # No podemos hacer mucho aquí, el cliente ya está recibiendo datos
                 return
+            except Exception as e:
+                print(f"⚠️ Error durante streaming {message_id}: {type(e).__name__}: {e}")
+                # No relanzamos para no interrumpir el stream si ya empezó
+                return
+            finally:
+                print(f"✅ Stream finalizado: {message_id}, enviados {bytes_sent} bytes")
 
-        headers = {
-            "Content-Type":      content_type,
-            "Accept-Ranges":     "bytes",
-            "Content-Range":     f"bytes {start}-{end}/{file_size}",
-            "Content-Length":    str(content_length),
-            "Cache-Control":     "no-store",
-            "X-Accel-Buffering": "no",
-            "Content-Disposition": "inline",
-        }
-
-        return StreamingResponse(
-            chunk_generator_range(start, content_length),
-            status_code=206,
-            headers=headers,
-            media_type=content_type,
-        )
+        # ✅ 7. Configurar headers según sea rango o completo
+        if byte_range is None:
+            # Respuesta completa (sin rango)
+            start = 0
+            content_length = file_size
+            
+            headers = {
+                "Content-Type": content_type,
+                "Content-Length": str(content_length),
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+                "Content-Disposition": "inline",
+                "Access-Control-Allow-Origin": "*",
+            }
+            
+            return StreamingResponse(
+                chunk_generator(start, content_length),
+                status_code=200,
+                headers=headers,
+                media_type=content_type,
+            )
+        else:
+            # Respuesta parcial (con rango)
+            start, end = byte_range
+            content_length = (end - start) + 1
+            
+            headers = {
+                "Content-Type": content_type,
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(content_length),
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+                "Content-Disposition": "inline",
+                "Access-Control-Allow-Origin": "*",
+            }
+            
+            return StreamingResponse(
+                chunk_generator(start, content_length),
+                status_code=206,
+                headers=headers,
+                media_type=content_type,
+            )
 
     except HTTPException:
+        # Re-lanzar excepciones HTTP ya formateadas
         raise
+    except errors.FloodWait as e:
+        # Capturar FloodWait que pueda ocurrir fuera del bloque principal
+        wait_time = getattr(e, 'seconds', 30)
+        print(f"⚠️ FloodWait en stream {message_id}: {wait_time}s")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Límite de Telegram alcanzado. Espera {wait_time} segundos"
+        )
     except Exception as e:
-        print(f"⚠️  Error de streaming: {e}")
-        raise HTTPException(status_code=500, detail="Error de streaming")
+        # Error genérico con logging detallado
+        error_msg = f"Error crítico en streaming: {type(e).__name__}: {e}"
+        print(f"❌ {error_msg}")
+        
+        # Intentar identificar si el cliente se perdió
+        if "Connection" in str(e) or "disconnect" in str(e).lower():
+            # Error de conexión, no es crítico para el servidor
+            print(f"📡 Cliente desconectado durante stream {message_id}")
+            return Response(status_code=499)  # Código para cliente cerrado
+        
+        raise HTTPException(status_code=500, detail="Error interno de streaming")
 
 
 # ---------------------------------------------------------------------------
