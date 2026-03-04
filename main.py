@@ -10,10 +10,11 @@ import time
 import io
 from urllib.parse import quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager
+from itertools import cycle
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Message,
@@ -455,6 +456,47 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
         return int(ch_vals[0])
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# ✅ NUEVA FUNCIÓN: Obtener entidad de canal de forma segura
+# ---------------------------------------------------------------------------
+async def _get_safe_entity(ch_index: int, client=None) -> tuple:
+    """
+    Obtiene una entidad de canal de forma segura.
+    Retorna (entity, error) donde error es None si todo OK.
+    """
+    try:
+        entities = getattr(app.state, "entities", [app.state.entity])
+        
+        # Verificar que el índice existe
+        if ch_index < 0 or ch_index >= len(entities):
+            return None, f"Índice de canal {ch_index} fuera de rango"
+        
+        entity = entities[ch_index]
+        
+        # Si la entidad ya es válida, usarla directamente
+        if entity is not None:
+            return entity, None
+        
+        # Intentar obtener la entidad del pool de canales de respaldo
+        if ch_index < len(BACKUP_CHANNELS):
+            channel_username = BACKUP_CHANNELS[ch_index]
+            try:
+                if client is None:
+                    client = await get_active_client()
+                if client:
+                    entity = await client.get_entity(channel_username)
+                    # Actualizar en app.state
+                    entities[ch_index] = entity
+                    return entity, None
+            except Exception as e:
+                return None, f"Error obteniendo entidad para {channel_username}: {e}"
+        
+        return None, f"No se pudo obtener entidad para canal {ch_index}"
+    
+    except Exception as e:
+        return None, f"Error inesperado obteniendo entidad: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -962,13 +1004,13 @@ if SESSION_STRING_2.strip():
 else:
     print("ℹ️  SESSION_STRING_2 no configurado. Usando cuenta única.")
 
-# Índice global para rotación Round Robin
-_client_rr_index: dict = {"idx": 0}
+# ✅ Sistema de rotación mejorado con cycle
+_client_cycle = cycle(_telegram_clients) if _telegram_clients else None
 
 
 async def get_active_client() -> TelegramClient | None:
     """
-    Retorna un cliente Telegram activo y conectado usando rotación Round Robin.
+    Retorna un cliente Telegram activo y conectado usando rotación Round Robin con cycle.
     Si el cliente seleccionado está desconectado, intenta reconectarlo
     automáticamente antes de retornarlo. Prueba todos los clientes disponibles.
     """
@@ -977,21 +1019,22 @@ async def get_active_client() -> TelegramClient | None:
 
     total = len(_telegram_clients)
     for _ in range(total):
-        idx      = _client_rr_index["idx"]
-        selected = _telegram_clients[idx % total]
-        _client_rr_index["idx"] = (idx + 1) % total
+        try:
+            selected = next(_client_cycle)
+        except StopIteration:
+            return None
 
         try:
             if selected.is_connected():
                 return selected
             # Cliente desconectado → intentar reconectar
-            print(f"🔄 Cliente {idx} desconectado — reconectando...")
+            print(f"🔄 Cliente desconectado — reconectando...")
             await selected.connect()
             if await selected.is_user_authorized():
-                print(f"✅ Cliente {idx} reconectado correctamente")
+                print(f"✅ Cliente reconectado correctamente")
                 return selected
         except Exception as _ce:
-            print(f"⚠️  No se pudo reconectar cliente {idx}: {_ce}")
+            print(f"⚠️  No se pudo reconectar cliente: {_ce}")
             continue
 
     print("❌ Ningún cliente de Telegram disponible")
@@ -1003,12 +1046,12 @@ def _get_next_client() -> TelegramClient:
     Versión síncrona de rotación (usada en contextos no-async).
     No verifica conexión — usar get_active_client() cuando sea posible.
     """
-    if len(_telegram_clients) == 1:
-        return _telegram_clients[0]
-    idx = _client_rr_index["idx"]
-    selected = _telegram_clients[idx % len(_telegram_clients)]
-    _client_rr_index["idx"] = (idx + 1) % len(_telegram_clients)
-    return selected
+    if not _telegram_clients:
+        return None
+    try:
+        return next(_client_cycle)
+    except StopIteration:
+        return _telegram_clients[0] if _telegram_clients else None
 
 
 # ---------------------------------------------------------------------------
@@ -1500,6 +1543,8 @@ async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) ->
     results = []
     # ✅ MULTI-CUENTA: Usar cliente rotativo para repartir carga entre cuentas
     _active_client = _get_next_client()
+    if not _active_client:
+        return []
     await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
     async with _client_semaphore:
         async for message in _active_client.iter_messages(entity, limit=limit):
@@ -2697,6 +2742,8 @@ async def search(
             try:
                 # ✅ MULTI-CUENTA: Usar cliente rotativo para distribuir la carga
                 _active_client = _get_next_client()
+                if not _active_client:
+                    return []
                 await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
                 if effective_text:
                     async with _client_semaphore:
@@ -2859,6 +2906,8 @@ async def catalog():
                 try:
                     # ✅ MULTI-CUENTA: Usar cliente rotativo para repartir carga
                     _active_client = _get_next_client()
+                    if not _active_client:
+                        return []
                     # ✅ OPT: Offset aleatorio para catálogo variado en cada solicitud
                     random_offset = random.randint(0, 100)
                     async with fetch_sem:
@@ -3024,19 +3073,25 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
-            entities[ch]
-            if (0 <= ch < len(entities) and entities[ch] is not None)
-            else app.state.entity
-        )
+        # ✅ Obtener entidad de canal de forma segura
+        entity, error = await _get_safe_entity(ch, active_client)
+        if error or not entity:
+            print(f"⚠️ Error obteniendo entidad para canal {ch}: {error}")
+            return await _serve_placeholder(thumb_cache, cache_key)
 
         # ✅ Obtener mensaje con semáforo de concurrencia
         async with _client_semaphore:
-            message = await asyncio.wait_for(
-                active_client.get_messages(entity, ids=message_id),
-                timeout=3.0,
-            )
+            try:
+                message = await asyncio.wait_for(
+                    active_client.get_messages(entity, ids=message_id),
+                    timeout=3.0,
+                )
+            except errors.FloodWait as e:
+                print(f"⚠️ FloodWait en thumb {message_id}: {e.seconds}s")
+                return await _serve_placeholder(thumb_cache, cache_key)
+            except Exception as e:
+                print(f"⚠️ Error obteniendo mensaje {message_id}: {e}")
+                return await _serve_placeholder(thumb_cache, cache_key)
         
         if not message:
             # Si no hay mensaje, usar placeholder
@@ -3172,7 +3227,7 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id} - SIN MODIFICACIONES
+# ENDPOINT /stream/{message_id} - SIN MODIFICACIONES (solo headers mejorados)
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
@@ -3182,15 +3237,21 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
         if not active_client:
             raise HTTPException(status_code=503, detail="Telegram desconectado")
 
-        entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
-            entities[ch]
-            if (0 <= ch < len(entities) and entities[ch] is not None)
-            else app.state.entity
-        )
+        # ✅ Obtener entidad de canal de forma segura
+        entity, error = await _get_safe_entity(ch, active_client)
+        if error or not entity:
+            print(f"⚠️ Error obteniendo entidad para streaming canal {ch}: {error}")
+            raise HTTPException(status_code=404, detail="Canal no encontrado")
 
         async with _client_semaphore:
-            message = await active_client.get_messages(entity, ids=message_id)
+            try:
+                message = await asyncio.wait_for(
+                    active_client.get_messages(entity, ids=message_id),
+                    timeout=3.0,
+                )
+            except errors.FloodWait as e:
+                print(f"⚠️ FloodWait en stream {message_id}: {e.seconds}s")
+                raise HTTPException(status_code=429, detail="Demasiadas solicitudes")
         
         if not message or not message.file:
             raise HTTPException(status_code=404, detail="Video no encontrado")
@@ -3229,6 +3290,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 "Content-Length":    str(content_length),
                 "Cache-Control":     "no-store",
                 "X-Accel-Buffering": "no",
+                "Content-Disposition": "inline",
             }
 
             return StreamingResponse(
@@ -3271,6 +3333,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             "Content-Length":    str(content_length),
             "Cache-Control":     "no-store",
             "X-Accel-Buffering": "no",
+            "Content-Disposition": "inline",
         }
 
         return StreamingResponse(
