@@ -10,25 +10,11 @@ import time
 import io
 from urllib.parse import quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager
-from itertools import cycle
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from telethon import TelegramClient, errors
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import (
-    Message,
-    MessageMediaDocument,
-    MessageMediaPhoto,
-    Document,
-    Photo,
-    PhotoSize,
-    PhotoCachedSize,
-    PhotoStrippedSize,
-    PhotoPathSize,
-    VideoSize,
-    MessageMediaWebPage
-)
 
 # 🔧 Pillow con fallback gracioso
 try:
@@ -40,15 +26,14 @@ except ImportError:
     print("⚠️  Pillow no disponible. Instalar con: pip install Pillow")
 
 # ---------------------------------------------------------------------------
-# CONFIGURACIÓN - CUENTA 1
+# CONFIGURACIÓN
 # ---------------------------------------------------------------------------
+# Cuenta 1 (principal)
 API_ID             = int(os.getenv("API_ID", "0"))
 API_HASH           = os.getenv("API_HASH", "")
 SESSION_STRING     = os.getenv("SESSION_STRING", "")
 
-# ---------------------------------------------------------------------------
-# CONFIGURACIÓN - CUENTA 2 (opcional, para balanceo de carga)
-# ---------------------------------------------------------------------------
+# Cuenta 2 (secundaria) - Credenciales independientes
 API_ID_2           = int(os.getenv("API_ID_2", "0"))
 API_HASH_2         = os.getenv("API_HASH_2", "")
 SESSION_STRING_2   = os.getenv("SESSION_STRING_2", "")
@@ -127,11 +112,6 @@ THUMB_CACHE_MAX = max(50, min(2000, int(os.getenv("THUMB_CACHE_MAX", "500"))))
 TARGET_THUMB_WIDTH  = 500
 TARGET_THUMB_HEIGHT = 750
 
-# ---------------------------------------------------------------------------
-# ✅ NUEVO: Semáforo global para control de concurrencia de clientes
-# ---------------------------------------------------------------------------
-CLIENT_SEMAPHORE_LIMIT = 15
-_client_semaphore = asyncio.Semaphore(CLIENT_SEMAPHORE_LIMIT)
 
 # ---------------------------------------------------------------------------
 # ✅ Cache IA (persistente) para reducir 429
@@ -198,8 +178,9 @@ _REQUIRED_CHANNELS = [
     '@anal_fisting',
     '@phettheesam',
     '@ParaisoAnal',
-    '@tsgirl',
+    '@tsgirl',     	          	                                             	                                                
 ]
+
 
 def _dedupe_channels(channels: list) -> list:
     seen, out = set(), []
@@ -465,251 +446,7 @@ def _extract_ch_from_stream_url(stream_url: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# ✅ NUEVA FUNCIÓN: Obtener entidad de canal de forma segura
-# ---------------------------------------------------------------------------
-async def _get_safe_entity(ch_index: int, client=None) -> tuple:
-    """
-    Obtiene una entidad de canal de forma segura.
-    Retorna (entity, error) donde error es None si todo OK.
-    """
-    try:
-        entities = getattr(app.state, "entities", [app.state.entity])
-        
-        # Verificar que el índice existe
-        if ch_index < 0 or ch_index >= len(entities):
-            return None, f"Índice de canal {ch_index} fuera de rango"
-        
-        entity = entities[ch_index]
-        
-        # Si la entidad ya es válida, usarla directamente
-        if entity is not None:
-            return entity, None
-        
-        # Intentar obtener la entidad del pool de canales de respaldo
-        if ch_index < len(BACKUP_CHANNELS):
-            channel_username = BACKUP_CHANNELS[ch_index]
-            try:
-                if client is None:
-                    client = await get_active_client()
-                if client:
-                    entity = await client.get_entity(channel_username)
-                    # Actualizar en app.state
-                    entities[ch_index] = entity
-                    return entity, None
-            except Exception as e:
-                return None, f"Error obteniendo entidad para {channel_username}: {e}"
-        
-        return None, f"No se pudo obtener entidad para canal {ch_index}"
-    
-    except Exception as e:
-        return None, f"Error inesperado obteniendo entidad: {e}"
-
-
-# ---------------------------------------------------------------------------
-# ✅ NUEVA FUNCIÓN: Extraer miniatura nativa de Telegram de manera confiable
-# ---------------------------------------------------------------------------
-async def _extract_native_thumbnail(message, client) -> bytes | None:
-    """
-    Extrae la miniatura nativa de Telegram de un mensaje de video.
-    Implementación 100% probada y funcional para 2026.
-    Prioridades:
-    1. message.video.thumbs (video nativo)
-    2. message.document.thumbs (documento con video)
-    3. message.media.thumbs (media en general)
-    4. message.photo (si es una foto)
-    """
-    if not message:
-        return None
-
-    thumb_data = None
-
-    # Helper para descargar thumbnail
-    async def _download_thumb(media_obj, thumb_obj):
-        try:
-            async with _client_semaphore:
-                return await client.download_media(media_obj, bytes, thumb=thumb_obj)
-        except Exception as e:
-            print(f"   ⚠️ Error descargando thumb: {e}")
-            return None
-
-    # Función para obtener el mejor thumb de una lista
-    def _get_best_thumb(thumbs_list):
-        if not thumbs_list:
-            return None
-        
-        # Filtrar thumbs válidos
-        valid_thumbs = []
-        for t in thumbs_list:
-            # Ignorar thumbs sin datos útiles
-            if isinstance(t, (PhotoStrippedSize, PhotoPathSize)):
-                continue
-            # Ignorar thumb type 'i' (inline) o 'p' (path)
-            if hasattr(t, 'type') and t.type in ('i', 'p'):
-                continue
-            valid_thumbs.append(t)
-        
-        if not valid_thumbs:
-            return None
-        
-        # Ordenar por resolución (w * h)
-        try:
-            valid_thumbs.sort(
-                key=lambda x: (getattr(x, 'w', 0) or 0) * (getattr(x, 'h', 0) or 0),
-                reverse=True
-            )
-        except Exception:
-            pass
-        
-        return valid_thumbs[0]
-
-    # CASO 1: Mensaje es una foto directamente
-    if hasattr(message, 'photo') and message.photo:
-        try:
-            thumb_data = await _download_thumb(message.photo, None)
-            if thumb_data:
-                print(f"   📷 Thumb nativo (photo) extraído")
-                return thumb_data
-        except Exception:
-            pass
-
-    # CASO 2: Video nativo (message.video)
-    if hasattr(message, 'video') and message.video:
-        video = message.video
-        if hasattr(video, 'thumbs') and video.thumbs:
-            best_thumb = _get_best_thumb(video.thumbs)
-            if best_thumb:
-                thumb_data = await _download_thumb(video, best_thumb)
-                if thumb_data:
-                    print(f"   🎬 Thumb nativo (video.thumbs) extraído")
-                    return thumb_data
-
-    # CASO 3: Documento (message.document)
-    if hasattr(message, 'document') and message.document:
-        doc = message.document
-        if hasattr(doc, 'thumbs') and doc.thumbs:
-            best_thumb = _get_best_thumb(doc.thumbs)
-            if best_thumb:
-                thumb_data = await _download_thumb(doc, best_thumb)
-                if thumb_data:
-                    print(f"   📎 Thumb nativo (document.thumbs) extraído")
-                    return thumb_data
-
-    # CASO 4: Media genérico (message.media)
-    if hasattr(message, 'media') and message.media:
-        media = message.media
-        if hasattr(media, 'document') and media.document:
-            doc = media.document
-            if hasattr(doc, 'thumbs') and doc.thumbs:
-                best_thumb = _get_best_thumb(doc.thumbs)
-                if best_thumb:
-                    thumb_data = await _download_thumb(doc, best_thumb)
-                    if thumb_data:
-                        print(f"   🖼️ Thumb nativo (media.document) extraído")
-                        return thumb_data
-        
-        if hasattr(media, 'photo') and media.photo:
-            thumb_data = await _download_thumb(media.photo, None)
-            if thumb_data:
-                print(f"   📸 Thumb nativo (media.photo) extraído")
-                return thumb_data
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# ✅ NUEVA FUNCIÓN: Buscar póster en mensajes cercanos mejorada
-# ---------------------------------------------------------------------------
-async def _find_poster_in_nearby_messages_enhanced(
-    entity,
-    message_id: int,
-    client,
-    search_range: int = 5,
-) -> bytes | None:
-    """
-    Versión mejorada de búsqueda de póster en mensajes cercanos.
-    Busca en un rango más amplio y prioriza mensajes que sean solo fotos.
-    """
-    try:
-        # IDs a buscar (antes y después)
-        nearby_ids = []
-        for offset in range(-search_range, search_range + 1):
-            if offset != 0:  # Excluir el mensaje actual
-                nearby_ids.append(message_id + offset)
-        
-        if not nearby_ids:
-            return None
-
-        # Obtener mensajes en lotes para no sobrecargar
-        messages = []
-        batch_size = 3
-        for i in range(0, len(nearby_ids), batch_size):
-            batch = nearby_ids[i:i+batch_size]
-            try:
-                async with _client_semaphore:
-                    batch_msgs = await client.get_messages(entity, ids=batch)
-                if batch_msgs:
-                    if isinstance(batch_msgs, list):
-                        messages.extend(batch_msgs)
-                    else:
-                        messages.append(batch_msgs)
-            except Exception:
-                continue
-            await asyncio.sleep(0.1)  # Pequeña pausa entre lotes
-
-        if not messages:
-            return None
-
-        # Filtrar mensajes que son fotos
-        photo_messages = []
-        for msg in messages:
-            if msg and hasattr(msg, 'photo') and msg.photo:
-                distance = abs(msg.id - message_id)
-                photo_messages.append((distance, msg))
-
-        # Ordenar por cercanía al mensaje original
-        photo_messages.sort(key=lambda x: x[0])
-
-        for distance, msg in photo_messages:
-            try:
-                async with _client_semaphore:
-                    photo_data = await client.download_media(msg.photo, bytes)
-                if photo_data and len(photo_data) > 500:
-                    print(f"   🖼️ Póster encontrado en mensaje #{msg.id} (a {distance} mensajes)")
-                    return photo_data
-            except Exception:
-                continue
-
-        return None
-
-    except Exception as e:
-        print(f"   ⚠️ Error en búsqueda de póster cercano: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# ✅ NUEVA FUNCIÓN: Obtener URL de miniatura garantizada
-# ---------------------------------------------------------------------------
-async def _get_guaranteed_thumbnail_url(
-    message_id: int,
-    ch_index: int,
-    message=None,
-    entity=None,
-    client=None
-) -> str:
-    """
-    Función que garantiza que siempre se devuelva una URL de miniatura válida.
-    Prioridad:
-    1. Usar mensaje proporcionado o obtenerlo si es necesario
-    2. Extraer miniatura nativa
-    3. Si no hay miniatura, devolver placeholder
-    """
-    # Si ya tenemos una URL construida, validarla
-    url = _build_public_url(f"/thumb/{message_id}?ch={ch_index}")
-    return url
-
-
-# ---------------------------------------------------------------------------
-# ✅ thumb_url_for_message mejorada
+# ✅ _thumb_url_for_message valida que el ID sea numérico
 # ---------------------------------------------------------------------------
 def _thumb_url_for_message(message_id, stream_url=None, ch=None):
     if not message_id:
@@ -723,7 +460,6 @@ def _thumb_url_for_message(message_id, stream_url=None, ch=None):
         ch_final = int(ch)
     elif stream_url:
         ch_final = _extract_ch_from_stream_url(stream_url)
-    # Siempre devolvemos la URL, aunque sea placeholder
     return _build_public_url(f"/thumb/{msg_id_int}?ch={ch_final}")
 
 
@@ -834,6 +570,59 @@ def _meta_is_full_enough_for_persist(meta: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# ✅ HELPER: Obtener el mejor thumb nativo de Telegram de forma robusta
+# ---------------------------------------------------------------------------
+def _get_best_native_thumb(thumbs_list):
+    """
+    Dado una lista de thumbs de Telegram (PhotoSize, PhotoCachedSize,
+    PhotoStrippedSize, VideoSize, etc.), devuelve el mejor objeto thumb
+    para descargar, priorizando por resolución y descartando tipos sin datos.
+
+    Retorna el objeto thumb seleccionado, o None si la lista está vacía
+    o todos son de tipos no descargables.
+    """
+    if not thumbs_list:
+        return None
+
+    # Importar tipos de Telethon de forma segura
+    try:
+        from telethon.tl.types import (
+            PhotoStrippedSize,
+            PhotoPathSize,
+        )
+        _stripped_types = (PhotoStrippedSize, PhotoPathSize)
+    except ImportError:
+        _stripped_types = ()
+
+    valid = []
+    for t in thumbs_list:
+        # Saltar tipos que no se pueden descargar correctamente como imagen
+        if _stripped_types and isinstance(t, _stripped_types):
+            continue
+        # Saltar si type_ es 'i' (inline/stripped) o 'p' (path)
+        type_attr = getattr(t, "type", "") or ""
+        if type_attr in ("i", "p"):
+            continue
+        valid.append(t)
+
+    if not valid:
+        # Si solo quedan stripped/path, intentar con el último de la lista original
+        # como último recurso antes de rendirse
+        return thumbs_list[-1] if thumbs_list else None
+
+    # Ordenar por resolución descendente (w * h), con fallback a 0 si no tienen dimensiones
+    try:
+        valid.sort(
+            key=lambda t: getattr(t, "w", 0) * getattr(t, "h", 0),
+            reverse=True,
+        )
+    except Exception:
+        pass
+
+    return valid[0]
+
+
+# ---------------------------------------------------------------------------
 # ✅ MEJORA: Limpiar descripción (eliminar links, @menciones, limitar longitud)
 # ---------------------------------------------------------------------------
 def _clean_description(text: str, max_len: int = 300) -> str:
@@ -849,7 +638,7 @@ def _clean_description(text: str, max_len: int = 300) -> str:
         return ""
     t = text.strip()
     # Eliminar links markdown: [texto](url)
-    t = re.sub(r'\[([^\]]*)\]\(https?://[^\)]*\)', r'\1', t)
+    t = re.sub(r'\[([^\]]*)\]\(https?://[^\)]*\)', r'', t)
     # Eliminar URLs sueltas
     t = re.sub(r'https?://\S+', '', t)
     # Eliminar menciones @usuario
@@ -869,17 +658,159 @@ def _clean_description(text: str, max_len: int = 300) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ✅ MEJORA: Buscar póster en mensajes cercanos al video
+# ---------------------------------------------------------------------------
+async def _find_poster_in_nearby_messages(
+    entity,
+    message_id: int,
+    tg_client,
+    search_range: int = 4,
+) -> bytes | None:
+    """
+    Busca una imagen (póster) en los mensajes cercanos al video.
+    Muchos canales publican el póster como foto justo antes o después del video.
+    Revisa ±search_range mensajes alrededor del mensaje dado.
+    Retorna los bytes de la imagen si la encuentra, o None.
+    """
+    try:
+        # Obtener IDs de mensajes cercanos (antes y después)
+        nearby_ids = list(range(
+            max(1, message_id - search_range),
+            message_id + search_range + 1,
+        ))
+        # Excluir el mensaje original
+        nearby_ids = [mid for mid in nearby_ids if mid != message_id]
+
+        if not nearby_ids:
+            return None
+
+        messages = await asyncio.wait_for(
+            tg_client.get_messages(entity, ids=nearby_ids),
+            timeout=3.0,
+        )
+
+        if not messages:
+            return None
+
+        # Normalizar a lista (a veces es un objeto único)
+        if not isinstance(messages, list):
+            messages = [messages]
+
+        # Priorizar mensajes más cercanos al ID original
+        messages_with_id = []
+        for msg in messages:
+            if msg is None:
+                continue
+            msg_id = getattr(msg, "id", None)
+            if msg_id is None:
+                continue
+            distance = abs(msg_id - message_id)
+            messages_with_id.append((distance, msg))
+
+        messages_with_id.sort(key=lambda x: x[0])
+
+        for _, msg in messages_with_id:
+            # Buscar mensajes que sean fotos (pósters)
+            if hasattr(msg, "photo") and msg.photo:
+                try:
+                    photo_data = await asyncio.wait_for(
+                        tg_client.download_media(msg.photo, bytes),
+                        timeout=3.0,
+                    )
+                    if photo_data and len(photo_data) > 500:
+                        print(f"   🖼️  Póster encontrado en mensaje cercano #{msg.id} (a {abs(msg.id - message_id)} de distancia)")
+                        return photo_data
+                except Exception:
+                    continue
+
+        return None
+
+    except asyncio.TimeoutError:
+        return None
+    except Exception as e:
+        print(f"   ⚠️  Error buscando póster en mensajes cercanos: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ✅ MULTI-CUENTA: Inicialización de clientes Telegram con reconexión automática
+# ---------------------------------------------------------------------------
+# Cliente 1 (principal)
+client1 = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+# Lista de clientes activos
+_telegram_clients: list = [client1]
+
+# Cliente 2 (secundario) - Solo si tiene todas sus credenciales
+if API_ID_2 > 0 and API_HASH_2 and SESSION_STRING_2:
+    client2 = TelegramClient(StringSession(SESSION_STRING_2), API_ID_2, API_HASH_2)
+    _telegram_clients.append(client2)
+    print(f"🔄 Multi-cuenta activada: {len(_telegram_clients)} cuentas de Telegram disponibles (cada una con sus propias credenciales)")
+else:
+    print("ℹ️  SESSION_STRING_2 no configurado o credenciales incompletas. Usando cuenta única.")
+
+# Índice global para rotación Round Robin
+_client_rr_index: dict = {"idx": 0}
+
+
+async def get_active_client() -> TelegramClient | None:
+    """
+    Retorna un cliente Telegram activo y conectado usando rotación Round Robin.
+    Si el cliente seleccionado está desconectado, intenta reconectarlo
+    automáticamente antes de retornarlo. Prueba todos los clientes disponibles.
+    """
+    if not _telegram_clients:
+        return None
+
+    total = len(_telegram_clients)
+    for _ in range(total):
+        idx      = _client_rr_index["idx"]
+        selected = _telegram_clients[idx % total]
+        _client_rr_index["idx"] = (idx + 1) % total
+
+        try:
+            if selected.is_connected():
+                return selected
+            # Cliente desconectado → intentar reconectar
+            print(f"🔄 Cliente {idx} desconectado — reconectando...")
+            await selected.connect()
+            if await selected.is_user_authorized():
+                print(f"✅ Cliente {idx} reconectado correctamente")
+                return selected
+        except Exception as _ce:
+            print(f"⚠️  No se pudo reconectar cliente {idx}: {_ce}")
+            continue
+
+    print("❌ Ningún cliente de Telegram disponible")
+    return None
+
+
+def _get_next_client() -> TelegramClient:
+    """
+    Versión síncrona de rotación (usada en contextos no-async).
+    No verifica conexión — usar get_active_client() cuando sea posible.
+    """
+    if len(_telegram_clients) == 1:
+        return _telegram_clients[0]
+    idx = _client_rr_index["idx"]
+    selected = _telegram_clients[idx % len(_telegram_clients)]
+    _client_rr_index["idx"] = (idx + 1) % len(_telegram_clients)
+    return selected
+
+
+# ---------------------------------------------------------------------------
 # LIFESPAN
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("📡 Conectando a Telegram...")
     # ✅ MULTI-CUENTA: Conectar todos los clientes disponibles
-    for _cl in _telegram_clients:
+    for i, _cl in enumerate(_telegram_clients):
         try:
             await _cl.connect()
+            print(f"✅ Cliente {i} conectado correctamente")
         except Exception as _e:
-            print(f"⚠️  Error conectando cliente Telegram: {_e}")
+            print(f"⚠️  Error conectando cliente {i} Telegram: {_e}")
 
     app.state.entity               = None
     app.state.entities             = [None]
@@ -981,9 +912,10 @@ async def lifespan(app: FastAPI):
         await _save_persistent_cache(to_save)
 
     # ✅ MULTI-CUENTA: Desconectar todos los clientes al apagar
-    for _cl in _telegram_clients:
+    for i, _cl in enumerate(_telegram_clients):
         try:
             await _cl.disconnect()
+            print(f"✅ Cliente {i} desconectado")
         except Exception:
             pass
 
@@ -995,80 +927,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------------------------------------------------------------------------
-# ✅ MULTI-CUENTA: Inicialización de clientes Telegram con credenciales independientes
-# ---------------------------------------------------------------------------
-_telegram_clients = []
-
-# Cliente 1 (principal) - usa credenciales de cuenta 1
-if API_ID and API_HASH and SESSION_STRING:
-    client1 = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    _telegram_clients.append(client1)
-    print("✅ Cliente 1 configurado correctamente")
-else:
-    print("⚠️  Credenciales de cuenta 1 incompletas")
-    client1 = None
-
-# Cliente 2 (secundario) - usa credenciales de cuenta 2 (totalmente independientes)
-if API_ID_2 and API_HASH_2 and SESSION_STRING_2:
-    client2 = TelegramClient(StringSession(SESSION_STRING_2), API_ID_2, API_HASH_2)
-    _telegram_clients.append(client2)
-    print(f"🔄 Multi-cuenta activada: {len(_telegram_clients)} cuentas de Telegram disponibles")
-else:
-    print("ℹ️  Cuenta 2 no configurada (API_ID_2, API_HASH_2 o SESSION_STRING_2 faltan)")
-
-# Referencia al cliente principal para compatibilidad
-client = client1
-
-# ✅ Sistema de rotación mejorado con cycle
-_client_cycle = cycle(_telegram_clients) if _telegram_clients else None
-
-
-async def get_active_client() -> TelegramClient | None:
-    """
-    Retorna un cliente Telegram activo y conectado usando rotación Round Robin con cycle.
-    Si el cliente seleccionado está desconectado, intenta reconectarlo
-    automáticamente antes de retornarlo. Prueba todos los clientes disponibles.
-    """
-    if not _telegram_clients or not _client_cycle:
-        return None
-
-    total = len(_telegram_clients)
-    for _ in range(total):
-        try:
-            selected = next(_client_cycle)
-        except StopIteration:
-            return None
-
-        try:
-            if selected.is_connected():
-                return selected
-            # Cliente desconectado → intentar reconectar
-            print(f"🔄 Cliente desconectado — reconectando...")
-            await selected.connect()
-            if await selected.is_user_authorized():
-                print(f"✅ Cliente reconectado correctamente")
-                return selected
-        except Exception as _ce:
-            print(f"⚠️  No se pudo reconectar cliente: {_ce}")
-            continue
-
-    print("❌ Ningún cliente de Telegram disponible")
-    return None
-
-
-def _get_next_client() -> TelegramClient:
-    """
-    Versión síncrona de rotación (usada en contextos no-async).
-    No verifica conexión — usar get_active_client() cuando sea posible.
-    """
-    if not _telegram_clients or not _client_cycle:
-        return None
-    try:
-        return next(_client_cycle)
-    except StopIteration:
-        return _telegram_clients[0] if _telegram_clients else None
 
 
 # ---------------------------------------------------------------------------
@@ -1560,37 +1418,29 @@ async def _fetch_recent_media_from_channel(ch_index: int, entity, limit: int) ->
     results = []
     # ✅ MULTI-CUENTA: Usar cliente rotativo para repartir carga entre cuentas
     _active_client = _get_next_client()
-    if not _active_client:
-        return []
     await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
-    async with _client_semaphore:
-        async for message in _active_client.iter_messages(entity, limit=limit):
-            if message.media and (message.video or message.document):
-                caption     = message.text or ""
-                title       = _extract_title_from_caption(caption)
-                # ✅ MEJORA: Limpiar descripción (eliminar links, menciones, limitar longitud)
-                description = _clean_description(caption, max_len=300)
-                # ✅ MEJORA: Usar URL de miniatura garantizada
-                thumb_url = await _get_guaranteed_thumbnail_url(
-                    message.id, ch_index, message, entity, _active_client
-                )
-                direct_link = (
-                    f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
-                    if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
-                )
-                results.append({
-                    "id":          message.id,
-                    "title":       title,
-                    "description": description,
-                    "size":        (
-                        f"{round(message.file.size / (1024 * 1024), 2)} MB"
-                        if message.file else "n/a"
-                    ),
-                    "stream_url":  direct_link,
-                    "thumb_url":   thumb_url,
-                })
-                if len(results) >= 50:
-                    break
+    async for message in _active_client.iter_messages(entity, limit=limit):
+        if message.media and (message.video or message.document):
+            caption     = message.text or ""
+            title       = _extract_title_from_caption(caption)
+            # ✅ MEJORA: Limpiar descripción (eliminar links, menciones, limitar longitud)
+            description = _clean_description(caption, max_len=300)
+            direct_link = (
+                f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
+                if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
+            )
+            results.append({
+                "id":          message.id,
+                "title":       title,
+                "description": description,
+                "size":        (
+                    f"{round(message.file.size / (1024 * 1024), 2)} MB"
+                    if message.file else "n/a"
+                ),
+                "stream_url":  direct_link,
+            })
+            if len(results) >= 50:
+                break
     return results
 
 
@@ -2476,7 +2326,7 @@ async def enrich_results_with_tmdb(
                 if (not meta) or need_repair:
                     if new_counter["n"] >= limit_new:
                         pelicula_url = r.get("stream_url") or ""
-                        thumb = r.get("thumb_url") or _thumb_url_for_message(r.get("id"), pelicula_url)
+                        thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
                         yt    = _youtube_thumb_from_stream_url(pelicula_url)
                         img_final = thumb or yt or ""
                         return {
@@ -2562,7 +2412,7 @@ async def enrich_results_with_tmdb(
             if _is_placeholder_image(meta_img):
                 meta_img = None
 
-            thumb_img  = r.get("thumb_url") or _thumb_url_for_message(r.get("id"), pelicula_url)
+            thumb_img  = _thumb_url_for_message(r.get("id"), pelicula_url)
             yt_img     = _youtube_thumb_from_stream_url(pelicula_url)
 
             if catalog_mode:
@@ -2634,7 +2484,7 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
 
         pelicula_url = r.get("stream_url") or ""
 
-        thumb_img = r.get("thumb_url") or _thumb_url_for_message(r.get("id"), pelicula_url)
+        thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
         yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
         img_final = thumb_img or yt_img or "n/a"
 
@@ -2759,38 +2609,30 @@ async def search(
             try:
                 # ✅ MULTI-CUENTA: Usar cliente rotativo para distribuir la carga
                 _active_client = _get_next_client()
-                if not _active_client:
-                    return []
                 await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
                 if effective_text:
-                    async with _client_semaphore:
-                        msg_iter = _active_client.iter_messages(entity, search=effective_text.strip())
+                    msg_iter = _active_client.iter_messages(entity, search=effective_text.strip())
 
-                        async for message in msg_iter:
-                            if message.media and (message.video or message.document):
-                                caption     = message.text or ""
-                                title       = _extract_title_from_caption(caption)
-                                # ✅ MEJORA: Limpiar descripción antes de guardarla
-                                description = _clean_description(caption, max_len=300)
-                                # ✅ MEJORA: Usar URL de miniatura garantizada
-                                thumb_url = await _get_guaranteed_thumbnail_url(
-                                    message.id, ch_index, message, entity, _active_client
-                                )
-                                direct_link = (
-                                    f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
-                                    if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
-                                )
-                                results.append({
-                                    "id":          message.id,
-                                    "title":       title,
-                                    "description": description,
-                                    "size":        (
-                                        f"{round(message.file.size / (1024 * 1024), 2)} MB"
-                                        if message.file else "n/a"
-                                    ),
-                                    "stream_url":  direct_link,
-                                    "thumb_url":   thumb_url,
-                                })
+                    async for message in msg_iter:
+                        if message.media and (message.video or message.document):
+                            caption     = message.text or ""
+                            title       = _extract_title_from_caption(caption)
+                            # ✅ MEJORA: Limpiar descripción antes de guardarla
+                            description = _clean_description(caption, max_len=300)
+                            direct_link = (
+                                f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
+                                if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
+                            )
+                            results.append({
+                                "id":          message.id,
+                                "title":       title,
+                                "description": description,
+                                "size":        (
+                                    f"{round(message.file.size / (1024 * 1024), 2)} MB"
+                                    if message.file else "n/a"
+                                ),
+                                "stream_url":  direct_link,
+                            })
                 else:
                     results = await _get_recent_media_cached(ch_index, entity)
 
@@ -2923,43 +2765,35 @@ async def catalog():
                 try:
                     # ✅ MULTI-CUENTA: Usar cliente rotativo para repartir carga
                     _active_client = _get_next_client()
-                    if not _active_client:
-                        return []
                     # ✅ OPT: Offset aleatorio para catálogo variado en cada solicitud
                     random_offset = random.randint(0, 100)
                     async with fetch_sem:
-                        async with _client_semaphore:
-                            await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
-                            async for message in _active_client.iter_messages(
-                                entity,
-                                limit=CATALOG_LIMIT_PER_CHANNEL,
-                                add_offset=random_offset,
-                            ):
-                                if message.media and (message.video or message.document):
-                                    caption     = message.text or ""
-                                    title       = _extract_title_from_caption(caption)
-                                    # ✅ MEJORA: Limpiar descripción antes de guardarla
-                                    description = _clean_description(caption, max_len=300)
-                                    # ✅ MEJORA: Usar URL de miniatura garantizada
-                                    thumb_url = await _get_guaranteed_thumbnail_url(
-                                        message.id, ch_index, message, entity, _active_client
-                                    )
-                                    direct_link = (
-                                        f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
-                                        if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
-                                    )
-                                    results.append({
-                                        "id":          message.id,
-                                        "title":       title,
-                                        "description": description,
-                                        "size":        (
-                                            f"{round(message.file.size / (1024 * 1024), 2)} MB"
-                                            if message.file else "n/a"
-                                        ),
-                                        "stream_url":  direct_link,
-                                        "thumb_url":   thumb_url,
-                                    })
-                                    if len(results) >= CATALOG_LIMIT_PER_CHANNEL: break
+                        await asyncio.sleep(0.2)  # ✅ Pausa natural para evitar Flood Wait
+                        async for message in _active_client.iter_messages(
+                            entity,
+                            limit=CATALOG_LIMIT_PER_CHANNEL,
+                            add_offset=random_offset,
+                        ):
+                            if message.media and (message.video or message.document):
+                                caption     = message.text or ""
+                                title       = _extract_title_from_caption(caption)
+                                # ✅ MEJORA: Limpiar descripción antes de guardarla
+                                description = _clean_description(caption, max_len=300)
+                                direct_link = (
+                                    f"{PUBLIC_URL}/stream/{message.id}?ch={ch_index}"
+                                    if PUBLIC_URL else f"/stream/{message.id}?ch={ch_index}"
+                                )
+                                results.append({
+                                    "id":          message.id,
+                                    "title":       title,
+                                    "description": description,
+                                    "size":        (
+                                        f"{round(message.file.size / (1024 * 1024), 2)} MB"
+                                        if message.file else "n/a"
+                                    ),
+                                    "stream_url":  direct_link,
+                                })
+                                if len(results) >= CATALOG_LIMIT_PER_CHANNEL: break
                 except Exception as e:
                     print(f"⚠️  Error en canal [{ch_index}] para /catalog: {e}")
                 return results
@@ -3069,8 +2903,7 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 # ---------------------------------------------------------------------------
-# ✅ ENDPOINT /thumb/{message_id} MEJORADO
-# Ahora garantiza miniatura nativa de Telegram
+# ENDPOINT /thumb/{message_id}
 # ---------------------------------------------------------------------------
 @app.get("/thumb/{message_id}")
 async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
@@ -3090,47 +2923,98 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 if time.monotonic() - ts < THUMB_CACHE_TTL:
                     return Response(content=data, media_type=mime)
 
-        # ✅ Obtener entidad de canal de forma segura
-        entity, error = await _get_safe_entity(ch, active_client)
-        if error or not entity:
-            print(f"⚠️ Error obteniendo entidad para canal {ch}: {error}")
-            return await _serve_placeholder(thumb_cache, cache_key)
+        entities = getattr(app.state, "entities", [app.state.entity])
+        entity   = (
+            entities[ch]
+            if (0 <= ch < len(entities) and entities[ch] is not None)
+            else app.state.entity
+        )
 
-        # ✅ Obtener mensaje con semáforo de concurrencia
-        async with _client_semaphore:
-            try:
-                message = await asyncio.wait_for(
-                    active_client.get_messages(entity, ids=message_id),
-                    timeout=3.0,
-                )
-            except errors.FloodWait as e:
-                print(f"⚠️ FloodWait en thumb {message_id}: {e.seconds}s")
-                return await _serve_placeholder(thumb_cache, cache_key)
-            except Exception as e:
-                print(f"⚠️ Error obteniendo mensaje {message_id}: {e}")
-                return await _serve_placeholder(thumb_cache, cache_key)
-        
+        message = await asyncio.wait_for(
+            active_client.get_messages(entity, ids=message_id),
+            timeout=3.0,
+        )
         if not message:
-            # Si no hay mensaje, usar placeholder
-            return await _serve_placeholder(thumb_cache, cache_key)
+            raise HTTPException(status_code=404, detail="Miniatura no disponible (mensaje no encontrado)")
 
         thumb_data: bytes | None = None
 
-        # ✅ PRIORIDAD 1: Buscar póster en mensajes cercanos (mejorado)
+        # ✅ PRIORIDAD 0: Buscar póster en mensajes cercanos (antes o después del video)
+        #    Muchos canales suben el póster como foto separada junto al video
         try:
-            poster = await _find_poster_in_nearby_messages_enhanced(entity, message_id, active_client)
+            poster = await _find_poster_in_nearby_messages(entity, message_id, active_client)
             if poster and len(poster) > 500:
                 thumb_data = poster
-                print(f"   🖼️ Póster encontrado en mensajes cercanos para msg {message_id}")
-        except Exception as e:
-            print(f"   ⚠️ Error buscando póster cercano: {e}")
+        except Exception:
+            thumb_data = None
 
-        # ✅ PRIORIDAD 2: Extraer miniatura nativa de Telegram
+        # ✅ PRIORIDAD 1: miniatura nativa desde message.photo (mensajes que son fotos)
+        if not thumb_data and hasattr(message, "photo") and message.photo:
+            try:
+                thumb_data = await asyncio.wait_for(
+                    active_client.download_media(message.photo, bytes),
+                    timeout=2.5,
+                )
+                if thumb_data:
+                    print(f"   📷 Miniatura nativa (photo) obtenida para msg {message_id}")
+            except Exception:
+                thumb_data = None
+
+        # ✅ PRIORIDAD 2: miniatura nativa desde message.video.thumbs
+        #    En Telethon, message.video devuelve el Document si es un video
         if not thumb_data:
-            thumb_data = await _extract_native_thumbnail(message, active_client)
+            video_obj = getattr(message, "video", None)
+            if video_obj and hasattr(video_obj, "thumbs") and video_obj.thumbs:
+                best = _get_best_native_thumb(video_obj.thumbs)
+                if best:
+                    try:
+                        raw = await asyncio.wait_for(
+                            active_client.download_media(video_obj, bytes, thumb=best),
+                            timeout=2.5,
+                        )
+                        if raw and len(raw) > 200:
+                            thumb_data = raw
+                            print(f"   🎬 Miniatura nativa (video.thumbs) obtenida para msg {message_id}")
+                    except Exception:
+                        thumb_data = None
+
+        # ✅ PRIORIDAD 3: miniatura nativa desde message.document.thumbs
+        #    (aquí es donde Telegram guarda las miniaturas de los videos en Telethon)
+        #    FIX: pasar document como media principal y best como parámetro thumb
+        if not thumb_data and message.document and message.document.thumbs:
+            best = _get_best_native_thumb(message.document.thumbs)
+            if best:
+                try:
+                    raw = await asyncio.wait_for(
+                        active_client.download_media(message.document, bytes, thumb=best),
+                        timeout=2.5,
+                    )
+                    if raw and len(raw) > 200:
+                        thumb_data = raw
+                        print(f"   📎 Miniatura nativa (document.thumbs) obtenida para msg {message_id}")
+                except Exception:
+                    thumb_data = None
+
+        # ✅ PRIORIDAD 4: miniatura desde message.media.thumbs (acceso directo al media)
+        #    FIX: pasar media_obj como media principal y best como parámetro thumb
+        if not thumb_data:
+            media_obj = getattr(message, "media", None)
+            media_thumbs = getattr(media_obj, "thumbs", None) if media_obj else None
+            if media_thumbs:
+                best = _get_best_native_thumb(media_thumbs)
+                if best:
+                    try:
+                        raw = await asyncio.wait_for(
+                            active_client.download_media(media_obj, bytes, thumb=best),
+                            timeout=2.5,
+                        )
+                        if raw and len(raw) > 200:
+                            thumb_data = raw
+                            print(f"   🖼️  Miniatura nativa (media.thumbs) obtenida para msg {message_id}")
+                    except Exception:
+                        thumb_data = None
 
         if thumb_data:
-            # Procesar y cachear
             processed = _crop_cover_to_poster(thumb_data)
             mime      = "image/jpeg"
             async with app.state.thumb_cache_lock:
@@ -3138,56 +3022,30 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 thumb_cache[cache_key] = (time.monotonic(), processed, mime)
             return Response(content=processed, media_type=mime)
 
-        # ✅ Si todo falla, servir placeholder
-        return await _serve_placeholder(thumb_cache, cache_key)
-
-    except asyncio.TimeoutError:
-        print(f"⚠️ Timeout en /thumb/{message_id}")
-        return await _serve_placeholder(getattr(app.state, "thumb_cache", {}), cache_key if 'cache_key' in locals() else None)
-    except Exception as e:
-        print(f"⚠️ Error en /thumb/{message_id}: {e}")
-        return await _serve_placeholder(getattr(app.state, "thumb_cache", {}), cache_key if 'cache_key' in locals() else None)
-
-
-# ---------------------------------------------------------------------------
-# ✅ Helper para servir imagen placeholder
-# ---------------------------------------------------------------------------
-async def _serve_placeholder(thumb_cache, cache_key=None):
-    """Sirve la imagen placeholder, cacheándola si es posible."""
-    try:
-        # Intentar obtener placeholder cacheado
-        if cache_key:
-            placeholder_cache_key = f"placeholder:{cache_key}"
-            async with app.state.thumb_cache_lock:
-                cached = thumb_cache.get(placeholder_cache_key)
-                if cached:
-                    ts, data, mime = cached
-                    if time.monotonic() - ts < THUMB_CACHE_TTL:
-                        return Response(content=data, media_type=mime)
-
-        # Descargar placeholder
-        async with httpx.AsyncClient(timeout=4.0) as _ph:
-            _r = await _ph.get(PLACEHOLDER_IMAGE_BASE)
-            if _r.status_code == 200 and _r.content:
-                processed = _crop_cover_to_poster(_r.content)
-                mime      = "image/jpeg"
-                
-                # Cachear si tenemos cache_key
-                if cache_key:
-                    placeholder_cache_key = f"placeholder:{cache_key}"
+        # ✅ Sin miniatura en Telegram → usar placeholder para no devolver error
+        print(f"   ℹ️  Sin miniatura disponible para msg {message_id} — usando placeholder")
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as _ph:
+                _r = await _ph.get(PLACEHOLDER_IMAGE_BASE)
+                if _r.status_code == 200 and _r.content:
+                    processed = _crop_cover_to_poster(_r.content)
+                    mime      = "image/jpeg"
                     async with app.state.thumb_cache_lock:
                         _thumb_cache_prune(thumb_cache)
-                        thumb_cache[placeholder_cache_key] = (time.monotonic(), processed, mime)
-                
-                return Response(content=processed, media_type=mime)
+                        thumb_cache[cache_key] = (time.monotonic(), processed, mime)
+                    return Response(content=processed, media_type=mime)
+        except Exception:
+            pass
+
+        raise HTTPException(status_code=404, detail="Miniatura no disponible")
+
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=404, detail="Miniatura no disponible (timeout)")
     except Exception as e:
-        print(f"⚠️ Error sirviendo placeholder: {e}")
-    
-    # Fallback último: redirección al placeholder original
-    return Response(
-        status_code=302,
-        headers={"Location": PLACEHOLDER_IMAGE_BASE},
-    )
+        print(f"⚠️  Error en /thumb/{message_id}: {e}")
+        raise HTTPException(status_code=404, detail="Miniatura no disponible")
 
 
 # ---------------------------------------------------------------------------
@@ -3244,7 +3102,7 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id} - SIN MODIFICACIONES
+# ENDPOINT /stream/{message_id}
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
@@ -3254,38 +3112,14 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
         if not active_client:
             raise HTTPException(status_code=503, detail="Telegram desconectado")
 
-        # ✅ Obtener entidad de canal de forma segura
-        entity, error = await _get_safe_entity(ch, active_client)
-        if error or not entity:
-            print(f"⚠️ Error obteniendo entidad para streaming canal {ch}: {error}")
-            raise HTTPException(status_code=404, detail="Canal no encontrado")
+        entities = getattr(app.state, "entities", [app.state.entity])
+        entity   = (
+            entities[ch]
+            if (0 <= ch < len(entities) and entities[ch] is not None)
+            else app.state.entity
+        )
 
-        async with _client_semaphore:
-            try:
-                message = await asyncio.wait_for(
-                    active_client.get_messages(entity, ids=message_id),
-                    timeout=5.0,
-                )
-            except errors.FloodWait as e:
-                wait_time = getattr(e, 'seconds', 30)
-                print(f"⚠️ FloodWait en stream {message_id}: esperar {wait_time}s")
-                raise HTTPException(
-                    status_code=429, 
-                    detail=f"Límite de Telegram alcanzado. Espera {wait_time} segundos"
-                )
-            except asyncio.TimeoutError:
-                print(f"⚠️ Timeout obteniendo mensaje {message_id}")
-                raise HTTPException(status_code=504, detail="Tiempo de espera agotado")
-            except errors.ChannelInvalidError:
-                print(f"⚠️ Canal inválido: {ch}")
-                raise HTTPException(status_code=403, detail="Canal no accesible")
-            except errors.ChannelPrivateError:
-                print(f"⚠️ Canal privado: {ch}")
-                raise HTTPException(status_code=403, detail="Canal privado")
-            except Exception as e:
-                print(f"⚠️ Error obteniendo mensaje {message_id}: {type(e).__name__}: {e}")
-                raise HTTPException(status_code=500, detail="Error al obtener el video")
-        
+        message = await active_client.get_messages(entity, ids=message_id)
         if not message or not message.file:
             raise HTTPException(status_code=404, detail="Video no encontrado")
 
@@ -3303,14 +3137,13 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
             async def chunk_generator_full(offset: int, limit: int):
                 try:
-                    async with _client_semaphore:
-                        async for chunk in active_client.iter_download(
-                            message.media,
-                            offset=offset,
-                            limit=limit,
-                            chunk_size=STREAM_CHUNK_SIZE,
-                        ):
-                            yield chunk
+                    async for chunk in active_client.iter_download(
+                        message.media,
+                        offset=offset,
+                        limit=limit,
+                        chunk_size=STREAM_CHUNK_SIZE,
+                    ):
+                        yield chunk
                 except asyncio.CancelledError:
                     return
                 except Exception as _se:
@@ -3323,7 +3156,6 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 "Content-Length":    str(content_length),
                 "Cache-Control":     "no-store",
                 "X-Accel-Buffering": "no",
-                "Content-Disposition": "inline",
             }
 
             return StreamingResponse(
@@ -3345,14 +3177,13 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
         async def chunk_generator_range(offset: int, limit: int):
             try:
-                async with _client_semaphore:
-                    async for chunk in active_client.iter_download(
-                        message.media,
-                        offset=offset,
-                        limit=limit,
-                        chunk_size=STREAM_CHUNK_SIZE,
-                    ):
-                        yield chunk
+                async for chunk in active_client.iter_download(
+                    message.media,
+                    offset=offset,
+                    limit=limit,
+                    chunk_size=STREAM_CHUNK_SIZE,
+                ):
+                    yield chunk
             except asyncio.CancelledError:
                 return
             except Exception as _se:
@@ -3366,7 +3197,6 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             "Content-Length":    str(content_length),
             "Cache-Control":     "no-store",
             "X-Accel-Buffering": "no",
-            "Content-Disposition": "inline",
         }
 
         return StreamingResponse(
