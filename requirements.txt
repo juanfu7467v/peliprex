@@ -1,10 +1,8 @@
 fastapi
 uvicorn
-telethon>=1.35.0
+telethon>=1.31.1
 python-multipart
 httpx
 aiohttp
 requests
 Pillow
-cryptg
-python-dotenv
