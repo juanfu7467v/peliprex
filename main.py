@@ -3233,18 +3233,17 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id} - VERSIÓN MEJORADA CON SOPORTE COMPLETO DE STREAMING
+# ENDPOINT /stream/{message_id} - VERSIÓN CORREGIDA Y OPTIMIZADA
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
     """
     Endpoint de streaming optimizado con:
-    - Rotación automática de clientes
-    - Manejo específico de FloodWait
-    - Soporte para range requests
+    - Corrección automática de IDs de canal (agrega -100 si es necesario)
+    - Manejo específico de FloodWaitError
+    - Timeout seguro para evitar bloqueos
     - Headers correctos para reproducción en navegador
     """
-    # Variable para tracking
     client_used = None
     
     try:
@@ -3254,21 +3253,44 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             print(f"❌ No hay clientes Telegram disponibles para stream {message_id}")
             raise HTTPException(status_code=503, detail="Servicio de streaming no disponible")
 
-        # ✅ 2. Obtener entidad de canal de forma segura
+        # ✅ 2. Obtener entidad de canal con corrección automática
         entity, error = await _get_safe_entity(ch, client_used)
         if error or not entity:
             print(f"⚠️ Error obteniendo entidad para streaming canal {ch}: {error}")
-            raise HTTPException(status_code=404, detail="Canal no encontrado")
+            
+            # 🔧 INTENTAR CORREGIR EL ID DEL CANAL AUTOMÁTICAMENTE
+            try:
+                # Si es un número, intentar con formato -100
+                if isinstance(ch, int) or (isinstance(ch, str) and ch.isdigit()):
+                    channel_id = int(ch)
+                    # Los IDs de canales públicos suelen necesitar -100
+                    if channel_id > 0:
+                        corrected_id = int(f"-100{channel_id}")
+                        print(f"🔄 Intentando con ID corregido: {corrected_id}")
+                        try:
+                            entity = await client_used.get_entity(corrected_id)
+                            if entity:
+                                # Actualizar en app.state
+                                entities = getattr(app.state, "entities", [])
+                                if 0 <= ch < len(entities):
+                                    entities[ch] = entity
+                                print(f"✅ ID corregido funcionó para canal {ch}")
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"⚠️ Error al corregir ID: {e}")
+            
+            if not entity:
+                raise HTTPException(status_code=404, detail="Canal no encontrado")
 
         # ✅ 3. Obtener mensaje con timeout y manejo de errores específicos
         async with _client_semaphore:
             try:
                 message = await asyncio.wait_for(
                     client_used.get_messages(entity, ids=message_id),
-                    timeout=5.0,
+                    timeout=8.0,  # Timeout generoso para evitar bloqueos
                 )
-            except errors.FloodWait as e:
-                # Error específico de Telegram por exceso de solicitudes
+            except errors.FloodWaitError as e:  # 🔥 CORREGIDO: FloodWaitError (no FloodWait)
                 wait_time = getattr(e, 'seconds', 30)
                 print(f"⚠️ FloodWait en stream {message_id}: esperar {wait_time}s")
                 raise HTTPException(
@@ -3278,6 +3300,12 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             except asyncio.TimeoutError:
                 print(f"⚠️ Timeout obteniendo mensaje {message_id}")
                 raise HTTPException(status_code=504, detail="Tiempo de espera agotado")
+            except errors.ChannelInvalidError:
+                print(f"⚠️ Canal inválido: {ch}")
+                raise HTTPException(status_code=403, detail="Canal no accesible")
+            except errors.ChannelPrivateError:
+                print(f"⚠️ Canal privado: {ch}")
+                raise HTTPException(status_code=403, detail="Canal privado")
             except Exception as e:
                 print(f"⚠️ Error obteniendo mensaje {message_id}: {type(e).__name__}: {e}")
                 raise HTTPException(status_code=500, detail="Error al obtener el video")
@@ -3297,11 +3325,9 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             print(f"⚠️ Archivo {message_id} tiene tamaño inválido: {file_size}")
             raise HTTPException(status_code=404, detail="Archivo de video inválido")
         
-        file_name = getattr(message.file, "name", f"video_{message_id}.mp4")
         content_type = message.file.mime_type or "video/mp4"
         
-        # Log para debugging (no en producción)
-        print(f"▶️ Streaming: msg={message_id}, canal={ch}, tamaño={file_size} bytes, tipo={content_type}")
+        print(f"▶️ Streaming: msg={message_id}, canal={ch}, tamaño={file_size} bytes")
 
         # ✅ 6. Procesar solicitud de rango (para seek en video)
         range_header = request.headers.get("range")
@@ -3329,28 +3355,23 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                             break
                             
             except asyncio.CancelledError:
-                print(f"⚠️ Stream cancelado por el cliente: {message_id}")
+                print(f"⚠️ Stream cancelado: {message_id}")
                 return
-            except errors.FloodWait as e:
-                print(f"⚠️ FloodWait durante streaming {message_id}: {e.seconds}s")
-                # No podemos hacer mucho aquí, el cliente ya está recibiendo datos
+            except errors.FloodWaitError as e:
+                print(f"⚠️ FloodWait durante streaming: {e.seconds}s")
                 return
             except Exception as e:
-                print(f"⚠️ Error durante streaming {message_id}: {type(e).__name__}: {e}")
-                # No relanzamos para no interrumpir el stream si ya empezó
+                print(f"⚠️ Error en streaming: {type(e).__name__}")
                 return
             finally:
                 print(f"✅ Stream finalizado: {message_id}, enviados {bytes_sent} bytes")
 
         # ✅ 7. Configurar headers según sea rango o completo
         if byte_range is None:
-            # Respuesta completa (sin rango)
-            start = 0
-            content_length = file_size
-            
+            # Respuesta completa
             headers = {
                 "Content-Type": content_type,
-                "Content-Length": str(content_length),
+                "Content-Length": str(file_size),
                 "Accept-Ranges": "bytes",
                 "Cache-Control": "no-cache",
                 "Content-Disposition": "inline",
@@ -3358,7 +3379,7 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             }
             
             return StreamingResponse(
-                chunk_generator(start, content_length),
+                chunk_generator(0, file_size),
                 status_code=200,
                 headers=headers,
                 media_type=content_type,
@@ -3386,26 +3407,27 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
             )
 
     except HTTPException:
-        # Re-lanzar excepciones HTTP ya formateadas
         raise
-    except errors.FloodWait as e:
-        # Capturar FloodWait que pueda ocurrir fuera del bloque principal
+    except errors.FloodWaitError as e:  # 🔥 CORREGIDO: Captura fuera del bloque principal
         wait_time = getattr(e, 'seconds', 30)
         print(f"⚠️ FloodWait en stream {message_id}: {wait_time}s")
         raise HTTPException(
             status_code=429,
             detail=f"Límite de Telegram alcanzado. Espera {wait_time} segundos"
         )
+    except errors.ChannelInvalidError:
+        print(f"⚠️ Canal inválido: {ch}")
+        raise HTTPException(status_code=403, detail="Canal no accesible")
+    except errors.ChannelPrivateError:
+        print(f"⚠️ Canal privado: {ch}")
+        raise HTTPException(status_code=403, detail="Canal privado")
     except Exception as e:
-        # Error genérico con logging detallado
-        error_msg = f"Error crítico en streaming: {type(e).__name__}: {e}"
+        error_msg = f"Error crítico: {type(e).__name__}: {e}"
         print(f"❌ {error_msg}")
         
-        # Intentar identificar si el cliente se perdió
+        # Si el cliente se desconectó, no es error crítico
         if "Connection" in str(e) or "disconnect" in str(e).lower():
-            # Error de conexión, no es crítico para el servidor
-            print(f"📡 Cliente desconectado durante stream {message_id}")
-            return Response(status_code=499)  # Código para cliente cerrado
+            return Response(status_code=499)
         
         raise HTTPException(status_code=500, detail="Error interno de streaming")
 
