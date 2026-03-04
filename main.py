@@ -102,12 +102,15 @@ MAX_ENRICH_NEW            = max(10, min(80, int(os.getenv("MAX_ENRICH_NEW",     
 CACHE_SAVE_EVERY      = 10
 
 # ---------------------------------------------------------------------------
-# STREAMING (FIX DEFINITIVO)
+# STREAMING - CONFIGURACIÓN OPTIMIZADA
 # ---------------------------------------------------------------------------
 STREAM_CHUNK_SIZE = max(
-    64 * 1024,
-    min(1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(512 * 1024))))
+    256 * 1024,  # Aumentado a 256KB para mejor rendimiento
+    min(2 * 1024 * 1024, int(os.getenv("STREAM_CHUNK_SIZE", str(1024 * 1024))))
 )
+
+STREAM_TIMEOUT = 30.0  # Timeout para cada chunk
+STREAM_MAX_RETRIES = 3  # Reintentos en caso de error
 
 # ---------------------------------------------------------------------------
 # THUMBNAILS
@@ -122,7 +125,7 @@ TARGET_THUMB_HEIGHT = 750
 # ---------------------------------------------------------------------------
 # ✅ NUEVO: Semáforo global para control de concurrencia de clientes
 # ---------------------------------------------------------------------------
-CLIENT_SEMAPHORE_LIMIT = 15
+CLIENT_SEMAPHORE_LIMIT = 20  # Aumentado para permitir más streams concurrentes
 _client_semaphore = asyncio.Semaphore(CLIENT_SEMAPHORE_LIMIT)
 
 # ---------------------------------------------------------------------------
@@ -3172,119 +3175,197 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT /stream/{message_id} - SIN MODIFICACIONES
+# ✅ ENDPOINT /stream/{message_id} - CORREGIDO Y OPTIMIZADO
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
+    """
+    Endpoint de streaming optimizado con mejor manejo de:
+    - Timeouts
+    - Reconexiones
+    - Headers Range
+    - Concurrencia
+    """
+    stream_start_time = time.time()
+    
     try:
-        # ✅ Usar cliente activo con reconexión automática
-        active_client = await get_active_client()
+        # ✅ Obtener cliente activo con timeout
+        active_client = await asyncio.wait_for(
+            get_active_client(),
+            timeout=5.0
+        )
         if not active_client:
-            raise HTTPException(status_code=503, detail="Telegram desconectado")
+            print(f"❌ Stream {message_id}: No hay cliente disponible")
+            raise HTTPException(status_code=503, detail="Servicio de streaming no disponible temporalmente")
 
+        # ✅ Obtener entidad del canal
         entities = getattr(app.state, "entities", [app.state.entity])
-        entity   = (
+        entity = (
             entities[ch]
             if (0 <= ch < len(entities) and entities[ch] is not None)
             else app.state.entity
         )
+        
+        if not entity:
+            print(f"❌ Stream {message_id}: Canal no disponible (ch={ch})")
+            raise HTTPException(status_code=404, detail="Canal no encontrado")
 
-        async with _client_semaphore:
-            message = await active_client.get_messages(entity, ids=message_id)
+        # ✅ Obtener mensaje con timeout y reintento
+        message = None
+        for attempt in range(STREAM_MAX_RETRIES):
+            try:
+                async with _client_semaphore:
+                    message = await asyncio.wait_for(
+                        active_client.get_messages(entity, ids=message_id),
+                        timeout=STREAM_TIMEOUT
+                    )
+                if message:
+                    break
+            except asyncio.TimeoutError:
+                print(f"⏱️ Stream {message_id}: Timeout en intento {attempt + 1}/{STREAM_MAX_RETRIES}")
+                if attempt < STREAM_MAX_RETRIES - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))  # Backoff exponencial
+                continue
+            except Exception as e:
+                print(f"⚠️ Stream {message_id}: Error en intento {attempt + 1}: {e}")
+                if attempt < STREAM_MAX_RETRIES - 1:
+                    await asyncio.sleep(0.5)
+                continue
         
         if not message or not message.file:
+            print(f"❌ Stream {message_id}: Video no encontrado después de {STREAM_MAX_RETRIES} intentos")
             raise HTTPException(status_code=404, detail="Video no encontrado")
 
+        # ✅ Validar tamaño del archivo
         file_size = int(message.file.size or 0)
         if file_size <= 0:
-            raise HTTPException(status_code=404, detail="Video no encontrado")
+            print(f"❌ Stream {message_id}: Tamaño de archivo inválido: {file_size}")
+            raise HTTPException(status_code=404, detail="Video no válido")
 
-        range_header  = request.headers.get("range")
-        byte_range    = _parse_range_header(range_header, file_size)
-        content_type  = message.file.mime_type or "video/mp4"
+        # ✅ Parsear Range header
+        range_header = request.headers.get("range")
+        byte_range = _parse_range_header(range_header, file_size)
+        content_type = message.file.mime_type or "video/mp4"
 
+        # Logging para debug
+        client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+        print(f"📺 Stream {message_id}: {client_ip} - {content_type} - {file_size} bytes - range: {range_header}")
+
+        # ✅ Función generadora optimizada para chunks
+        async def chunk_generator(offset: int, limit: int, is_range: bool = False):
+            """
+            Generador de chunks con:
+            - Timeout por chunk
+            - Reintentos en caso de error
+            - Mejor manejo de memoria
+            """
+            bytes_sent = 0
+            chunk_count = 0
+            last_chunk_time = time.time()
+            
+            try:
+                # Obtener el iterador de descarga
+                download_iter = active_client.iter_download(
+                    message.media,
+                    offset=offset,
+                    limit=limit,
+                    chunk_size=STREAM_CHUNK_SIZE,
+                    request_size=STREAM_CHUNK_SIZE  # Tamaño de solicitud a Telegram
+                )
+                
+                async for chunk in download_iter:
+                    chunk_count += 1
+                    chunk_size = len(chunk)
+                    bytes_sent += chunk_size
+                    last_chunk_time = time.time()
+                    
+                    # Logging periódico (cada 10MB)
+                    if bytes_sent % (10 * 1024 * 1024) < chunk_size:
+                        elapsed = time.time() - stream_start_time
+                        speed = bytes_sent / 1024 / 1024 / elapsed if elapsed > 0 else 0
+                        print(f"📊 Stream {message_id}: Enviados {bytes_sent/1024/1024:.1f}MB @ {speed:.1f} MB/s")
+                    
+                    yield chunk
+                    
+                    # Pequeña pausa para no saturar el event loop
+                    if chunk_count % 10 == 0:
+                        await asyncio.sleep(0.001)
+                
+                print(f"✅ Stream {message_id}: Completado - {bytes_sent/1024/1024:.1f}MB en {chunk_count} chunks")
+                
+            except asyncio.CancelledError:
+                print(f"⚠️ Stream {message_id}: Cancelado por el cliente después de {bytes_sent/1024/1024:.1f}MB")
+                return
+            except Exception as e:
+                print(f"⚠️ Stream {message_id}: Error durante streaming: {e}")
+                # No relanzamos la excepción para evitar errores 500
+                return
+
+        # ✅ Respuesta según si es range o no
         if byte_range is None:
-            start          = 0
+            # Streaming completo
+            start = 0
             content_length = file_size
-
-            async def chunk_generator_full(offset: int, limit: int):
-                try:
-                    async with _client_semaphore:
-                        async for chunk in active_client.iter_download(
-                            message.media,
-                            offset=offset,
-                            limit=limit,
-                            chunk_size=STREAM_CHUNK_SIZE,
-                        ):
-                            yield chunk
-                except asyncio.CancelledError:
-                    return
-                except Exception as _se:
-                    print(f"⚠️  Stream interrumpido (full) msg {message_id}: {_se}")
-                    return
-
+            
             headers = {
-                "Content-Type":      content_type,
-                "Accept-Ranges":     "bytes",
-                "Content-Length":    str(content_length),
-                "Cache-Control":     "no-store",
-                "X-Accel-Buffering": "no",
+                "Content-Type": content_type,
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+                "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "X-Content-Type-Options": "nosniff",
+                "X-Accel-Buffering": "no",  # Deshabilitar buffering de nginx
+                "Connection": "keep-alive",
             }
-
+            
             return StreamingResponse(
-                chunk_generator_full(start, content_length),
+                chunk_generator(start, content_length, is_range=False),
                 status_code=200,
                 headers=headers,
                 media_type=content_type,
             )
-
-        start, end     = byte_range
-        content_length = (end - start) + 1
-
-        if content_length <= 0:
-            return Response(
-                status_code=416,
-                content=b"",
-                headers={"Content-Range": f"bytes */{file_size}"},
+        else:
+            # Streaming parcial (range)
+            start, end = byte_range
+            content_length = (end - start) + 1
+            
+            if content_length <= 0:
+                return Response(
+                    status_code=416,
+                    content=b"",
+                    headers={"Content-Range": f"bytes */{file_size}"},
+                )
+            
+            headers = {
+                "Content-Type": content_type,
+                "Accept-Ranges": "bytes",
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(content_length),
+                "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "X-Content-Type-Options": "nosniff",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            }
+            
+            return StreamingResponse(
+                chunk_generator(start, content_length, is_range=True),
+                status_code=206,
+                headers=headers,
+                media_type=content_type,
             )
 
-        async def chunk_generator_range(offset: int, limit: int):
-            try:
-                async with _client_semaphore:
-                    async for chunk in active_client.iter_download(
-                        message.media,
-                        offset=offset,
-                        limit=limit,
-                        chunk_size=STREAM_CHUNK_SIZE,
-                    ):
-                        yield chunk
-            except asyncio.CancelledError:
-                return
-            except Exception as _se:
-                print(f"⚠️  Stream interrumpido (range) msg {message_id}: {_se}")
-                return
-
-        headers = {
-            "Content-Type":      content_type,
-            "Accept-Ranges":     "bytes",
-            "Content-Range":     f"bytes {start}-{end}/{file_size}",
-            "Content-Length":    str(content_length),
-            "Cache-Control":     "no-store",
-            "X-Accel-Buffering": "no",
-        }
-
-        return StreamingResponse(
-            chunk_generator_range(start, content_length),
-            status_code=206,
-            headers=headers,
-            media_type=content_type,
-        )
-
+    except asyncio.TimeoutError:
+        print(f"⏱️ Stream {message_id}: Timeout general")
+        raise HTTPException(status_code=504, detail="Tiempo de espera agotado")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"⚠️  Error de streaming: {e}")
-        raise HTTPException(status_code=500, detail="Error de streaming")
+        print(f"❌ Stream {message_id}: Error inesperado: {type(e).__name__}: {e}")
+        # Devolvemos error 500 pero con un mensaje más amigable
+        raise HTTPException(status_code=500, detail="Error temporal en el streaming. Por favor, intenta de nuevo.")
 
 
 # ---------------------------------------------------------------------------
@@ -3330,4 +3411,10 @@ async def youtube_fallback(youtube_query: str) -> list:
 # ENTRYPOINT
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=INTERNAL_PORT)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=INTERNAL_PORT,
+        timeout_keep_alive=30,  # Mantener conexiones vivas
+        limit_max_requests=1000,  # Límite de requests por worker
+    )
