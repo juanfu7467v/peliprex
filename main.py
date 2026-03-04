@@ -15,7 +15,6 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient, errors
-from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Message,
@@ -194,7 +193,6 @@ _REQUIRED_CHANNELS = [
     '@ParaisoAnal',
     '@tsgirl',
 ]
-
 
 def _dedupe_channels(channels: list) -> list:
     seen, out = set(), []
@@ -501,37 +499,6 @@ async def _get_safe_entity(ch_index: int, client=None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# ✅ NUEVA FUNCIÓN: Verificar si un mensaje tiene miniatura nativa
-# ---------------------------------------------------------------------------
-def _message_has_native_thumb(message) -> bool:
-    """
-    Verifica si un mensaje tiene miniatura nativa incorporada.
-    """
-    if not message:
-        return False
-    
-    # Verificar video thumbs
-    if hasattr(message, 'video') and message.video:
-        if hasattr(message.video, 'thumbs') and message.video.thumbs:
-            return True
-    
-    # Verificar document thumbs
-    if hasattr(message, 'document') and message.document:
-        if hasattr(message.document, 'thumbs') and message.document.thumbs:
-            return True
-    
-    # Verificar media thumbs
-    if hasattr(message, 'media') and message.media:
-        if hasattr(message.media, 'thumbs') and message.media.thumbs:
-            return True
-        if hasattr(message.media, 'document') and message.media.document:
-            if hasattr(message.media.document, 'thumbs') and message.media.document.thumbs:
-                return True
-    
-    return False
-
-
-# ---------------------------------------------------------------------------
 # ✅ NUEVA FUNCIÓN: Extraer miniatura nativa de Telegram de manera confiable
 # ---------------------------------------------------------------------------
 async def _extract_native_thumbnail(message, client) -> bytes | None:
@@ -724,7 +691,12 @@ async def _get_guaranteed_thumbnail_url(
 ) -> str:
     """
     Función que garantiza que siempre se devuelva una URL de miniatura válida.
+    Prioridad:
+    1. Usar mensaje proporcionado o obtenerlo si es necesario
+    2. Extraer miniatura nativa
+    3. Si no hay miniatura, devolver placeholder
     """
+    # Si ya tenemos una URL construida, validarla
     url = _build_public_url(f"/thumb/{message_id}?ch={ch_index}")
     return url
 
@@ -3113,14 +3085,9 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                     active_client.get_messages(entity, ids=message_id),
                     timeout=3.0,
                 )
-            except FloodWaitError as e:
-                print(f"⚠️ FloodWait en thumb {message_id}: Esperar {e.seconds} segundos")
-                await asyncio.sleep(e.seconds)
-                # Reintentar después de esperar
-                message = await asyncio.wait_for(
-                    active_client.get_messages(entity, ids=message_id),
-                    timeout=3.0,
-                )
+            except errors.FloodWait as e:
+                print(f"⚠️ FloodWait en thumb {message_id}: {e.seconds}s")
+                return await _serve_placeholder(thumb_cache, cache_key)
             except Exception as e:
                 print(f"⚠️ Error obteniendo mensaje {message_id}: {e}")
                 return await _serve_placeholder(thumb_cache, cache_key)
@@ -3131,21 +3098,18 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
 
         thumb_data: bytes | None = None
 
-        # ✅ VERIFICAR PRIMERO si el mensaje tiene miniatura nativa
-        if _message_has_native_thumb(message):
-            thumb_data = await _extract_native_thumbnail(message, active_client)
-            if thumb_data:
-                print(f"   🎬 Miniatura nativa extraída para msg {message_id}")
+        # ✅ PRIORIDAD 1: Buscar póster en mensajes cercanos (mejorado)
+        try:
+            poster = await _find_poster_in_nearby_messages_enhanced(entity, message_id, active_client)
+            if poster and len(poster) > 500:
+                thumb_data = poster
+                print(f"   🖼️ Póster encontrado en mensajes cercanos para msg {message_id}")
+        except Exception as e:
+            print(f"   ⚠️ Error buscando póster cercano: {e}")
 
-        # ✅ PRIORIDAD 2: Si no hay miniatura nativa, buscar póster en mensajes cercanos
+        # ✅ PRIORIDAD 2: Extraer miniatura nativa de Telegram
         if not thumb_data:
-            try:
-                poster = await _find_poster_in_nearby_messages_enhanced(entity, message_id, active_client)
-                if poster and len(poster) > 500:
-                    thumb_data = poster
-                    print(f"   🖼️ Póster encontrado en mensajes cercanos para msg {message_id}")
-            except Exception as e:
-                print(f"   ⚠️ Error buscando póster cercano: {e}")
+            thumb_data = await _extract_native_thumbnail(message, active_client)
 
         if thumb_data:
             # Procesar y cachear
@@ -3159,11 +3123,6 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
         # ✅ Si todo falla, servir placeholder
         return await _serve_placeholder(thumb_cache, cache_key)
 
-    except FloodWaitError as e:
-        print(f"⚠️ FloodWait en thumb {message_id}: Esperar {e.seconds} segundos")
-        await asyncio.sleep(e.seconds)
-        # Reintentar después de esperar
-        return await get_thumbnail(message_id, request, ch)
     except asyncio.TimeoutError:
         print(f"⚠️ Timeout en /thumb/{message_id}")
         return await _serve_placeholder(getattr(app.state, "thumb_cache", {}), cache_key if 'cache_key' in locals() else None)
@@ -3267,7 +3226,7 @@ def _parse_range_header(range_header, file_size: int):
 
 
 # ---------------------------------------------------------------------------
-# ✅ ENDPOINT /stream/{message_id} - MEJORADO con soporte completo para Range Requests
+# ENDPOINT /stream/{message_id} - SIN MODIFICACIONES (solo headers mejorados)
 # ---------------------------------------------------------------------------
 @app.get("/stream/{message_id}")
 async def stream_video(message_id: int, request: Request, ch: int = 0):
@@ -3289,14 +3248,9 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                     active_client.get_messages(entity, ids=message_id),
                     timeout=3.0,
                 )
-            except FloodWaitError as e:
-                print(f"⚠️ FloodWait en stream {message_id}: Esperar {e.seconds} segundos")
-                await asyncio.sleep(e.seconds)
-                # Reintentar después de esperar
-                message = await asyncio.wait_for(
-                    active_client.get_messages(entity, ids=message_id),
-                    timeout=3.0,
-                )
+            except errors.FloodWait as e:
+                print(f"⚠️ FloodWait en stream {message_id}: {e.seconds}s")
+                raise HTTPException(status_code=429, detail="Demasiadas solicitudes")
         
         if not message or not message.file:
             raise HTTPException(status_code=404, detail="Video no encontrado")
@@ -3305,53 +3259,47 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
         if file_size <= 0:
             raise HTTPException(status_code=404, detail="Video no encontrado")
 
-        range_header = request.headers.get("range")
-        byte_range = _parse_range_header(range_header, file_size)
-        content_type = message.file.mime_type or "video/mp4"
-
-        # Headers base para soporte de streaming
-        headers = {
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-store",
-            "X-Accel-Buffering": "no",
-            "Content-Disposition": "inline",
-        }
+        range_header  = request.headers.get("range")
+        byte_range    = _parse_range_header(range_header, file_size)
+        content_type  = message.file.mime_type or "video/mp4"
 
         if byte_range is None:
-            # Respuesta completa
-            start = 0
+            start          = 0
             content_length = file_size
 
-            async def chunk_generator():
+            async def chunk_generator_full(offset: int, limit: int):
                 try:
                     async with _client_semaphore:
                         async for chunk in active_client.iter_download(
                             message.media,
-                            offset=start,
-                            limit=content_length,
+                            offset=offset,
+                            limit=limit,
                             chunk_size=STREAM_CHUNK_SIZE,
                         ):
                             yield chunk
                 except asyncio.CancelledError:
                     return
-                except Exception as e:
-                    print(f"⚠️ Stream interrumpido msg {message_id}: {e}")
+                except Exception as _se:
+                    print(f"⚠️  Stream interrumpido (full) msg {message_id}: {_se}")
                     return
 
-            headers.update({
-                "Content-Type": content_type,
-                "Content-Length": str(content_length),
-            })
+            headers = {
+                "Content-Type":      content_type,
+                "Accept-Ranges":     "bytes",
+                "Content-Length":    str(content_length),
+                "Cache-Control":     "no-store",
+                "X-Accel-Buffering": "no",
+                "Content-Disposition": "inline",
+            }
 
             return StreamingResponse(
-                chunk_generator(),
+                chunk_generator_full(start, content_length),
                 status_code=200,
                 headers=headers,
                 media_type=content_type,
             )
 
-        # Respuesta parcial (range)
-        start, end = byte_range
+        start, end     = byte_range
         content_length = (end - start) + 1
 
         if content_length <= 0:
@@ -3361,44 +3309,43 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
                 headers={"Content-Range": f"bytes */{file_size}"},
             )
 
-        async def chunk_generator_range():
+        async def chunk_generator_range(offset: int, limit: int):
             try:
                 async with _client_semaphore:
                     async for chunk in active_client.iter_download(
                         message.media,
-                        offset=start,
-                        limit=content_length,
+                        offset=offset,
+                        limit=limit,
                         chunk_size=STREAM_CHUNK_SIZE,
                     ):
                         yield chunk
             except asyncio.CancelledError:
                 return
-            except Exception as e:
-                print(f"⚠️ Stream range interrumpido msg {message_id}: {e}")
+            except Exception as _se:
+                print(f"⚠️  Stream interrumpido (range) msg {message_id}: {_se}")
                 return
 
-        headers.update({
-            "Content-Type": content_type,
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Content-Length": str(content_length),
-        })
+        headers = {
+            "Content-Type":      content_type,
+            "Accept-Ranges":     "bytes",
+            "Content-Range":     f"bytes {start}-{end}/{file_size}",
+            "Content-Length":    str(content_length),
+            "Cache-Control":     "no-store",
+            "X-Accel-Buffering": "no",
+            "Content-Disposition": "inline",
+        }
 
         return StreamingResponse(
-            chunk_generator_range(),
+            chunk_generator_range(start, content_length),
             status_code=206,
             headers=headers,
             media_type=content_type,
         )
 
-    except FloodWaitError as e:
-        print(f"⚠️ FloodWait en stream {message_id}: Esperar {e.seconds} segundos")
-        await asyncio.sleep(e.seconds)
-        # Reintentar después de esperar
-        return await stream_video(message_id, request, ch)
     except HTTPException:
         raise
     except Exception as e:
-        print(f"⚠️ Error de streaming: {e}")
+        print(f"⚠️  Error de streaming: {e}")
         raise HTTPException(status_code=500, detail="Error de streaming")
 
 
