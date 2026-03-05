@@ -1,10 +1,7 @@
-# fly.toml app configuration file generated for peliprex-31wrsa on 2026-03-04T15:20:28Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml app configuration file for peliprex-31wrsa
 
 app = 'peliprex-31wrsa'
-primary_region = 'ams'
+primary_region = 'iad'
 
 [build]
 
@@ -16,8 +13,11 @@ primary_region = 'ams'
   min_machines_running = 0
   processes = ['app']
 
+[mounts]
+  source = "peliprex_data"
+  destination = "/data"
+
 [[vm]]
-  memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256
+  memory_mb = 512
