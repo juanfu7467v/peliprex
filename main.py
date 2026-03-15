@@ -67,7 +67,7 @@ TVMAZE_API_BASE    = "https://api.tvmaze.com"
 
 # --- GEMINI AI ---
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_URL     = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
