@@ -9,7 +9,7 @@ import httpx
 import time
 import io
 from urllib.parse import quote_plus, urlparse, parse_qs
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -170,6 +170,11 @@ SEARCH_CHANNEL_CACHE_LIMIT        = max(20, min(200, int(os.getenv("SEARCH_CHANN
 SEARCH_CHANNEL_WARMUP_CONCURRENCY = max(1, min(10, int(os.getenv("SEARCH_CHANNEL_WARMUP_CONCURRENCY", "4"))))
 SEARCH_CHANNEL_FETCH_TIMEOUT      = float(os.getenv("SEARCH_CHANNEL_FETCH_TIMEOUT", "2.8"))
 CHANNELS_READY_MAX_WAIT_SEARCH    = float(os.getenv("CHANNELS_READY_MAX_WAIT_SEARCH", "6.0"))
+
+# ✅ Arranque rápido / tolerancia de Telegram
+TELEGRAM_CONNECT_TIMEOUT       = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "20.0"))
+TELEGRAM_ENTITY_TIMEOUT        = float(os.getenv("TELEGRAM_ENTITY_TIMEOUT", "8.0"))
+TMDB_THUMB_HTTP_TIMEOUT        = float(os.getenv("TMDB_THUMB_HTTP_TIMEOUT", "4.5"))
 
 # ---------------------------------------------------------------------------
 # CANALES DE RESPALDO
@@ -941,6 +946,22 @@ async def _find_poster_in_nearby_messages(
 
 
 # ---------------------------------------------------------------------------
+# HELPERS SEGUROS DE TELEGRAM
+# ---------------------------------------------------------------------------
+async def _safe_connect_client(tg_client: TelegramClient) -> None:
+    await asyncio.wait_for(tg_client.connect(), timeout=TELEGRAM_CONNECT_TIMEOUT)
+
+
+async def _safe_get_entity(tg_client: TelegramClient, entity_ref):
+    if entity_ref is None:
+        raise ValueError("entity_ref vacío")
+    return await asyncio.wait_for(
+        tg_client.get_entity(entity_ref),
+        timeout=TELEGRAM_ENTITY_TIMEOUT,
+    )
+
+
+# ---------------------------------------------------------------------------
 # ✅ FORZAR RESOLUCIÓN DE CANALES — evita "Invalid channel object"
 # ---------------------------------------------------------------------------
 async def force_resolve_channels(tg_client: TelegramClient) -> None:
@@ -960,14 +981,14 @@ async def force_resolve_channels(tg_client: TelegramClient) -> None:
         nonlocal ok, fail
         async with sem:
             try:
-                await tg_client.get_entity(ch)
+                await _safe_get_entity(tg_client, ch)
                 ok += 1
             except FloodWaitError as _fw:
                 wait_s = getattr(_fw, "seconds", 10)
                 print(f"   ⏳ FloodWait resolviendo canal {ch}: esperando {wait_s}s...")
                 await asyncio.sleep(wait_s + 2)
                 try:
-                    await tg_client.get_entity(ch)
+                    await _safe_get_entity(tg_client, ch)
                     ok += 1
                 except Exception as _ex2:
                     fail += 1
@@ -1118,6 +1139,9 @@ async def lifespan(app: FastAPI):
     app.state.entity               = None
     app.state.entities             = [None]
     app.state.channels_ready       = False
+    app.state.telegram_ready       = False
+    app.state.telegram_bootstrap_done = False
+    app.state.telegram_clients_connected = 0
     app.state.meta_cache_lock      = asyncio.Lock()
     app.state.meta_cache_dirty     = False
     app.state.catalog_pool_cache   = {"ts": 0.0, "pool": []}
@@ -1132,10 +1156,8 @@ async def lifespan(app: FastAPI):
     app.state.ai_cache_lock = asyncio.Lock()
     app.state.ai_sem        = asyncio.Semaphore(AI_SEM_LIMIT)
 
-    app.state.last_persist_save_ts     = 0.0
-    app.state.background_tasks         = []
-    app.state.telegram_bootstrap_done  = False
-    app.state.telegram_bootstrap_error = None
+    app.state.last_persist_save_ts = 0.0
+    app.state.telegram_bootstrap_task = None
 
     # ✅ Inicializar caché de búsquedas SQLite (anti-flood)
     _db_init_search_cache()
@@ -1159,23 +1181,11 @@ async def lifespan(app: FastAPI):
     print(f"⚙️  IA semáforo: max={AI_SEM_LIMIT}")
     print(f"🔄 Cuentas Telegram activas: {len(_telegram_clients)}")
     print(f"✅ Sin canal principal — todos los canales tienen igual prioridad (pool plano)")
-    print("🚀 FastAPI iniciará primero; Telegram se terminará de cargar en segundo plano")
-
-    def _spawn_bg_task(coro, name: str):
-        task = asyncio.create_task(coro, name=name)
-        app.state.background_tasks.append(task)
-        return task
+    print("🚀 Inicio rápido habilitado: FastAPI responderá mientras Telegram termina de cargarse en segundo plano")
 
     async def _load_backup_channels():
         sem = asyncio.Semaphore(5)
         _total_cl = len(_telegram_clients)
-
-        if _total_cl == 0:
-            app.state.entities = []
-            app.state.entity = None
-            app.state.channels_ready = True
-            print("⚠️  No hay clientes de Telegram disponibles para cargar canales")
-            return
 
         def _entity_name(entity) -> str:
             """Nombre seguro de entidad: funciona para canal, grupo, usuario."""
@@ -1189,17 +1199,19 @@ async def lifespan(app: FastAPI):
 
         async def _load_one(ch_item, idx: int):
             async with sem:
-                _cl_primary = _telegram_clients[idx % _total_cl]
+                # ✅ Distribuir carga en round-robin entre TODOS los clientes disponibles
+                _cl_primary = _telegram_clients[idx % _total_cl] if _total_cl > 0 else client
                 entity = None
                 try:
-                    entity = await _cl_primary.get_entity(ch_item)
+                    entity = await _safe_get_entity(_cl_primary, ch_item)
                     print(f"✅ Canal cargado [{idx % _total_cl + 1}]: {_entity_name(entity)}")
                 except Exception as ex:
+                    # Fallback: intentar con los demás clientes
                     for _cl_fb in _telegram_clients:
                         if _cl_fb is _cl_primary:
                             continue
                         try:
-                            entity = await _cl_fb.get_entity(ch_item)
+                            entity = await _safe_get_entity(_cl_fb, ch_item)
                             print(f"✅ Canal cargado (fallback): {_entity_name(entity)}")
                             break
                         except Exception:
@@ -1208,32 +1220,27 @@ async def lifespan(app: FastAPI):
                         print(f"⚠️  No se pudo cargar canal {ch_item}: {ex}")
                         return None
 
+                # ✅ Asegurar que TODOS los demás clientes resuelvan este canal
+                # para que sus sesiones tengan el access_hash en caché y evitar
+                # "Invalid channel object" durante búsquedas paralelas.
                 _ch_ref = getattr(entity, "id", None) or ch_item
                 for _cl_other in _telegram_clients:
                     if _cl_other is _cl_primary:
                         continue
                     try:
-                        await _cl_other.get_entity(_ch_ref)
+                        await _safe_get_entity(_cl_other, _ch_ref)
                     except Exception:
-                        pass
+                        pass  # best-effort; el acceso real fallará más tarde si no se pudo
                 return entity
 
         backup_entities = await asyncio.gather(
             *[_load_one(ch, i) for i, ch in enumerate(BACKUP_CHANNELS)],
             return_exceptions=True,
         )
-
-        normalized_entities = []
-        for _item in backup_entities:
-            if isinstance(_item, Exception):
-                print(f"⚠️  Error aislado cargando canal en background: {_item}")
-                normalized_entities.append(None)
-            else:
-                normalized_entities.append(_item)
-
-        valid_entities = [e for e in normalized_entities if e is not None]
-        app.state.entity = valid_entities[0] if valid_entities else None
-        app.state.entities = list(normalized_entities)
+        # ✅ Sin canal principal — el pool es plano: todos los canales tienen igual peso
+        valid_entities     = [e for e in backup_entities if e is not None and not isinstance(e, Exception)]
+        app.state.entity   = valid_entities[0] if valid_entities else None
+        app.state.entities = [None if isinstance(e, Exception) else e for e in backup_entities]
         app.state.channels_ready = True
         loaded_n = sum(1 for e in app.state.entities if e is not None)
         print(f"✅ Todos los canales cargados: {loaded_n} disponibles (sin canal principal)")
@@ -1260,46 +1267,47 @@ async def lifespan(app: FastAPI):
             except Exception as ex:
                 print(f"⚠️  Warm-up caché por canal falló: {ex}")
 
-        _spawn_bg_task(_warmup_search_cache(), "warmup-search-cache")
-        _spawn_bg_task(_catalog_background_updater(), "catalog-background-updater")
+        asyncio.create_task(_warmup_search_cache())
+
+        # ✅ SEPARACIÓN C: Iniciar tarea de fondo para actualizar catálogo
+        asyncio.create_task(_catalog_background_updater())
 
     async def _bootstrap_telegram():
-        print("📡 Inicializando Telegram en segundo plano...")
+        print("📡 Conectando a Telegram en segundo plano...")
         _clients_connected: list = []
-
         for _i, _cl in enumerate(_telegram_clients):
             try:
-                await _cl.connect()
+                await _safe_connect_client(_cl)
                 if await _cl.is_user_authorized():
                     _clients_connected.append(_cl)
                     print(f"✅ Cliente {_i + 1} conectado y autorizado")
-                    print(f"   🔍 Resolviendo canales para cliente {_i + 1} en background...")
-                    try:
-                        await force_resolve_channels(_cl)
-                    except Exception as _resolve_ex:
-                        print(f"   ⚠️  Resolución parcial de canales para cliente {_i + 1}: {_resolve_ex}")
+                    print(f"   🔍 Resolviendo canales para cliente {_i + 1}...")
+                    await force_resolve_channels(_cl)
                 else:
                     print(f"⚠️  Cliente {_i + 1} conectado pero NO autorizado — se omite")
             except Exception as _e:
                 print(f"⚠️  Error conectando cliente {_i + 1}: {_e}")
 
+        app.state.telegram_clients_connected = len(_clients_connected)
+        app.state.telegram_ready = bool(_clients_connected)
+
         if not _clients_connected:
-            print("⚠️  Ninguna cuenta de Telegram quedó activa tras el arranque")
-            app.state.channels_ready = True
+            print("❌ Ninguna cuenta Telegram quedó lista tras el arranque en background")
             app.state.telegram_bootstrap_done = True
             return
 
-        try:
-            await _load_backup_channels()
-        except Exception as _boot_ex:
-            app.state.telegram_bootstrap_error = str(_boot_ex)
-            print(f"⚠️  Error en bootstrap de Telegram/canales: {_boot_ex}")
-        finally:
-            app.state.telegram_bootstrap_done = True
+        await _load_backup_channels()
+        app.state.telegram_bootstrap_done = True
 
-    _spawn_bg_task(_bootstrap_telegram(), "telegram-bootstrap")
+    app.state.telegram_bootstrap_task = asyncio.create_task(_bootstrap_telegram())
 
     yield
+
+    bootstrap_task = getattr(app.state, "telegram_bootstrap_task", None)
+    if bootstrap_task and not bootstrap_task.done():
+        bootstrap_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await bootstrap_task
 
     if getattr(app.state, "meta_cache_dirty", False):
         print("💾 Guardando caché pendiente antes de apagar...")
@@ -1307,13 +1315,7 @@ async def lifespan(app: FastAPI):
         to_save[AI_CACHE_KEY] = dict(getattr(app.state, "ai_cache", {}) or {})
         await _save_persistent_cache(to_save)
 
-    _bg_tasks = list(getattr(app.state, "background_tasks", []) or [])
-    for _task in _bg_tasks:
-        if not _task.done():
-            _task.cancel()
-    if _bg_tasks:
-        await asyncio.gather(*_bg_tasks, return_exceptions=True)
-
+    # ✅ MULTI-CUENTA: Desconectar todos los clientes al apagar
     for _cl in _telegram_clients:
         try:
             await _cl.disconnect()
@@ -1404,7 +1406,7 @@ async def get_active_client() -> TelegramClient | None:
                 return selected
             # Cliente desconectado → intentar reconectar
             print(f"🔄 Cliente {idx} desconectado — reconectando...")
-            await selected.connect()
+            await _safe_connect_client(selected)
             if await selected.is_user_authorized():
                 print(f"✅ Cliente {idx} reconectado correctamente")
                 return selected
@@ -1443,6 +1445,9 @@ async def health_check():
         "thumb_cache_entries":  len(getattr(app.state, "thumb_cache", {})),
         "internal_port":        INTERNAL_PORT,
         "telegram_accounts":    len(_telegram_clients),
+        "telegram_clients_connected": getattr(app.state, "telegram_clients_connected", 0),
+        "telegram_ready":        getattr(app.state, "telegram_ready", False),
+        "telegram_bootstrap_done": getattr(app.state, "telegram_bootstrap_done", False),
     })
 
 
@@ -3648,74 +3653,47 @@ async def youtube_thumbnail_proxy(video_id: str):
     return Response(content=processed, media_type=mime)
 
 
-def _extract_title_from_message_for_thumb(message) -> str:
-    """Extrae un título razonable del mensaje para consultar TMDb."""
-    candidates: list[str] = []
-
-    for attr_name in ("message", "raw_text", "text"):
-        value = getattr(message, attr_name, None)
-        if isinstance(value, str) and value.strip():
-            candidates.append(value.strip())
-
-    doc = getattr(message, "document", None)
-    for attr in getattr(doc, "attributes", []) or []:
-        file_name = getattr(attr, "file_name", None)
-        if isinstance(file_name, str) and file_name.strip():
-            candidates.append(os.path.splitext(os.path.basename(file_name))[0])
-
-    for candidate in candidates:
-        title = _extract_title_from_caption(candidate)
-        if title and title.strip() and title.strip().lower() != "película":
-            return title.strip()
-
-    return "Película"
-
-
 async def _fetch_tmdb_poster_bytes_for_message(message) -> bytes | None:
-    """Prioriza TMDb para pósters; Telegram queda como fallback."""
-    if not TMDB_API_KEY:
+    if not TMDB_API_KEY or message is None:
         return None
 
-    title_raw = _extract_title_from_message_for_thumb(message)
-    if not title_raw or title_raw.strip().lower() == "película":
+    title_raw = _extract_title_from_caption((message.text or "").strip())
+    if not title_raw:
         return None
 
     query_title, year = _build_tmdb_query_from_title(title_raw)
     if not query_title:
         return None
 
-    cache_key = _cache_key_from_query(query_title, year)
-    meta = await _meta_cache_get(cache_key)
-    image_url = None
+    ck = _cache_key_from_query(query_title, year)
+    meta = await _meta_cache_get(ck)
 
-    if isinstance(meta, dict):
-        image_url = meta.get("imagen_url")
-        if _is_placeholder_image(image_url):
-            image_url = None
+    meta_img = None
+    if isinstance(meta, dict) and (meta.get("source") == "tmdb" or meta.get("tmdb_id")):
+        meta_img = meta.get("imagen_url")
+        if _is_placeholder_image(meta_img):
+            meta_img = None
 
-    timeout = httpx.Timeout(connect=2.0, read=4.0, write=2.0, pool=1.0)
-    async with httpx.AsyncClient(timeout=timeout) as http:
-        if not image_url:
+    timeout = httpx.Timeout(connect=2.0, read=TMDB_THUMB_HTTP_TIMEOUT, write=2.0, pool=1.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+        if not meta_img:
             tmdb = await _tmdb_search_and_details(http, query_title, year)
-            if isinstance(tmdb, dict) and tmdb.get("imagen_url"):
-                image_url = tmdb.get("imagen_url")
-                merged_meta = dict(meta) if isinstance(meta, dict) else {}
-                for _k, _v in tmdb.items():
-                    if _v not in (None, ""):
-                        merged_meta[_k] = _v
-                await _meta_cache_set(cache_key, merged_meta or tmdb)
+            if isinstance(tmdb, dict):
+                meta_img = tmdb.get("imagen_url")
+                merged = dict(meta) if isinstance(meta, dict) else {}
+                merged.update(tmdb)
+                await _meta_cache_set(ck, merged)
 
-        if not image_url:
+        if not meta_img or _is_placeholder_image(meta_img):
             return None
 
-        try:
-            resp = await http.get(image_url)
-            if resp.status_code == 200 and resp.content and len(resp.content) > 500:
-                return resp.content
-        except Exception:
+        response = await http.get(meta_img)
+        response.raise_for_status()
+        if not response.content or len(response.content) <= 200:
             return None
 
-    return None
+        print(f"   🎬 Póster TMDb obtenido para '{query_title}' [{len(response.content)//1024}KB]")
+        return response.content
 
 
 # ---------------------------------------------------------------------------
@@ -3789,15 +3767,14 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
 
         thumb_data: bytes | None = None
 
-        # ✅ PRIORIDAD 1 — póster oficial desde TMDb
-        try:
-            tmdb_poster = await _fetch_tmdb_poster_bytes_for_message(message)
-            if tmdb_poster and len(tmdb_poster) > 500:
-                thumb_data = tmdb_poster
-                print(f"   🎬 Póster TMDb priorizado para msg {message_id} [{len(tmdb_poster)//1024}KB]")
-        except Exception as _tmdb_ex:
-            print(f"   ⚠️  TMDb no disponible para msg {message_id}: {_tmdb_ex}")
-            thumb_data = None
+        # ✅ PRIORIDAD 1 — póster oficial de TMDb
+        if not thumb_data:
+            try:
+                tmdb_poster = await _fetch_tmdb_poster_bytes_for_message(message)
+                if tmdb_poster and len(tmdb_poster) > 200:
+                    thumb_data = tmdb_poster
+            except Exception as _tmdb_ex:
+                print(f"   ⚠️  TMDb no disponible para msg {message_id}: {_tmdb_ex}")
 
         # ✅ PRIORIDAD 2 — miniatura nativa desde message.document.thumbs
         # Intenta primero obtener la imagen completa (thumb=-1 = mayor resolución disponible),
@@ -3935,7 +3912,7 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                 thumb_cache[cache_key] = (time.monotonic(), processed, mime)
             return Response(content=processed, media_type=mime)
 
-        # ✅ Sin miniatura en Telegram → usar placeholder para no devolver error
+        # ✅ Sin póster oficial ni miniatura en Telegram → usar placeholder para no devolver error
         print(f"   ℹ️  Sin miniatura disponible para msg {message_id} — usando placeholder")
         try:
             async with httpx.AsyncClient(timeout=4.0) as _ph:
