@@ -170,6 +170,7 @@ AI_CACHE_TTL_NONE_S  = int(os.getenv("AI_CACHE_TTL_NONE_S",  str(24 * 3600)))
 AI_CACHE_TTL_429_S   = int(os.getenv("AI_CACHE_TTL_429_S",   str(6 * 3600)))
 AI_CACHE_TTL_ERR_S   = int(os.getenv("AI_CACHE_TTL_ERR_S",   str(30 * 60)))
 AI_SEM_LIMIT         = max(1, min(4, int(os.getenv("AI_SEM_LIMIT", "2"))))
+METADATA_PRIORITY_VERSION = int(os.getenv("METADATA_PRIORITY_VERSION", "2"))
 
 # ---------------------------------------------------------------------------
 # OPTIMIZACIÓN EXTRA: CACHÉ DE RECIENTES POR CANAL
@@ -708,7 +709,7 @@ def _archive_thumb_from_stream_url(stream_url: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# ✅ Cache IA helpers (Google KG / Gemini) con persistencia
+# ✅ Cache IA helpers (TMDb / Google KG / TVMaze / Gemini) con persistencia
 # ---------------------------------------------------------------------------
 def _ai_cache_entry_ttl_s(status: str) -> int:
     st = (status or "").lower()
@@ -764,6 +765,39 @@ async def _ai_cache_set(kind: str, key: str, data, status: str):
             setattr(app.state, "meta_cache_dirty", True)
     except Exception:
         return
+
+
+def _meta_entry_is_current(meta: dict) -> bool:
+    try:
+        return isinstance(meta, dict) and int(meta.get("_meta_priority_version") or 0) == METADATA_PRIORITY_VERSION
+    except Exception:
+        return False
+
+
+def _meta_has_usable_payload(meta: dict) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    for key in ("titulo", "imagen_url", "sinopsis", "año", "fecha_lanzamiento", "generos"):
+        value = meta.get(key)
+        if key == "imagen_url":
+            if isinstance(value, str) and value.strip() and not _is_placeholder_image(value):
+                return True
+            continue
+        if value is not None and str(value).strip() != "":
+            return True
+    return False
+
+
+def _looks_like_series_or_novela(title: str) -> bool:
+    txt = normalize_title(title or "")
+    if not txt:
+        return False
+    markers = (
+        "serie", "series", "novela", "telenovela", "temporada", "season",
+        "episodio", "episode", "capitulo", "anime", "dorama", "kdrama",
+        "cdrama", "miniserie", "miniseries", "tv show", "show"
+    )
+    return any(marker in txt for marker in markers)
 
 
 def _meta_is_full_enough_for_persist(meta: dict) -> bool:
@@ -2600,96 +2634,134 @@ async def _tmdb_search_and_details(
 ):
     if not TMDB_API_KEY:
         return None
+
+    ck = _cache_key_from_query(query_title, year)
+    cached_data, cached_status = await _ai_cache_get("tmdb", ck)
+    if cached_status in ("ok", "none", "429", "err"):
+        if cached_status == "ok" and isinstance(cached_data, dict):
+            return cached_data
+        if cached_status in ("none", "429"):
+            return None
+        if cached_status == "err" and cached_data is None:
+            return None
+
+    if not (isinstance(query_title, str) and query_title.strip()):
+        await _ai_cache_set("tmdb", ck, None, "none")
+        return None
+
     try:
         params = {
-            "api_key":       TMDB_API_KEY,
-            "query":         query_title,
+            "api_key": TMDB_API_KEY,
+            "query": query_title,
             "include_adult": "false",
-            "language":      "es-ES",
-            "page":          1,
+            "language": "es-ES",
+            "page": 1,
         }
         r = await http.get(f"{TMDB_API_BASE}/search/multi", params=params)
+        if r.status_code == 429:
+            await _ai_cache_set("tmdb", ck, None, "429")
+            return None
         r.raise_for_status()
-        results    = r.json().get("results") or []
+
+        results = r.json().get("results") or []
         candidates = [x for x in results if x.get("media_type") in ("movie", "tv")]
         if not candidates:
+            await _ai_cache_set("tmdb", ck, None, "none")
             return None
 
         if year:
             by_year = []
             for x in candidates:
-                d = (x.get("release_date") or x.get("first_air_date") or "")
-                if d.startswith(year):
+                release_hint = (x.get("release_date") or x.get("first_air_date") or "")
+                if release_hint.startswith(year):
                     by_year.append(x)
             if by_year:
                 candidates = by_year
 
         candidates.sort(key=lambda x: (x.get("popularity") or 0), reverse=True)
-        best       = candidates[0]
-        tmdb_id    = best.get("id")
+        best = candidates[0]
+        tmdb_id = best.get("id")
         media_type = best.get("media_type")
         if not tmdb_id or media_type not in ("movie", "tv"):
+            await _ai_cache_set("tmdb", ck, None, "none")
             return None
 
         detail_params = {"api_key": TMDB_API_KEY, "language": "es-ES"}
         if media_type == "movie":
             d = await http.get(f"{TMDB_API_BASE}/movie/{tmdb_id}", params=detail_params)
+            if d.status_code == 429:
+                await _ai_cache_set("tmdb", ck, None, "429")
+                return None
             d.raise_for_status()
-            details       = d.json()
-            title         = details.get("title") or details.get("original_title") or query_title
-            poster_path   = details.get("poster_path")
+            details = d.json()
+            title = details.get("title") or details.get("original_title") or query_title
+            poster_path = details.get("poster_path")
             backdrop_path = details.get("backdrop_path")
-            overview      = details.get("overview")
-            release_date  = details.get("release_date")
-            runtime       = details.get("runtime")
-            orig_lang     = details.get("original_language")
-            popularity    = details.get("popularity")
-            vote_avg      = details.get("vote_average")
-            genres_list   = details.get("genres") or []
-            tagline       = details.get("tagline")
+            overview = details.get("overview")
+            release_date = details.get("release_date")
+            runtime = details.get("runtime")
+            orig_lang = details.get("original_language")
+            popularity = details.get("popularity")
+            vote_avg = details.get("vote_average")
+            genres_list = details.get("genres") or []
+            tagline = details.get("tagline")
         else:
             d = await http.get(f"{TMDB_API_BASE}/tv/{tmdb_id}", params=detail_params)
+            if d.status_code == 429:
+                await _ai_cache_set("tmdb", ck, None, "429")
+                return None
             d.raise_for_status()
-            details       = d.json()
-            title         = details.get("name") or details.get("original_name") or query_title
-            poster_path   = details.get("poster_path")
+            details = d.json()
+            title = details.get("name") or details.get("original_name") or query_title
+            poster_path = details.get("poster_path")
             backdrop_path = details.get("backdrop_path")
-            overview      = details.get("overview")
-            release_date  = details.get("first_air_date")
-            run_list      = details.get("episode_run_time") or []
-            runtime       = run_list[0] if run_list else None
-            orig_lang     = details.get("original_language")
-            popularity    = details.get("popularity")
-            vote_avg      = details.get("vote_average")
-            genres_list   = details.get("genres") or []
-            tagline       = details.get("tagline")
+            overview = details.get("overview")
+            release_date = details.get("first_air_date")
+            run_list = details.get("episode_run_time") or []
+            runtime = run_list[0] if run_list else None
+            orig_lang = details.get("original_language")
+            popularity = details.get("popularity")
+            vote_avg = details.get("vote_average")
+            genres_list = details.get("genres") or []
+            tagline = details.get("tagline")
 
-        genres    = ", ".join(g.get("name") for g in genres_list if g.get("name")) or None
-        poster    = poster_path or backdrop_path
+        genres = ", ".join(g.get("name") for g in genres_list if g.get("name")) or None
+        poster = poster_path or backdrop_path
         image_url = f"{TMDB_IMAGE_BASE}{poster}" if poster else None
-        year_out  = (release_date[:4] if release_date else None) or year
+        year_out = (release_date[:4] if release_date else None) or year
+
+        out = {
+            "source": "tmdb",
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            "titulo": title,
+            "imagen_url": image_url,
+            "sinopsis": overview,
+            "fecha_lanzamiento": release_date,
+            "duracion": (f"{runtime} minutos" if isinstance(runtime, int) and runtime > 0 else None),
+            "idioma_original": (orig_lang.upper() if orig_lang else None),
+            "popularidad": popularity,
+            "puntuacion": vote_avg,
+            "generos": genres,
+            "año": year_out,
+            "descripcion_detallada": tagline or None,
+        }
 
         print(
             f"   🎬 TMDb → '{title}' [{media_type}] "
             f"año={year_out} img={'✓' if image_url else '✗'}"
         )
-        return {
-            "source":                "tmdb",
-            "tmdb_id":               tmdb_id,
-            "media_type":            media_type,
-            "titulo":                title,
-            "imagen_url":            image_url,
-            "sinopsis":              overview,
-            "fecha_lanzamiento":     release_date,
-            "duracion":              (f"{runtime} minutos" if isinstance(runtime, int) and runtime > 0 else None),
-            "idioma_original":       (orig_lang.upper() if orig_lang else None),
-            "popularidad":           popularity,
-            "puntuacion":            vote_avg,
-            "generos":               genres,
-            "año":                   year_out,
-            "descripcion_detallada": tagline or None,
-        }
+        await _ai_cache_set("tmdb", ck, out, "ok")
+        return out
+    except httpx.HTTPStatusError as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 429:
+            await _ai_cache_set("tmdb", ck, None, "429")
+        else:
+            await _ai_cache_set("tmdb", ck, None, "err")
+        print(f"⚠️  TMDb error ({query_title}): {e}")
+        return None
     except Exception as e:
+        await _ai_cache_set("tmdb", ck, None, "err")
         print(f"⚠️  TMDb error ({query_title}): {e}")
         return None
 
@@ -2702,68 +2774,118 @@ async def _tvmaze_fetch(
     query_title: str,
     year,
 ):
+    ck = _cache_key_from_query(query_title, year)
+    cached_data, cached_status = await _ai_cache_get("tvmaze", ck)
+    if cached_status in ("ok", "none", "429", "err"):
+        if cached_status == "ok" and isinstance(cached_data, dict):
+            return cached_data
+        if cached_status in ("none", "429"):
+            return None
+        if cached_status == "err" and cached_data is None:
+            return None
+
+    if not (isinstance(query_title, str) and query_title.strip()):
+        await _ai_cache_set("tvmaze", ck, None, "none")
+        return None
+
     try:
         r = await http.get(
             f"{TVMAZE_API_BASE}/search/shows",
-            params={"q": quote_plus(query_title)},
+            params={"q": query_title},
         )
+        if r.status_code == 429:
+            await _ai_cache_set("tvmaze", ck, None, "429")
+            return None
         r.raise_for_status()
         items = r.json() or []
         if not items:
+            await _ai_cache_set("tvmaze", ck, None, "none")
             return None
+
+        def _score_item(item: dict) -> float:
+            show = item.get("show") or {}
+            show_name = show.get("name") or ""
+            premiered = show.get("premiered") or ""
+            score = float(item.get("score") or 0.0) * 100.0
+            if query_title and show_name and _fuzzy_title_match(query_title, show_name):
+                score += 300.0
+            elif normalize_title(query_title) == normalize_title(show_name):
+                score += 220.0
+            if year and premiered.startswith(year):
+                score += 120.0
+            elif year and premiered:
+                score -= 25.0
+            if str(show.get("type") or "").lower() in ("scripted", "animation", "miniseries"):
+                score += 15.0
+            return score
 
         best_show = None
-        if year:
-            for item in items:
-                show = item.get("show") or {}
-                if (show.get("premiered") or "").startswith(year):
-                    best_show = show; break
-        if best_show is None and items:
-            best_show = items[0].get("show") or {}
+        best_score = float("-inf")
+        for item in items:
+            show = item.get("show") or {}
+            if not isinstance(show, dict) or not show:
+                continue
+            score = _score_item(item)
+            if score > best_score:
+                best_score = score
+                best_show = show
+
         if not best_show:
+            await _ai_cache_set("tvmaze", ck, None, "none")
             return None
 
-        image_obj  = best_show.get("image") or {}
+        image_obj = best_show.get("image") or {}
         imagen_url = image_obj.get("original") or image_obj.get("medium") or None
 
         summary_raw = best_show.get("summary") or ""
-        sinopsis    = re.sub(r"<[^>]+>", "", summary_raw).strip() or None
+        sinopsis = re.sub(r"<[^>]+>", "", summary_raw).strip() or None
 
         genres_list = best_show.get("genres") or []
-        generos     = ", ".join(genres_list) if genres_list else None
+        generos = ", ".join(genres_list) if genres_list else None
 
-        rating_obj  = best_show.get("rating") or {}
-        puntuacion  = rating_obj.get("average") or None
+        rating_obj = best_show.get("rating") or {}
+        puntuacion = rating_obj.get("average") or None
 
         runtime_val = best_show.get("runtime")
-        duracion    = (f"{runtime_val} minutos" if isinstance(runtime_val, int) and runtime_val > 0 else None)
+        duracion = (f"{runtime_val} minutos" if isinstance(runtime_val, int) and runtime_val > 0 else None)
 
-        premiered   = best_show.get("premiered") or ""
-        year_out    = premiered[:4] if len(premiered) >= 4 else year
-        titulo      = best_show.get("name") or query_title
+        premiered = best_show.get("premiered") or ""
+        year_out = premiered[:4] if len(premiered) >= 4 else year
+        titulo = best_show.get("name") or query_title
+
+        out = {
+            "source": "tvmaze",
+            "tmdb_id": None,
+            "media_type": "tv",
+            "titulo": titulo,
+            "imagen_url": imagen_url,
+            "sinopsis": sinopsis,
+            "fecha_lanzamiento": premiered or None,
+            "duracion": duracion,
+            "idioma_original": best_show.get("language") or None,
+            "popularidad": None,
+            "puntuacion": puntuacion,
+            "generos": generos,
+            "año": year_out,
+            "descripcion_detallada": None,
+        }
 
         print(
             f"   📺 TVMaze → '{titulo}' año={year_out} "
             f"img={'✓' if imagen_url else '✗'} "
             f"sinopsis={'✓' if sinopsis else '✗'}"
         )
-        return {
-            "source":                "tvmaze",
-            "tmdb_id":               None,
-            "media_type":            "tv",
-            "titulo":                titulo,
-            "imagen_url":            imagen_url,
-            "sinopsis":              sinopsis,
-            "fecha_lanzamiento":     premiered or None,
-            "duracion":              duracion,
-            "idioma_original":       best_show.get("language") or None,
-            "popularidad":           None,
-            "puntuacion":            puntuacion,
-            "generos":               generos,
-            "año":                   year_out,
-            "descripcion_detallada": None,
-        }
+        await _ai_cache_set("tvmaze", ck, out, "ok")
+        return out
+    except httpx.HTTPStatusError as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 429:
+            await _ai_cache_set("tvmaze", ck, None, "429")
+        else:
+            await _ai_cache_set("tvmaze", ck, None, "err")
+        print(f"⚠️  TVMaze error ({query_title}): {e}")
+        return None
     except Exception as e:
+        await _ai_cache_set("tvmaze", ck, None, "err")
         print(f"⚠️  TVMaze error ({query_title}): {e}")
         return None
 
@@ -3210,32 +3332,35 @@ def _merge_metadata_with_kg(
     fallback_title: str,
     fallback_year,
 ) -> dict:
-    text_sources  = [s for s in [kg, tmdb, tvmaze, archive] if isinstance(s, dict)]
-    image_sources = [s for s in [tmdb, archive, kg, tvmaze]  if isinstance(s, dict)]
+    text_sources  = [s for s in [tmdb, kg, tvmaze, archive] if isinstance(s, dict)]
+    image_sources = [s for s in [tmdb, kg, tvmaze, archive] if isinstance(s, dict)]
 
     def pick(key: str):
         for src in text_sources:
             v = src.get(key)
-            if v is not None and v != "": return v
+            if v is not None and v != "":
+                return v
         return None
 
     def pick_image():
         for src in image_sources:
             v = src.get("imagen_url")
-            if v is not None and v != "": return v
+            if v is not None and v != "":
+                return v
         return None
 
-    tmdb_id    = (tmdb.get("tmdb_id")      if isinstance(tmdb,   dict) else None) or \
-                 (kg.get("tmdb_id")        if isinstance(kg,     dict) else None)
-    media_type = (tmdb.get("media_type")    if isinstance(tmdb,    dict) else None) or \
-                 (kg.get("media_type")      if isinstance(kg,      dict) else None) or \
-                 (tvmaze.get("media_type")  if isinstance(tvmaze,  dict) else None) or \
-                 (archive.get("media_type") if isinstance(archive, dict) else None)
+    tmdb_id = (tmdb.get("tmdb_id") if isinstance(tmdb, dict) else None) or               (kg.get("tmdb_id") if isinstance(kg, dict) else None)
+    media_type = (tmdb.get("media_type") if isinstance(tmdb, dict) else None) or                  (kg.get("media_type") if isinstance(kg, dict) else None) or                  (tvmaze.get("media_type") if isinstance(tvmaze, dict) else None) or                  (archive.get("media_type") if isinstance(archive, dict) else None)
+
+    source_chain = []
+    for src_name, src_value in (("tmdb", tmdb), ("google_kg", kg), ("tvmaze", tvmaze), ("archive_org", archive)):
+        if isinstance(src_value, dict) and _meta_has_usable_payload(src_value):
+            source_chain.append(src_name)
 
     return {
         "tmdb_id":               tmdb_id,
         "media_type":            media_type,
-        "titulo":                pick("titulo")               or fallback_title or "Película",
+        "titulo":                pick("titulo") or fallback_title or "Película",
         "imagen_url":            pick_image(),
         "sinopsis":              pick("sinopsis"),
         "fecha_lanzamiento":     pick("fecha_lanzamiento"),
@@ -3244,8 +3369,10 @@ def _merge_metadata_with_kg(
         "popularidad":           pick("popularidad"),
         "puntuacion":            pick("puntuacion"),
         "generos":               pick("generos"),
-        "año":                   pick("año")                  or fallback_year,
+        "año":                   pick("año") or fallback_year,
         "descripcion_detallada": pick("descripcion_detallada"),
+        "_meta_priority_version": METADATA_PRIORITY_VERSION,
+        "_metadata_source_chain": source_chain,
     }
 
 
@@ -3330,10 +3457,9 @@ async def enrich_results_with_tmdb(
                 meta = await _meta_cache_get(ck)
 
                 need_repair = isinstance(meta, dict) and (
-                    _is_placeholder_image(meta.get("imagen_url")) or
-                    not meta.get("sinopsis")   or
-                    not meta.get("año")        or
-                    not meta.get("titulo")
+                    not _meta_entry_is_current(meta) or
+                    not meta.get("titulo") or
+                    not _meta_has_usable_payload(meta)
                 )
 
                 if (not meta) or need_repair:
@@ -3362,44 +3488,19 @@ async def enrich_results_with_tmdb(
 
                     new_counter["n"] += 1
 
-                    kg = tmdb = tvmaze = archive = None
+                    kg = tmdb = tvmaze = archive = gemini_data = None
+                    looks_like_tv = _looks_like_series_or_novela(f"{title_raw} {query_title}")
 
                     async with semaphore:
                         tmdb = await (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
 
-                        tmdb_has_image = bool(isinstance(tmdb, dict) and tmdb.get("imagen_url"))
-                        tmdb_has_text  = bool(isinstance(tmdb, dict) and tmdb.get("sinopsis") and tmdb.get("año"))
-
-                        if GOOGLE_KG_API_KEY and ((not tmdb_has_image) or (not tmdb_has_text)):
+                        if not isinstance(tmdb, dict) and GOOGLE_KG_API_KEY:
                             kg = await _google_kg_search(http, query_title, year)
 
-                        combined_has_image = bool(
-                            (isinstance(tmdb, dict) and tmdb.get("imagen_url")) or
-                            (isinstance(kg,   dict) and kg.get("imagen_url"))
-                        )
-                        combined_has_synopsis = bool(
-                            (isinstance(tmdb, dict) and tmdb.get("sinopsis")) or
-                            (isinstance(kg,   dict) and kg.get("sinopsis"))
-                        )
-                        combined_has_year = bool(
-                            (isinstance(tmdb, dict) and tmdb.get("año")) or
-                            (isinstance(kg,   dict) and kg.get("año"))
-                        )
-
-                        need_archive = (
-                            not combined_has_image or
-                            str((r.get("source") or "")).lower() == "archive_org" or
-                            bool(_archive_identifier_from_stream_url(r.get("stream_url") or ""))
-                        )
-                        if need_archive:
-                            archive = await _archive_org_search_and_details(http, query_title, year)
-
-                        combined_has_image = combined_has_image or bool(isinstance(archive, dict) and archive.get("imagen_url"))
-                        combined_has_synopsis = combined_has_synopsis or bool(isinstance(archive, dict) and archive.get("sinopsis"))
-                        combined_has_year = combined_has_year or bool(isinstance(archive, dict) and archive.get("año"))
-
-                        if not (combined_has_image and combined_has_synopsis and combined_has_year):
+                        if not isinstance(tmdb, dict) and not isinstance(kg, dict):
                             tvmaze = await _tvmaze_fetch(http, query_title, year)
+                            if isinstance(tvmaze, dict) and looks_like_tv:
+                                print(f"   📌 TVMaze priorizada por heurística TV/novela para '{query_title}'")
 
                     meta = _merge_metadata_with_kg(
                         kg, tmdb, tvmaze, archive,
@@ -3407,23 +3508,30 @@ async def enrich_results_with_tmdb(
                         fallback_year=fallback_year_title or year,
                     )
 
-                    if use_gemini and GEMINI_API_KEY and not (meta.get("sinopsis") and meta.get("generos")):
+                    if (
+                        use_gemini and GEMINI_API_KEY and
+                        not isinstance(tmdb, dict) and
+                        not isinstance(kg, dict) and
+                        not isinstance(tvmaze, dict)
+                    ):
                         gemini_data = await _gemini_complete_metadata(
                             http, fallback_title, year, meta
                         )
                         if isinstance(gemini_data, dict):
-                            for _gk in ["sinopsis", "generos", "año", "idioma_original",
-                                        "duracion", "fecha_lanzamiento"]:
+                            for _gk in [
+                                "titulo", "imagen_url", "sinopsis", "generos", "año",
+                                "idioma_original", "duracion", "fecha_lanzamiento",
+                                "descripcion_detallada", "puntuacion", "popularidad"
+                            ]:
                                 if not meta.get(_gk) and gemini_data.get(_gk):
                                     meta[_gk] = gemini_data[_gk]
-                            # ✅ También tomar titulo e imagen de Gemini si faltan
-                            if not meta.get("titulo") and gemini_data.get("titulo"):
-                                meta["titulo"] = gemini_data["titulo"]
-                            if _is_placeholder_image(meta.get("imagen_url")) and gemini_data.get("imagen_url"):
-                                meta["imagen_url"] = gemini_data["imagen_url"]
+                            meta["_meta_priority_version"] = METADATA_PRIORITY_VERSION
+                            meta["_metadata_source_chain"] = ["gemini"]
 
+                    debug_chain = " > ".join(meta.get("_metadata_source_chain") or []) or "fallback_local"
                     print(
                         f"   ✅ Enriquecimiento → '{meta.get('titulo', '?')}' "
+                        f"fuentes={debug_chain} "
                         f"img={'✓' if meta.get('imagen_url') else '✗'} "
                         f"sinopsis={'✓' if meta.get('sinopsis') else '✗'} "
                         f"año={meta.get('año', '?')}"
