@@ -1,4 +1,3 @@
-# fly.toml app configuration file for peliprex-31wrsa
 app = 'peliprex-31wrsa'
 primary_region = 'iad'
 
@@ -11,12 +10,28 @@ primary_region = 'iad'
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
-  # Se apaga tras 5 minutos de inactividad para liberar el volumen y ahorrar
-  idle_timeout = '300s'
+
+  [http_service.http_options]
+    idle_timeout = 300
+
+  [http_service.concurrency]
+    type = 'requests'
+    soft_limit = 20
+    hard_limit = 25
+
+[[http_service.checks]]
+  grace_period = '180s'
+  interval = '15s'
+  timeout = '5s'
+  method = 'GET'
+  path = '/health'
+
+  [http_service.checks.headers]
+    X-Forwarded-Proto = 'https'
 
 [mounts]
-  source = "peliprex_data"
-  destination = "/data"
+  source = 'peliprex_data'
+  destination = '/data'
 
 [[vm]]
   cpu_kind = 'shared'
