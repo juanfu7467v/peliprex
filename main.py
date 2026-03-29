@@ -2846,8 +2846,27 @@ def _archive_doc_score(doc: dict, query_title: str, year) -> float:
     return score
 
 
+def _archive_normalize_files_list(files) -> list[dict]:
+    if isinstance(files, list):
+        return [f for f in files if isinstance(f, dict)]
+    if isinstance(files, dict):
+        return [f for f in files.values() if isinstance(f, dict)]
+    return []
+
+
+
+def _archive_build_download_url(identifier: str, file_name: str) -> str | None:
+    ident = (identifier or "").strip()
+    name = (file_name or "").strip().lstrip("/")
+    if not ident or not name:
+        return None
+    return f"https://archive.org/download/{quote(ident, safe='')}/{quote(name, safe='/')}"
+
+
+
 def _archive_pick_best_video_file(files: list) -> dict | None:
-    if not isinstance(files, list):
+    normalized_files = _archive_normalize_files_list(files)
+    if not normalized_files:
         return None
 
     bad_exts = {
@@ -2858,39 +2877,52 @@ def _archive_pick_best_video_file(files: list) -> dict | None:
     }
     bad_tokens = (
         "thumb", "thumbnail", "cover", "poster", "sample", "preview", "trailer", "clip",
-        "subtitle", "captions", "closedcaption", "scan", "metadata", "torrent", "log", "spectrogram"
+        "subtitle", "captions", "closedcaption", "closed_caption", "scan", "metadata", "torrent",
+        "log", "spectrogram", "screensaver", "contactsheet"
     )
-    best = None
-    best_score = float("-inf")
+    video_exts = {".mp4", ".m4v", ".mkv", ".avi", ".mov", ".webm", ".ogv", ".mpg", ".mpeg"}
 
-    for file_item in files:
-        if not isinstance(file_item, dict):
-            continue
+    best_mp4 = None
+    best_mp4_score = float("-inf")
+    best_fallback = None
+    best_fallback_score = float("-inf")
 
+    for file_item in normalized_files:
         name = str(file_item.get("name") or "").strip()
         if not name:
             continue
 
         name_l = name.lower()
         fmt = normalize_title(file_item.get("format") or "")
+        mime = normalize_title(file_item.get("mime") or file_item.get("mimetype") or "")
         source = normalize_title(file_item.get("source") or "")
         ext = os.path.splitext(name_l)[1]
+        combined_hint = " ".join(x for x in (fmt, mime) if x)
 
         if ext in bad_exts:
             continue
-        if any(tok in name_l for tok in bad_tokens) or any(tok in fmt for tok in bad_tokens):
+        if any(tok in name_l for tok in bad_tokens) or any(tok in combined_hint for tok in bad_tokens):
             continue
 
+        is_mp4 = (
+            ext == ".mp4"
+            or mime == "video/mp4"
+            or ("mp4" in combined_hint and "audio" not in combined_hint)
+        )
         is_video = (
-            ext in {".mp4", ".m4v", ".mkv", ".avi", ".mov", ".webm", ".ogv", ".mpg", ".mpeg"}
-            or any(tok in fmt for tok in ("mpeg4", "h.264", "matroska", "quicktime", "ogg video", "webm", "video"))
+            is_mp4
+            or ext in video_exts
+            or mime.startswith("video/")
+            or any(tok in combined_hint for tok in (
+                "mpeg4", "mpeg-4", "h.264", "h264", "matroska", "quicktime", "ogg video", "webm", "video"
+            ))
         )
         if not is_video:
             continue
 
         score = 0.0
-        if ext == ".mp4":
-            score += 500.0
+        if is_mp4:
+            score += 1000.0
         elif ext == ".m4v":
             score += 460.0
         elif ext == ".webm":
@@ -2904,8 +2936,10 @@ def _archive_pick_best_video_file(files: list) -> dict | None:
         elif ext in {".mpg", ".mpeg"}:
             score += 260.0
 
-        if "h.264" in fmt or "mpeg4" in fmt or "512kb" in name_l or "h264" in name_l:
+        if "h.264" in combined_hint or "h264" in combined_hint or "mpeg4" in combined_hint or "mpeg-4" in combined_hint:
             score += 120.0
+        if "512kb" in name_l or "ia.mp4" in name_l or "h264" in name_l:
+            score += 60.0
         if "original" in source:
             score += 70.0
         elif "derivative" in source:
@@ -2918,11 +2952,15 @@ def _archive_pick_best_video_file(files: list) -> dict | None:
         if size_bytes > 0:
             score += min(size_bytes / (1024 * 1024 * 50), 120.0)
 
-        if score > best_score:
-            best = file_item
-            best_score = score
+        if is_mp4 and score > best_mp4_score:
+            best_mp4 = file_item
+            best_mp4_score = score
 
-    return best
+        if score > best_fallback_score:
+            best_fallback = file_item
+            best_fallback_score = score
+
+    return best_mp4 or best_fallback
 
 
 async def _archive_org_search_and_details(http, query_title: str, year):
@@ -2972,6 +3010,9 @@ async def _archive_org_search_and_details(http, query_title: str, year):
             file_name = str(best_file.get("name") or "").strip()
             if not file_name:
                 continue
+            stream_url = _archive_build_download_url(identifier, file_name)
+            if not stream_url:
+                continue
 
             metadata_root = metadata_data.get("metadata") or {}
             title = _archive_text(metadata_root.get("title")) or _archive_text(doc.get("title")) or query_title
@@ -2999,7 +3040,6 @@ async def _archive_org_search_and_details(http, query_title: str, year):
                 size_bytes = 0
 
             size_label = f"{round(size_bytes / (1024 * 1024), 2)} MB" if size_bytes > 0 else "n/a"
-            stream_url = f"https://archive.org/download/{quote(identifier, safe='')}/{quote(file_name, safe='/')}"
             image_url = _archive_thumb_from_identifier(identifier)
 
             print(
