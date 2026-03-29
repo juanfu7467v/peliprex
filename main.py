@@ -8,7 +8,7 @@ import json
 import httpx
 import time
 import io
-from urllib.parse import quote_plus, urlparse, parse_qs
+from urllib.parse import quote, quote_plus, urlparse, parse_qs
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -52,7 +52,16 @@ CHANNEL_IDENTIFIER = None  # Sin canal principal prioritario
 INTERNAL_PORT = int(os.getenv("PORT", 8080))
 
 # --- YOUTUBE BACKUP ---
-YOUTUBE_API_KEY    = os.getenv("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_API_KEY               = os.getenv("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_FALLBACK_MAX_RESULTS  = max(1, min(10, int(os.getenv("YOUTUBE_FALLBACK_MAX_RESULTS", "8"))))
+YOUTUBE_FALLBACK_MIN_DURATION_S = max(1200, int(os.getenv("YOUTUBE_FALLBACK_MIN_DURATION_S", "2400")))
+
+# --- INTERNET ARCHIVE ---
+INTERNET_ARCHIVE_SEARCH_BASE    = "https://archive.org/advancedsearch.php"
+INTERNET_ARCHIVE_METADATA_BASE  = "https://archive.org/metadata"
+INTERNET_ARCHIVE_IMAGE_BASE     = "https://archive.org/services/img"
+INTERNET_ARCHIVE_TIMEOUT_S      = max(2.5, float(os.getenv("INTERNET_ARCHIVE_TIMEOUT_S", "4.5")))
+INTERNET_ARCHIVE_MAX_CANDIDATES = max(1, min(8, int(os.getenv("INTERNET_ARCHIVE_MAX_CANDIDATES", "4"))))
 
 # --- GOOGLE KNOWLEDGE GRAPH ---
 GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
@@ -663,6 +672,39 @@ def _youtube_thumb_from_stream_url(stream_url):
         return None
     except Exception:
         return None
+
+
+def _archive_identifier_from_stream_url(stream_url: str) -> str | None:
+    try:
+        if not stream_url:
+            return None
+        parsed = urlparse(stream_url)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        if "archive.org" not in host:
+            return None
+        for marker in ("/details/", "/download/", "/metadata/", "/services/img/"):
+            if marker in path:
+                tail = path.split(marker, 1)[1].strip("/")
+                identifier = tail.split("/", 1)[0].strip()
+                return identifier or None
+        return None
+    except Exception:
+        return None
+
+
+def _archive_thumb_from_identifier(identifier: str) -> str | None:
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    return f"{INTERNET_ARCHIVE_IMAGE_BASE}/{quote(ident, safe='')}"
+
+
+def _archive_thumb_from_stream_url(stream_url: str) -> str | None:
+    identifier = _archive_identifier_from_stream_url(stream_url)
+    if not identifier:
+        return None
+    return _archive_thumb_from_identifier(identifier)
 
 
 # ---------------------------------------------------------------------------
@@ -2726,6 +2768,268 @@ async def _tvmaze_fetch(
         return None
 
 
+def _archive_text(value, max_len: int | None = None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        value = " ".join(str(x).strip() for x in value if x is not None and str(x).strip())
+    elif isinstance(value, dict):
+        value = " ".join(str(v).strip() for v in value.values() if v is not None and str(v).strip())
+    else:
+        value = str(value).strip()
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return None
+    if max_len and len(value) > max_len:
+        clipped = value[:max_len].rsplit(" ", 1)[0].strip()
+        value = (clipped or value[:max_len]).strip() + "…"
+    return value
+
+
+def _archive_extract_year(value) -> str | None:
+    txt = _archive_text(value)
+    if not txt:
+        return None
+    match = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\b", txt)
+    return match.group(1) if match else None
+
+
+def _archive_escape_query(value: str) -> str:
+    return (value or "").replace("\\", " ").replace('"', '\\"').strip()
+
+
+def _archive_build_queries(query_title: str, year) -> list[str]:
+    title = _archive_escape_query(query_title)
+    if not title:
+        return []
+    text_clause = f'(title:("{title}") OR subject:("{title}") OR description:("{title}"))'
+    media_clause = '(mediatype:(movies) OR mediatype:(video))'
+    out = []
+    if year:
+        out.append(f'{text_clause} AND {media_clause} AND (year:{year} OR date:{year}*)')
+    out.append(f'{text_clause} AND {media_clause}')
+    return out
+
+
+def _archive_doc_score(doc: dict, query_title: str, year) -> float:
+    title = _archive_text(doc.get("title")) or ""
+    query_norm = normalize_title(query_title or "")
+    title_norm = normalize_title(title)
+    score = 0.0
+
+    if query_title and title and _fuzzy_title_match(query_title, title):
+        score += 350.0
+    elif query_norm and title_norm:
+        shared = len(set(query_norm.split()) & set(title_norm.split()))
+        score += float(shared * 25)
+
+    doc_year = _archive_extract_year(doc.get("year") or doc.get("date"))
+    if year and doc_year == year:
+        score += 140.0
+    elif year and doc_year and doc_year != year:
+        score -= 30.0
+
+    identifier = normalize_title(doc.get("identifier") or "")
+    if query_norm and identifier and query_norm.replace(" ", "") in identifier.replace(" ", ""):
+        score += 40.0
+
+    mediatype = normalize_title(doc.get("mediatype") or "")
+    if "movie" in mediatype or "video" in mediatype:
+        score += 20.0
+
+    try:
+        downloads = int(float(doc.get("downloads") or 0))
+    except Exception:
+        downloads = 0
+    score += min(downloads / 500.0, 60.0)
+    return score
+
+
+def _archive_pick_best_video_file(files: list) -> dict | None:
+    if not isinstance(files, list):
+        return None
+
+    bad_exts = {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".txt", ".xml", ".json",
+        ".srt", ".vtt", ".sub", ".nfo", ".torrent", ".sqlite", ".db", ".pdf", ".zip",
+        ".7z", ".rar", ".doc", ".docx", ".epub", ".md", ".html", ".htm", ".csv",
+        ".jp2", ".mp3", ".flac", ".wav", ".ogg", ".m3u8"
+    }
+    bad_tokens = (
+        "thumb", "thumbnail", "cover", "poster", "sample", "preview", "trailer", "clip",
+        "subtitle", "captions", "closedcaption", "scan", "metadata", "torrent", "log", "spectrogram"
+    )
+    best = None
+    best_score = float("-inf")
+
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            continue
+
+        name = str(file_item.get("name") or "").strip()
+        if not name:
+            continue
+
+        name_l = name.lower()
+        fmt = normalize_title(file_item.get("format") or "")
+        source = normalize_title(file_item.get("source") or "")
+        ext = os.path.splitext(name_l)[1]
+
+        if ext in bad_exts:
+            continue
+        if any(tok in name_l for tok in bad_tokens) or any(tok in fmt for tok in bad_tokens):
+            continue
+
+        is_video = (
+            ext in {".mp4", ".m4v", ".mkv", ".avi", ".mov", ".webm", ".ogv", ".mpg", ".mpeg"}
+            or any(tok in fmt for tok in ("mpeg4", "h.264", "matroska", "quicktime", "ogg video", "webm", "video"))
+        )
+        if not is_video:
+            continue
+
+        score = 0.0
+        if ext == ".mp4":
+            score += 500.0
+        elif ext == ".m4v":
+            score += 460.0
+        elif ext == ".webm":
+            score += 380.0
+        elif ext == ".ogv":
+            score += 360.0
+        elif ext == ".mkv":
+            score += 340.0
+        elif ext in {".mov", ".avi"}:
+            score += 280.0
+        elif ext in {".mpg", ".mpeg"}:
+            score += 260.0
+
+        if "h.264" in fmt or "mpeg4" in fmt or "512kb" in name_l or "h264" in name_l:
+            score += 120.0
+        if "original" in source:
+            score += 70.0
+        elif "derivative" in source:
+            score += 30.0
+
+        try:
+            size_bytes = int(str(file_item.get("size") or "0"))
+        except Exception:
+            size_bytes = 0
+        if size_bytes > 0:
+            score += min(size_bytes / (1024 * 1024 * 50), 120.0)
+
+        if score > best_score:
+            best = file_item
+            best_score = score
+
+    return best
+
+
+async def _archive_org_search_and_details(http, query_title: str, year):
+    query_title = (query_title or "").strip()
+    if not query_title:
+        return None
+
+    try:
+        docs = []
+        for q in _archive_build_queries(query_title, year):
+            params = {
+                "q": q,
+                "fl[]": "identifier,title,description,year,date,downloads,creator,subject,mediatype",
+                "rows": INTERNET_ARCHIVE_MAX_CANDIDATES,
+                "page": 1,
+                "output": "json",
+                "sort[]": ["downloads desc", "publicdate desc"],
+            }
+            response = await http.get(INTERNET_ARCHIVE_SEARCH_BASE, params=params)
+            response.raise_for_status()
+            docs = ((response.json() or {}).get("response") or {}).get("docs") or []
+            if docs:
+                break
+
+        if not docs:
+            return None
+
+        ranked_docs = sorted(
+            (doc for doc in docs if isinstance(doc, dict)),
+            key=lambda d: _archive_doc_score(d, query_title, year),
+            reverse=True,
+        )[:INTERNET_ARCHIVE_MAX_CANDIDATES]
+
+        for doc in ranked_docs:
+            identifier = _archive_text(doc.get("identifier"))
+            if not identifier:
+                continue
+
+            metadata_resp = await http.get(f"{INTERNET_ARCHIVE_METADATA_BASE}/{quote(identifier, safe='')}")
+            metadata_resp.raise_for_status()
+            metadata_data = metadata_resp.json() or {}
+            files = metadata_data.get("files") or []
+            best_file = _archive_pick_best_video_file(files)
+            if not best_file:
+                continue
+
+            file_name = str(best_file.get("name") or "").strip()
+            if not file_name:
+                continue
+
+            metadata_root = metadata_data.get("metadata") or {}
+            title = _archive_text(metadata_root.get("title")) or _archive_text(doc.get("title")) or query_title
+            description = _archive_text(metadata_root.get("description"), max_len=650) or _archive_text(doc.get("description"), max_len=650)
+            year_out = _archive_extract_year(
+                metadata_root.get("year") or metadata_root.get("date") or doc.get("year") or doc.get("date")
+            ) or year
+            release_date = _archive_text(metadata_root.get("date") or doc.get("date"))
+            language = _archive_text(metadata_root.get("language") or metadata_root.get("languageSorter"))
+            subject = metadata_root.get("subject") or doc.get("subject")
+            if isinstance(subject, list):
+                generos = ", ".join(str(x).strip() for x in subject[:4] if str(x).strip()) or None
+            else:
+                generos = _archive_text(subject)
+            creator = _archive_text(metadata_root.get("creator") or doc.get("creator"))
+            runtime = _archive_text(metadata_root.get("runtime") or metadata_root.get("length"))
+
+            try:
+                downloads = int(float(doc.get("downloads") or 0))
+            except Exception:
+                downloads = 0
+            try:
+                size_bytes = int(str(best_file.get("size") or "0"))
+            except Exception:
+                size_bytes = 0
+
+            size_label = f"{round(size_bytes / (1024 * 1024), 2)} MB" if size_bytes > 0 else "n/a"
+            stream_url = f"https://archive.org/download/{quote(identifier, safe='')}/{quote(file_name, safe='/')}"
+            image_url = _archive_thumb_from_identifier(identifier)
+
+            print(
+                f"   🏛️ Archive.org → '{title}' año={year_out or '?'} "
+                f"img={'✓' if image_url else '✗'} archivo={'✓' if stream_url else '✗'}"
+            )
+            return {
+                "source":                "archive_org",
+                "archive_identifier":    identifier,
+                "tmdb_id":               None,
+                "media_type":            "movie",
+                "titulo":                title,
+                "imagen_url":            image_url,
+                "sinopsis":              description,
+                "fecha_lanzamiento":     release_date,
+                "duracion":              runtime,
+                "idioma_original":       language,
+                "popularidad":           downloads or None,
+                "puntuacion":            None,
+                "generos":               generos,
+                "año":                   year_out,
+                "descripcion_detallada": creator,
+                "stream_url":            stream_url,
+                "size":                  size_label,
+            }
+    except Exception as e:
+        print(f"⚠️  Internet Archive error ({query_title}): {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # GEMINI AI: completa metadatos faltantes (SOLO EN /search, LIMITADO A 10) + cache IA
 # ---------------------------------------------------------------------------
@@ -2862,11 +3166,12 @@ def _merge_metadata_with_kg(
     kg,
     tmdb,
     tvmaze,
+    archive,
     fallback_title: str,
     fallback_year,
 ) -> dict:
-    text_sources  = [s for s in [kg, tmdb, tvmaze] if isinstance(s, dict)]
-    image_sources = [s for s in [tmdb, kg, tvmaze]  if isinstance(s, dict)]
+    text_sources  = [s for s in [kg, tmdb, tvmaze, archive] if isinstance(s, dict)]
+    image_sources = [s for s in [tmdb, archive, kg, tvmaze]  if isinstance(s, dict)]
 
     def pick(key: str):
         for src in text_sources:
@@ -2882,9 +3187,10 @@ def _merge_metadata_with_kg(
 
     tmdb_id    = (tmdb.get("tmdb_id")      if isinstance(tmdb,   dict) else None) or \
                  (kg.get("tmdb_id")        if isinstance(kg,     dict) else None)
-    media_type = (tmdb.get("media_type")   if isinstance(tmdb,   dict) else None) or \
-                 (kg.get("media_type")     if isinstance(kg,     dict) else None) or \
-                 (tvmaze.get("media_type") if isinstance(tvmaze, dict) else None)
+    media_type = (tmdb.get("media_type")    if isinstance(tmdb,    dict) else None) or \
+                 (kg.get("media_type")      if isinstance(kg,      dict) else None) or \
+                 (tvmaze.get("media_type")  if isinstance(tvmaze,  dict) else None) or \
+                 (archive.get("media_type") if isinstance(archive, dict) else None)
 
     return {
         "tmdb_id":               tmdb_id,
@@ -2994,8 +3300,9 @@ async def enrich_results_with_tmdb(
                     if new_counter["n"] >= limit_new:
                         pelicula_url = r.get("stream_url") or ""
                         thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
+                        archive_img = r.get("imagen_url") or _archive_thumb_from_stream_url(pelicula_url)
                         yt    = _youtube_thumb_from_stream_url(pelicula_url)
-                        img_final = thumb or yt or ""
+                        img_final = thumb or archive_img or yt or ""
                         return {
                             "titulo":                fallback_title or "Película",
                             "imagen_url":            img_final,
@@ -3015,18 +3322,18 @@ async def enrich_results_with_tmdb(
 
                     new_counter["n"] += 1
 
-                    kg = tmdb = tvmaze = None
+                    kg = tmdb = tvmaze = archive = None
 
                     async with semaphore:
                         tmdb = await (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
 
-                        need_image = not (isinstance(tmdb, dict) and tmdb.get("imagen_url"))
-                        need_text  = not (isinstance(tmdb, dict) and tmdb.get("sinopsis") and tmdb.get("año"))
+                        tmdb_has_image = bool(isinstance(tmdb, dict) and tmdb.get("imagen_url"))
+                        tmdb_has_text  = bool(isinstance(tmdb, dict) and tmdb.get("sinopsis") and tmdb.get("año"))
 
-                        if (GOOGLE_KG_API_KEY and (need_image or need_text)):
+                        if GOOGLE_KG_API_KEY and ((not tmdb_has_image) or (not tmdb_has_text)):
                             kg = await _google_kg_search(http, query_title, year)
 
-                        combined_has_image    = bool(
+                        combined_has_image = bool(
                             (isinstance(tmdb, dict) and tmdb.get("imagen_url")) or
                             (isinstance(kg,   dict) and kg.get("imagen_url"))
                         )
@@ -3034,16 +3341,28 @@ async def enrich_results_with_tmdb(
                             (isinstance(tmdb, dict) and tmdb.get("sinopsis")) or
                             (isinstance(kg,   dict) and kg.get("sinopsis"))
                         )
-                        combined_has_year     = bool(
+                        combined_has_year = bool(
                             (isinstance(tmdb, dict) and tmdb.get("año")) or
                             (isinstance(kg,   dict) and kg.get("año"))
                         )
+
+                        need_archive = (
+                            not combined_has_image or
+                            str((r.get("source") or "")).lower() == "archive_org" or
+                            bool(_archive_identifier_from_stream_url(r.get("stream_url") or ""))
+                        )
+                        if need_archive:
+                            archive = await _archive_org_search_and_details(http, query_title, year)
+
+                        combined_has_image = combined_has_image or bool(isinstance(archive, dict) and archive.get("imagen_url"))
+                        combined_has_synopsis = combined_has_synopsis or bool(isinstance(archive, dict) and archive.get("sinopsis"))
+                        combined_has_year = combined_has_year or bool(isinstance(archive, dict) and archive.get("año"))
 
                         if not (combined_has_image and combined_has_synopsis and combined_has_year):
                             tvmaze = await _tvmaze_fetch(http, query_title, year)
 
                     meta = _merge_metadata_with_kg(
-                        kg, tmdb, tvmaze,
+                        kg, tmdb, tvmaze, archive,
                         fallback_title=fallback_title,
                         fallback_year=fallback_year_title or year,
                     )
@@ -3079,13 +3398,15 @@ async def enrich_results_with_tmdb(
             if _is_placeholder_image(meta_img):
                 meta_img = None
 
-            thumb_img  = _thumb_url_for_message(r.get("id"), pelicula_url)
-            yt_img     = _youtube_thumb_from_stream_url(pelicula_url)
+            provided_img = r.get("imagen_url") or ""
+            archive_img = provided_img or _archive_thumb_from_stream_url(pelicula_url)
+            thumb_img   = _thumb_url_for_message(r.get("id"), pelicula_url)
+            yt_img      = _youtube_thumb_from_stream_url(pelicula_url)
 
             if catalog_mode:
-                imagen_url = meta_img or thumb_img or yt_img or ""
+                imagen_url = meta_img or archive_img or thumb_img or yt_img or ""
             else:
-                imagen_url = meta_img or thumb_img or yt_img or ""
+                imagen_url = meta_img or archive_img or thumb_img or yt_img or ""
 
             descripcion = (meta.get("sinopsis") if isinstance(meta, dict) else None) or "n/a"
             year_out    = (meta.get("año") if isinstance(meta, dict) else None) or fallback_year_title or year or "n/a"
@@ -3151,9 +3472,10 @@ def _format_results_without_apis(final_results: list, catalog_mode: bool = False
 
         pelicula_url = r.get("stream_url") or ""
 
-        thumb_img = _thumb_url_for_message(r.get("id"), pelicula_url)
-        yt_img    = _youtube_thumb_from_stream_url(pelicula_url)
-        img_final = thumb_img or yt_img or "n/a"
+        archive_img = r.get("imagen_url") or _archive_thumb_from_stream_url(pelicula_url)
+        thumb_img   = _thumb_url_for_message(r.get("id"), pelicula_url)
+        yt_img      = _youtube_thumb_from_stream_url(pelicula_url)
+        img_final   = archive_img or thumb_img or yt_img or "n/a"
 
         formatted.append({
             "titulo":                titulo or "Película",
@@ -3498,7 +3820,22 @@ async def search(
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
 
         if not final_results and effective_text:
-            print("🟦 Sin resultados en Telegram. Usando respaldo YouTube...")
+            print("🟦 Sin resultados en Telegram. Probando Internet Archive...")
+            archive_results = await archive_org_fallback(effective_text.strip())
+            if archive_results:
+                try:
+                    enriched = await asyncio.wait_for(
+                        enrich_results_with_tmdb(archive_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
+                        timeout=4.0,
+                    )
+                except asyncio.TimeoutError:
+                    print("⚠️  /search Internet Archive enrichment timeout")
+                    enriched = _format_results_without_apis(archive_results)
+                if any([effective_year, effective_genre, language, effective_desde, effective_hasta]):
+                    enriched = _apply_advanced_filters(enriched, effective_year, effective_genre, language, effective_desde, effective_hasta)
+                return _to_peliculas_json_schema(enriched)
+
+            print("🟦 Sin resultados en Internet Archive. Usando respaldo YouTube...")
             yt_results = await youtube_fallback(effective_text.strip())
             if yt_results:
                 try:
@@ -3654,7 +3991,7 @@ async def youtube_thumbnail_proxy(video_id: str):
 
 
 async def _fetch_tmdb_poster_bytes_for_message(message) -> bytes | None:
-    if not TMDB_API_KEY or message is None:
+    if message is None:
         return None
 
     title_raw = _extract_title_from_caption((message.text or "").strip())
@@ -3669,20 +4006,32 @@ async def _fetch_tmdb_poster_bytes_for_message(message) -> bytes | None:
     meta = await _meta_cache_get(ck)
 
     meta_img = None
-    if isinstance(meta, dict) and (meta.get("source") == "tmdb" or meta.get("tmdb_id")):
+    if isinstance(meta, dict):
         meta_img = meta.get("imagen_url")
         if _is_placeholder_image(meta_img):
             meta_img = None
 
     timeout = httpx.Timeout(connect=2.0, read=TMDB_THUMB_HTTP_TIMEOUT, write=2.0, pool=1.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-        if not meta_img:
+        if not meta_img and TMDB_API_KEY:
             tmdb = await _tmdb_search_and_details(http, query_title, year)
             if isinstance(tmdb, dict):
                 meta_img = tmdb.get("imagen_url")
                 merged = dict(meta) if isinstance(meta, dict) else {}
                 merged.update(tmdb)
                 await _meta_cache_set(ck, merged)
+
+        if not meta_img or _is_placeholder_image(meta_img):
+            archive = await _archive_org_search_and_details(http, query_title, year)
+            if isinstance(archive, dict):
+                archive_img = archive.get("imagen_url")
+                if archive_img and not _is_placeholder_image(archive_img):
+                    meta_img = archive_img
+                    merged = dict(meta) if isinstance(meta, dict) else {}
+                    for _ak, _av in archive.items():
+                        if _av not in (None, "") and (_ak == "imagen_url" or not merged.get(_ak)):
+                            merged[_ak] = _av
+                    await _meta_cache_set(ck, merged)
 
         if not meta_img or _is_placeholder_image(meta_img):
             return None
@@ -3692,7 +4041,7 @@ async def _fetch_tmdb_poster_bytes_for_message(message) -> bytes | None:
         if not response.content or len(response.content) <= 200:
             return None
 
-        print(f"   🎬 Póster TMDb obtenido para '{query_title}' [{len(response.content)//1024}KB]")
+        print(f"   🎬 Póster/miniatura remota obtenida para '{query_title}' [{len(response.content)//1024}KB]")
         return response.content
 
 
@@ -3767,14 +4116,14 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
 
         thumb_data: bytes | None = None
 
-        # ✅ PRIORIDAD 1 — póster oficial de TMDb
+        # ✅ PRIORIDAD 1 — póster remoto (TMDb; si falta, miniatura de Archive.org)
         if not thumb_data:
             try:
                 tmdb_poster = await _fetch_tmdb_poster_bytes_for_message(message)
                 if tmdb_poster and len(tmdb_poster) > 200:
                     thumb_data = tmdb_poster
             except Exception as _tmdb_ex:
-                print(f"   ⚠️  TMDb no disponible para msg {message_id}: {_tmdb_ex}")
+                print(f"   ⚠️  Imagen remota no disponible para msg {message_id}: {_tmdb_ex}")
 
         # ✅ PRIORIDAD 2 — miniatura nativa desde message.document.thumbs
         # Intenta primero obtener la imagen completa (thumb=-1 = mayor resolución disponible),
@@ -4181,39 +4530,222 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
 
 # ---------------------------------------------------------------------------
-# YOUTUBE FALLBACK
+# INTERNET ARCHIVE + YOUTUBE FALLBACK (Telegram → Archive.org → YouTube)
 # ---------------------------------------------------------------------------
+def _parse_iso8601_duration_seconds(value: str) -> int | None:
+    if not value:
+        return None
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?",
+        value,
+    )
+    if not match:
+        return None
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _build_youtube_fallback_queries(search_query: str) -> list[str]:
+    base_title, base_year = _build_tmdb_query_from_title(search_query or "")
+    root = " ".join(part for part in [base_title or (search_query or "").strip(), base_year] if part).strip()
+    if not root:
+        return []
+
+    is_classic = False
+    try:
+        is_classic = bool(base_year and int(base_year) <= 1985)
+    except Exception:
+        is_classic = False
+
+    queries = [
+        f"{root} pelicula completa full movie",
+        f"{root} official full movie",
+    ]
+    if is_classic:
+        queries.insert(1, f"{root} classic movie full length")
+
+    out = []
+    seen = set()
+    for q in queries:
+        qn = normalize_title(q)
+        if qn and qn not in seen:
+            seen.add(qn)
+            out.append(q)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def _youtube_candidate_score(base_query: str, title: str, channel: str, duration_s, category_id: str | None) -> float:
+    title_n = normalize_title(title or "")
+    channel_n = normalize_title(channel or "")
+    score = 0.0
+
+    if base_query and title and _fuzzy_title_match(base_query, title):
+        score += 240.0
+
+    positive_title_tokens = (
+        "pelicula completa", "full movie", "complete movie", "feature film",
+        "free movie", "classic movie", "public domain", "movie"
+    )
+    positive_channel_tokens = (
+        "movies", "films", "cinema", "classic", "official", "archive",
+        "public domain", "vault", "pictures", "studio", "entertainment"
+    )
+    negative_tokens = (
+        "trailer", "teaser", "clip", "scene", "short", "shorts", "review",
+        "reaction", "recap", "ending", "soundtrack", "ost", "fanmade",
+        "analysis", "explicada", "resumen", "fragmento"
+    )
+
+    for token in positive_title_tokens:
+        if token in title_n:
+            score += 75.0
+    for token in positive_channel_tokens:
+        if token in channel_n:
+            score += 35.0
+    for token in negative_tokens:
+        if token in title_n:
+            score -= 180.0
+        if token in channel_n:
+            score -= 40.0
+
+    if category_id == "1":
+        score += 40.0
+
+    if duration_s is not None:
+        if duration_s >= 7200:
+            score += 280.0
+        elif duration_s >= 5400:
+            score += 240.0
+        elif duration_s >= 4200:
+            score += 210.0
+        elif duration_s >= YOUTUBE_FALLBACK_MIN_DURATION_S:
+            score += 170.0
+        else:
+            score -= 420.0
+
+    return score
+
+
+async def archive_org_fallback(search_query: str) -> list:
+    query_title, year = _build_tmdb_query_from_title(search_query or "")
+    query_title = (query_title or search_query or "").strip()
+    if not query_title:
+        return []
+
+    timeout = httpx.Timeout(connect=2.5, read=INTERNET_ARCHIVE_TIMEOUT_S, write=2.5, pool=1.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+            archive_meta = await _archive_org_search_and_details(http, query_title, year)
+        if not isinstance(archive_meta, dict):
+            return []
+
+        stream_url = archive_meta.get("stream_url")
+        if not stream_url:
+            return []
+
+        result = {
+            "id":                 archive_meta.get("archive_identifier") or query_title,
+            "title":              archive_meta.get("titulo") or query_title,
+            "size":               archive_meta.get("size") or "n/a",
+            "stream_url":         stream_url,
+            "imagen_url":         archive_meta.get("imagen_url") or _archive_thumb_from_stream_url(stream_url),
+            "source":             "archive_org",
+            "archive_identifier": archive_meta.get("archive_identifier"),
+        }
+        print(f"🟫 Internet Archive fallback OK: {result['title']}")
+        return [result]
+    except Exception as e:
+        print(f"⚠️  Error usando Internet Archive fallback: {e}")
+        return []
+
+
 async def youtube_fallback(youtube_query: str) -> list:
     if not YOUTUBE_API_KEY:
         return []
-    url    = "https://www.googleapis.com/youtube/v3/search"
-    params = {
-        "part":       "snippet",
-        "q":          youtube_query,
-        "key":        YOUTUBE_API_KEY,
-        "type":       "video",
-        "maxResults": 1,
-    }
+
+    search_url = "https://www.googleapis.com/youtube/v3/search"
+    videos_url = "https://www.googleapis.com/youtube/v3/videos"
+    candidate_map = {}
+
     try:
-        async with httpx.AsyncClient(timeout=3.5) as http:
-            r = await http.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-        items = data.get("items") or []
-        if not items:
+        async with httpx.AsyncClient(timeout=4.5) as http:
+            for query in _build_youtube_fallback_queries(youtube_query):
+                params = {
+                    "part":             "snippet",
+                    "q":                query,
+                    "key":              YOUTUBE_API_KEY,
+                    "type":             "video",
+                    "maxResults":       YOUTUBE_FALLBACK_MAX_RESULTS,
+                    "videoDuration":    "long",
+                    "videoEmbeddable":  "true",
+                    "videoSyndicated":  "true",
+                    "safeSearch":       "none",
+                    "order":            "relevance",
+                }
+                response = await http.get(search_url, params=params)
+                response.raise_for_status()
+                items = (response.json() or {}).get("items") or []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    vid = ((item.get("id") or {}).get("videoId")) or ""
+                    if not vid or vid in candidate_map:
+                        continue
+                    candidate_map[vid] = item
+
+            if not candidate_map:
+                return []
+
+            details_params = {
+                "part": "contentDetails,status,snippet",
+                "id": ",".join(candidate_map.keys()),
+                "key": YOUTUBE_API_KEY,
+            }
+            details_response = await http.get(videos_url, params=details_params)
+            details_response.raise_for_status()
+            detail_items = (details_response.json() or {}).get("items") or []
+            detail_map = {item.get("id"): item for item in detail_items if isinstance(item, dict)}
+
+        ranked = []
+        for vid, item in candidate_map.items():
+            snippet = item.get("snippet") or {}
+            title = (snippet.get("title") or "YouTube Video").strip()
+            channel = (snippet.get("channelTitle") or "").strip()
+
+            detail = detail_map.get(vid) or {}
+            status = detail.get("status") or {}
+            if status.get("embeddable") is False:
+                continue
+
+            content_details = detail.get("contentDetails") or {}
+            duration_s = _parse_iso8601_duration_seconds(content_details.get("duration") or "")
+            if duration_s is not None and duration_s < YOUTUBE_FALLBACK_MIN_DURATION_S:
+                continue
+
+            category_id = ((detail.get("snippet") or {}).get("categoryId") or "").strip() or None
+            score = _youtube_candidate_score(youtube_query, title, channel, duration_s, category_id)
+            if score <= 0:
+                continue
+
+            ranked.append((score, {
+                "id":         vid,
+                "title":      title,
+                "size":       "n/a",
+                "stream_url": f"https://www.youtube.com/watch?v={vid}",
+                "source":     "youtube",
+            }))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        if not ranked:
             return []
-        first    = items[0]
-        video_id = ((first.get("id") or {}).get("videoId")) or ""
-        snippet  = first.get("snippet") or {}
-        title    = (snippet.get("title") or "YouTube Video").strip()
-        if not video_id:
-            return []
-        return [{
-            "id":         video_id,
-            "title":      title,
-            "size":       "n/a",
-            "stream_url": f"https://www.youtube.com/watch?v={video_id}",
-        }]
+
+        print(f"🟥 YouTube fallback OK: {ranked[0][1]['title']}")
+        return [ranked[0][1]]
     except Exception as e:
         print(f"⚠️  Error usando YouTube fallback: {e}")
         return []
