@@ -8,7 +8,7 @@ import json
 import httpx
 import time
 import io
-from urllib.parse import quote, quote_plus, urlparse, parse_qs
+from urllib.parse import quote, quote_plus, urlparse, parse_qs, urljoin
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -70,6 +70,25 @@ GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
 TMDB_API_KEY       = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_API_BASE      = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w500"
+
+# --- RESOLVER EXTERNO POR TMDB (opcional, recomendado self-hosted) ---
+EXTERNAL_STREAM_API_BASE = os.getenv("EXTERNAL_STREAM_API_BASE", "").strip().rstrip("/")
+EXTERNAL_STREAM_API_PATH_TEMPLATE = (
+    os.getenv("EXTERNAL_STREAM_API_PATH_TEMPLATE", "/api/streams/{type}/{tmdb_id}")
+    or "/api/streams/{type}/{tmdb_id}"
+).strip()
+EXTERNAL_STREAM_API_TIMEOUT_S = max(2.5, float(os.getenv("EXTERNAL_STREAM_API_TIMEOUT_S", "5.5")))
+EXTERNAL_STREAM_API_MAX_RESULTS = max(1, min(10, int(os.getenv("EXTERNAL_STREAM_API_MAX_RESULTS", "5"))))
+EXTERNAL_STREAM_API_AUTH_HEADER = os.getenv("EXTERNAL_STREAM_API_AUTH_HEADER", "").strip()
+EXTERNAL_STREAM_API_AUTH_TOKEN  = os.getenv("EXTERNAL_STREAM_API_AUTH_TOKEN", "").strip()
+EXTERNAL_STREAM_API_ACCEPT_HEADER_DEPENDENT = (
+    os.getenv("EXTERNAL_STREAM_API_ACCEPT_HEADER_DEPENDENT", "0").strip().lower() in ("1", "true", "yes", "on")
+)
+EXTERNAL_STREAM_API_PREFERRED_PROVIDERS = tuple(
+    p.strip().lower()
+    for p in os.getenv("EXTERNAL_STREAM_API_PREFERRED_PROVIDERS", "").split(",")
+    if p.strip()
+)
 
 # --- TVMaze (gratuita, sin API key) ---
 TVMAZE_API_BASE    = "https://api.tvmaze.com"
@@ -3998,6 +4017,21 @@ async def search(
                     enriched = _apply_advanced_filters(enriched, effective_year, effective_genre, language, effective_desde, effective_hasta)
                 return _to_peliculas_json_schema(enriched)
 
+            print("🟦 Sin resultados en YouTube. Probando resolver externo por TMDb...")
+            external_results = await external_stream_fallback(effective_text.strip())
+            if external_results:
+                try:
+                    enriched = await asyncio.wait_for(
+                        enrich_results_with_tmdb(external_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
+                        timeout=4.0,
+                    )
+                except asyncio.TimeoutError:
+                    print("⚠️  /search resolver externo enrichment timeout")
+                    enriched = _format_results_without_apis(external_results)
+                if any([effective_year, effective_genre, language, effective_desde, effective_hasta]):
+                    enriched = _apply_advanced_filters(enriched, effective_year, effective_genre, language, effective_desde, effective_hasta)
+                return _to_peliculas_json_schema(enriched)
+
         try:
             enriched = await asyncio.wait_for(
                 enrich_results_with_tmdb(final_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
@@ -4777,6 +4811,232 @@ def _youtube_candidate_score(base_query: str, title: str, channel: str, duration
             score -= 420.0
 
     return score
+
+
+def _build_external_stream_endpoint(media_type: str, tmdb_id) -> str | None:
+    if not EXTERNAL_STREAM_API_BASE or not tmdb_id or media_type not in ("movie", "tv"):
+        return None
+    try:
+        path = EXTERNAL_STREAM_API_PATH_TEMPLATE.format(
+            type=media_type,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            tmdbId=tmdb_id,
+        )
+    except Exception:
+        path = f"/api/streams/{media_type}/{tmdb_id}"
+    if not isinstance(path, str) or not path.strip():
+        path = f"/api/streams/{media_type}/{tmdb_id}"
+    return urljoin(f"{EXTERNAL_STREAM_API_BASE}/", path.lstrip("/"))
+
+
+def _looks_like_playable_stream_url(value: str, base_host: str | None = None) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = urlparse(value.strip())
+    except Exception:
+        return False
+
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    media_tokens = (".mp4", ".m4v", ".webm", ".mov", ".mkv", ".avi", ".m3u8", ".mpd")
+    proxy_tokens = ("/m3u8-proxy", "/ts-proxy", "/sub-proxy", "/stream/")
+
+    if any(token in path for token in media_tokens):
+        return True
+    if any(token in query for token in ("mp4", "m3u8", "playlist", "manifest")):
+        return True
+    if any(token in path for token in proxy_tokens):
+        return (not base_host) or host == base_host
+    return False
+
+
+def _external_stream_quality_score(value) -> int:
+    txt = str(value or "").lower()
+    m = re.search(r"(2160|1440|1080|900|720|576|540|480|360)", txt)
+    if m:
+        return int(m.group(1))
+    if "4k" in txt:
+        return 2160
+    if "hd" in txt:
+        return 720
+    return 0
+
+
+def _extract_external_stream_candidates(payload) -> list[dict]:
+    items = []
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        if any(k in payload for k in ("url", "stream_url", "file", "src")):
+            items = [payload]
+        else:
+            for key in ("streams", "sources", "results", "data", "items"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+                if isinstance(value, dict):
+                    nested = value.get("streams") or value.get("sources") or value.get("results")
+                    if isinstance(nested, list):
+                        items = nested
+                        break
+
+    base_host = ""
+    try:
+        base_host = urlparse(EXTERNAL_STREAM_API_BASE).netloc.lower()
+    except Exception:
+        base_host = ""
+
+    preferred = set(EXTERNAL_STREAM_API_PREFERRED_PROVIDERS)
+    candidates = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+
+        url = raw.get("url") or raw.get("stream_url") or raw.get("file") or raw.get("src") or raw.get("link")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        url = url.strip()
+        if url.startswith("//"):
+            url = f"https:{url}"
+        elif url.startswith("/"):
+            url = urljoin(f"{EXTERNAL_STREAM_API_BASE}/", url.lstrip("/"))
+
+        headers = raw.get("headers") or raw.get("requestHeaders") or raw.get("custom_headers") or {}
+        has_headers = isinstance(headers, dict) and bool(headers)
+        if has_headers and not EXTERNAL_STREAM_API_ACCEPT_HEADER_DEPENDENT:
+            continue
+        if not _looks_like_playable_stream_url(url, base_host):
+            continue
+
+        provider = str(raw.get("provider") or raw.get("source") or raw.get("server") or "").strip()
+        quality = str(raw.get("quality") or raw.get("label") or raw.get("resolution") or "").strip()
+        title = str(raw.get("title") or raw.get("name") or raw.get("label") or provider or "Stream").strip()
+
+        score = float(_external_stream_quality_score(quality))
+        path_l = (urlparse(url).path or "").lower()
+        if ".mp4" in path_l:
+            score += 400.0
+        elif ".m4v" in path_l:
+            score += 320.0
+        elif ".m3u8" in path_l:
+            score += 220.0
+        elif ".mpd" in path_l:
+            score += 180.0
+        else:
+            score += 40.0
+        if provider and provider.lower() in preferred:
+            score += 140.0
+        if not has_headers:
+            score += 70.0
+        if base_host and urlparse(url).netloc.lower() == base_host:
+            score += 35.0
+
+        candidates.append({
+            "url": url,
+            "provider": provider or "external",
+            "quality": quality or "n/a",
+            "title": title,
+            "headers": headers if has_headers else {},
+            "score": score,
+        })
+
+    candidates.sort(key=lambda item: item.get("score") or 0, reverse=True)
+    return candidates[:EXTERNAL_STREAM_API_MAX_RESULTS]
+
+
+async def external_stream_fallback(search_query: str) -> list:
+    if not EXTERNAL_STREAM_API_BASE or not TMDB_API_KEY:
+        return []
+
+    query_title, year = _build_tmdb_query_from_title(search_query or "")
+    query_title = (query_title or search_query or "").strip()
+    if not query_title:
+        return []
+
+    ck = _cache_key_from_query(query_title, year)
+    cached_data, cached_status = await _ai_cache_get("stream_api", ck)
+    if cached_status in ("ok", "none", "429", "err"):
+        if cached_status == "ok" and isinstance(cached_data, list):
+            return cached_data
+        if cached_status in ("none", "429"):
+            return []
+        if cached_status == "err" and cached_data is None:
+            return []
+
+    timeout = httpx.Timeout(connect=2.5, read=EXTERNAL_STREAM_API_TIMEOUT_S, write=2.5, pool=1.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+            tmdb_meta = await _tmdb_search_and_details(http, query_title, year)
+            if not isinstance(tmdb_meta, dict):
+                await _ai_cache_set("stream_api", ck, None, "none")
+                return []
+
+            tmdb_id = tmdb_meta.get("tmdb_id")
+            media_type = tmdb_meta.get("media_type")
+            endpoint = _build_external_stream_endpoint(media_type, tmdb_id)
+            if not endpoint:
+                await _ai_cache_set("stream_api", ck, None, "none")
+                return []
+
+            headers = {"Accept": "application/json"}
+            if EXTERNAL_STREAM_API_AUTH_HEADER and EXTERNAL_STREAM_API_AUTH_TOKEN:
+                headers[EXTERNAL_STREAM_API_AUTH_HEADER] = EXTERNAL_STREAM_API_AUTH_TOKEN
+
+            response = await http.get(endpoint, headers=headers)
+            if response.status_code == 429:
+                await _ai_cache_set("stream_api", ck, None, "429")
+                return []
+            if response.status_code in (204, 404):
+                await _ai_cache_set("stream_api", ck, None, "none")
+                return []
+            response.raise_for_status()
+
+            try:
+                payload = response.json()
+            except Exception:
+                await _ai_cache_set("stream_api", ck, None, "err")
+                return []
+
+        candidates = _extract_external_stream_candidates(payload)
+        if not candidates:
+            await _ai_cache_set("stream_api", ck, None, "none")
+            return []
+
+        best = candidates[0]
+        result = {
+            "id":                f"external:{tmdb_id}:{best.get('provider') or 'resolver'}",
+            "title":             tmdb_meta.get("titulo") or query_title,
+            "size":              " · ".join(part for part in [best.get("quality"), best.get("provider")] if part and part != "n/a") or "n/a",
+            "stream_url":        best.get("url"),
+            "imagen_url":        tmdb_meta.get("imagen_url") or "",
+            "source":            "external_stream_api",
+            "tmdb_id":           tmdb_id,
+            "media_type":        media_type,
+            "external_provider": best.get("provider") or "external",
+            "quality":           best.get("quality") or "n/a",
+        }
+        print(
+            f"🟪 Resolver externo OK: {result['title']} "
+            f"[{result.get('external_provider')}] {result.get('quality')}"
+        )
+        await _ai_cache_set("stream_api", ck, [result], "ok")
+        return [result]
+    except httpx.HTTPStatusError as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        await _ai_cache_set("stream_api", ck, None, "429" if code == 429 else "err")
+        print(f"⚠️  Error usando resolver externo TMDb ({query_title}): {e}")
+        return []
+    except Exception as e:
+        await _ai_cache_set("stream_api", ck, None, "err")
+        print(f"⚠️  Error usando resolver externo TMDb ({query_title}): {e}")
+        return []
 
 
 async def archive_org_fallback(search_query: str) -> list:
