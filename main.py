@@ -70,7 +70,7 @@ GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
 # --- TMDB ---
 TMDB_API_KEY       = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_API_BASE      = "https://api.themoviedb.org/3"
-TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w500"
+TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w780"
 
 # --- RESOLVER EXTERNO POR TMDB (opcional, recomendado self-hosted) ---
 EXTERNAL_STREAM_API_BASE = os.getenv("EXTERNAL_STREAM_API_BASE", "").strip().rstrip("/")
@@ -393,6 +393,71 @@ def _db_search_set(query_key: str, results: list) -> None:
         print(f"⚠️  Error guardando caché de búsqueda: {_e}")
 
 
+def _db_init_metadata_cache() -> None:
+    """Crea la tabla de metadatos enriquecidos en SQLite si no existe."""
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS metadata_cache (
+                query_key     TEXT PRIMARY KEY,
+                metadata_json TEXT NOT NULL,
+                updated_at    REAL NOT NULL,
+                is_complete   INTEGER NOT NULL DEFAULT 0,
+                tmdb_id       TEXT,
+                media_type    TEXT
+            )
+        """)
+        con.commit()
+        con.close()
+        print(f"✅ BD caché de metadatos inicializada: {DB_PATH}")
+    except Exception as _e:
+        print(f"⚠️  Error inicializando BD de metadatos: {_e}")
+
+
+def _db_metadata_get(query_key: str):
+    """Recupera metadatos enriquecidos desde SQLite."""
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = con.execute(
+            "SELECT metadata_json FROM metadata_cache WHERE query_key = ?",
+            (query_key,),
+        )
+        row = cur.fetchone()
+        con.close()
+        if row is None:
+            return None
+        data = json.loads(row[0])
+        return data if isinstance(data, dict) else None
+    except Exception as _e:
+        print(f"⚠️  Error leyendo caché de metadatos: {_e}")
+        return None
+
+
+def _db_metadata_set(query_key: str, metadata: dict) -> None:
+    """Guarda en SQLite únicamente metadatos suficientemente completos."""
+    if not query_key or not isinstance(metadata, dict):
+        return
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        con.execute(
+            """INSERT OR REPLACE INTO metadata_cache
+               (query_key, metadata_json, updated_at, is_complete, tmdb_id, media_type)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                query_key,
+                json.dumps(metadata, ensure_ascii=False),
+                time.time(),
+                1 if _meta_is_full_enough_for_persist(metadata) else 0,
+                str(metadata.get("tmdb_id") or "") or None,
+                str(metadata.get("media_type") or "") or None,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception as _e:
+        print(f"⚠️  Error guardando caché de metadatos: {_e}")
+
+
 # ---------------------------------------------------------------------------
 # ✅ SEPARACIÓN C: CACHÉ DE CATÁLOGO EN SQLITE (proceso de fondo independiente)
 # ---------------------------------------------------------------------------
@@ -447,6 +512,83 @@ def _db_catalog_set(items: list) -> None:
         print(f"✅ Catálogo guardado en SQLite: {len(items)} items")
     except Exception as _e:
         print(f"⚠️  Error guardando caché de catálogo: {_e}")
+
+
+# ---------------------------------------------------------------------------
+# 🗑️ LIMPIEZA AUTOMÁTICA: Eliminar datos SQLite y miniaturas con más de 15 días
+# ---------------------------------------------------------------------------
+DATA_CLEANUP_INTERVAL_S = 15 * 24 * 3600  # 15 días en segundos
+
+
+def _db_cleanup_old_data() -> None:
+    """
+    Elimina registros SQLite más antiguos de 15 días en todas las tablas de caché.
+    Mantiene el sistema actualizado y evita acumulación de contenido obsoleto.
+    """
+    cutoff = time.time() - DATA_CLEANUP_INTERVAL_S
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        # Limpiar caché de búsquedas
+        cur = con.execute("DELETE FROM search_cache WHERE created_at < ?", (cutoff,))
+        deleted_search = cur.rowcount
+        # Limpiar caché de metadatos
+        cur = con.execute("DELETE FROM metadata_cache WHERE updated_at < ?", (cutoff,))
+        deleted_meta = cur.rowcount
+        # Limpiar caché de catálogo si tiene más de 15 días
+        cur = con.execute("DELETE FROM catalog_raw_cache WHERE updated_at < ?", (cutoff,))
+        deleted_catalog = cur.rowcount
+        con.commit()
+        con.close()
+        total = deleted_search + deleted_meta + deleted_catalog
+        if total > 0:
+            print(
+                f"🗑️  Limpieza SQLite (15d): "
+                f"búsquedas={deleted_search} metadatos={deleted_meta} catálogo={deleted_catalog} total={total}"
+            )
+    except Exception as _e:
+        print(f"⚠️  Error en limpieza SQLite: {_e}")
+
+
+def _cleanup_old_thumbnails() -> None:
+    """
+    Elimina archivos de miniaturas del disco con más de 15 días de antigüedad.
+    Libera espacio en el volumen persistente de Fly.io.
+    """
+    if not os.path.isdir(THUMBS_DIR):
+        return
+    cutoff = time.time() - DATA_CLEANUP_INTERVAL_S
+    deleted = 0
+    errors  = 0
+    try:
+        for fname in os.listdir(THUMBS_DIR):
+            fpath = os.path.join(THUMBS_DIR, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    deleted += 1
+            except Exception:
+                errors += 1
+        if deleted > 0:
+            print(f"🗑️  Limpieza miniaturas (15d): {deleted} archivos eliminados ({errors} errores)")
+    except Exception as _e:
+        print(f"⚠️  Error en limpieza de miniaturas: {_e}")
+
+
+async def _data_cleanup_background_task() -> None:
+    """
+    Tarea de fondo que ejecuta la limpieza de datos cada 15 días.
+    Se inicia junto con el servidor y no bloquea el arranque.
+    """
+    print(f"🗑️  [Limpieza] Tarea iniciada. Intervalo: {DATA_CLEANUP_INTERVAL_S // 86400} días")
+    # Primera limpieza al inicio (suave, sin bloquear)
+    await asyncio.sleep(60)  # Esperar 1 minuto tras el arranque
+    while True:
+        try:
+            await asyncio.to_thread(_db_cleanup_old_data)
+            await asyncio.to_thread(_cleanup_old_thumbnails)
+        except Exception as _ex:
+            print(f"❌ [Limpieza] Error inesperado: {_ex}")
+        await asyncio.sleep(DATA_CLEANUP_INTERVAL_S)
 
 
 def _db_search_cache_key(text, genre, year, language, desde, hasta) -> str:
@@ -575,6 +717,10 @@ def _detect_mime_type(data: bytes) -> str:
 def _crop_cover_to_poster(image_data: bytes) -> bytes:
     if not _PIL_AVAILABLE or not image_data:
         return image_data
+    # 🔧 FIX: Rechazar datos de imagen menores a 5KB (imágenes vacías/corruptas)
+    if len(image_data) < 5000:
+        print(f"   ⚠️  Imagen descartada por tamaño insuficiente ({len(image_data)} bytes < 5KB)")
+        return image_data
     try:
         img = _PIL_Image.open(io.BytesIO(image_data))
         if img.mode != "RGB":
@@ -602,7 +748,7 @@ def _crop_cover_to_poster(image_data: bytes) -> bytes:
         # para mejorar la visibilidad en la interfaz, independientemente
         # de si la imagen está oscura o no.
         try:
-            from PIL import ImageStat, ImageEnhance
+            from PIL import ImageStat, ImageEnhance, ImageFilter
             stat = ImageStat.Stat(img)
             bands = stat.mean
             mean_brightness = sum(bands[:3]) / min(3, len(bands))
@@ -618,12 +764,17 @@ def _crop_cover_to_poster(image_data: bytes) -> bytes:
                 print(f"   🌟 Brillo extra aplicado: media={mean_brightness:.1f} extra={extra_factor:.2f}")
             else:
                 print(f"   ✨ Brillo base +12% aplicado: media={mean_brightness:.1f}")
+
+            # 🖼️ MEJORA DE CALIDAD: Aplicar nitidez y contraste para imagen más nítida y atractiva
+            img = ImageEnhance.Sharpness(img).enhance(1.4)   # +40% nitidez
+            img = ImageEnhance.Contrast(img).enhance(1.15)   # +15% contraste
+            img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=60, threshold=3))  # enfoque fino
         except Exception:
             pass
 
-        # ✅ MEJORA: Calidad 92 (antes 88) para reducir artefactos de compresión
+        # ✅ MEJORA: Calidad 95 (antes 92) para máxima calidad visual
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=92, optimize=True)
+        img.save(out, format="JPEG", quality=95, optimize=True, subsampling=0)
         return out.getvalue()
     except Exception as e:
         print(f"⚠️  Error en _crop_cover_to_poster: {e}")
@@ -844,6 +995,40 @@ def _meta_is_full_enough_for_persist(meta: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+def _meta_needs_quality_backfill(meta: dict) -> bool:
+    if not isinstance(meta, dict):
+        return True
+    required_keys = ("titulo", "titulo_original", "imagen_url", "sinopsis", "año")
+    for key in required_keys:
+        value = meta.get(key)
+        if key == "imagen_url":
+            if _is_placeholder_image(value) or not (isinstance(value, str) and value.strip()):
+                return True
+            continue
+        if value is None or str(value).strip() == "":
+            return True
+    return False
+
+
+def _should_require_tmdb_validation(text, genre=None, canal=None, desde=None, hasta=None) -> bool:
+    txt = normalize_title(text or "")
+    if not txt or genre or canal or desde or hasta:
+        return False
+
+    generic_terms = {
+        "accion", "anime", "animacion", "aventura", "comedia", "cristianas",
+        "documental", "drama", "dramas", "infantil", "infantiles", "novela",
+        "novelas", "pelicula", "peliculas", "religiosas", "serie", "series",
+        "suspenso", "terror", "thriller"
+    }
+    words = [w for w in txt.split() if w]
+    if not words:
+        return False
+    if len(words) <= 3 and any(w in generic_terms for w in words):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1261,8 +1446,9 @@ async def lifespan(app: FastAPI):
     app.state.last_persist_save_ts = 0.0
     app.state.telegram_bootstrap_task = None
 
-    # ✅ Inicializar caché de búsquedas SQLite (anti-flood)
+    # ✅ Inicializar cachés SQLite persistentes
     _db_init_search_cache()
+    _db_init_metadata_cache()
     # ✅ SEPARACIÓN C: Inicializar caché de catálogo SQLite
     _db_init_catalog_cache()
 
@@ -1373,6 +1559,9 @@ async def lifespan(app: FastAPI):
 
         # ✅ SEPARACIÓN C: Iniciar tarea de fondo para actualizar catálogo
         asyncio.create_task(_catalog_background_updater())
+
+        # 🗑️ Iniciar tarea de limpieza automática de datos cada 15 días
+        asyncio.create_task(_data_cleanup_background_task())
 
     async def _bootstrap_telegram():
         print("📡 Conectando a Telegram en segundo plano...")
@@ -2721,6 +2910,7 @@ async def _tmdb_search_and_details(
             d.raise_for_status()
             details = d.json()
             title = details.get("title") or details.get("original_title") or query_title
+            original_title = details.get("original_title") or details.get("title") or query_title
             poster_path = details.get("poster_path")
             backdrop_path = details.get("backdrop_path")
             overview = details.get("overview")
@@ -2739,6 +2929,7 @@ async def _tmdb_search_and_details(
             d.raise_for_status()
             details = d.json()
             title = details.get("name") or details.get("original_name") or query_title
+            original_title = details.get("original_name") or details.get("name") or query_title
             poster_path = details.get("poster_path")
             backdrop_path = details.get("backdrop_path")
             overview = details.get("overview")
@@ -2761,6 +2952,7 @@ async def _tmdb_search_and_details(
             "tmdb_id": tmdb_id,
             "media_type": media_type,
             "titulo": title,
+            "titulo_original": original_title,
             "imagen_url": image_url,
             "sinopsis": overview,
             "fecha_lanzamiento": release_date,
@@ -3427,6 +3619,7 @@ def _merge_metadata_with_kg(
         "tmdb_id":               tmdb_id,
         "media_type":            media_type,
         "titulo":                pick("titulo") or fallback_title or "Película",
+        "titulo_original":       pick("titulo_original") or pick("titulo") or fallback_title or "Película",
         "imagen_url":            pick_image(),
         "sinopsis":              pick("sinopsis"),
         "fecha_lanzamiento":     pick("fecha_lanzamiento"),
@@ -3447,8 +3640,76 @@ def _merge_metadata_with_kg(
 # ---------------------------------------------------------------------------
 async def _meta_cache_get(cache_key: str):
     meta_cache = getattr(app.state, "meta_cache", None)
-    if not isinstance(meta_cache, dict): return None
-    return meta_cache.get(cache_key)
+    if isinstance(meta_cache, dict):
+        meta = meta_cache.get(cache_key)
+        if isinstance(meta, dict):
+            return meta
+
+    meta = await asyncio.to_thread(_db_metadata_get, cache_key)
+    if isinstance(meta, dict) and isinstance(meta_cache, dict):
+        async with app.state.meta_cache_lock:
+            app.state.meta_cache[cache_key] = meta
+        return meta
+    return meta if isinstance(meta, dict) else None
+
+
+async def _resolve_complete_metadata(
+    http,
+    query_title: str,
+    year,
+    fallback_title: str,
+    fallback_year,
+    use_gemini: bool = False,
+    looks_like_tv: bool = False,
+    seed_tmdb=None,
+) -> dict:
+    kg = tvmaze = archive = gemini_data = None
+    tmdb = seed_tmdb if isinstance(seed_tmdb, dict) else None
+
+    if not isinstance(tmdb, dict) and TMDB_API_KEY:
+        tmdb = await _tmdb_search_and_details(http, query_title, year)
+
+    if GOOGLE_KG_API_KEY and ((not isinstance(tmdb, dict)) or _meta_needs_quality_backfill(tmdb)):
+        kg = await _google_kg_search(http, query_title, year)
+
+    if looks_like_tv and not isinstance(tmdb, dict) and not isinstance(kg, dict):
+        tvmaze = await _tvmaze_fetch(http, query_title, year)
+        if isinstance(tvmaze, dict):
+            print(f"   📌 TVMaze priorizada por heurística TV/novela para '{query_title}'")
+
+    meta = _merge_metadata_with_kg(
+        kg, tmdb, tvmaze, archive,
+        fallback_title=fallback_title,
+        fallback_year=fallback_year,
+    )
+
+    if use_gemini and GEMINI_API_KEY and _meta_needs_quality_backfill(meta):
+        gemini_data = await _gemini_complete_metadata(
+            http, fallback_title or query_title, year, meta
+        )
+        if isinstance(gemini_data, dict):
+            for _gk in [
+                "titulo", "titulo_original", "imagen_url", "sinopsis", "generos", "año",
+                "idioma_original", "duracion", "fecha_lanzamiento",
+                "descripcion_detallada", "puntuacion", "popularidad"
+            ]:
+                if not meta.get(_gk) and gemini_data.get(_gk):
+                    meta[_gk] = gemini_data[_gk]
+            chain = list(meta.get("_metadata_source_chain") or [])
+            if "gemini" not in chain:
+                chain.append("gemini")
+            meta["_metadata_source_chain"] = chain or ["gemini"]
+            meta["_meta_priority_version"] = METADATA_PRIORITY_VERSION
+
+    if not meta.get("titulo_original"):
+        meta["titulo_original"] = (
+            (tmdb.get("titulo_original") if isinstance(tmdb, dict) else None)
+            or meta.get("titulo")
+            or fallback_title
+            or "Película"
+        )
+
+    return meta
 
 
 async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
@@ -3456,6 +3717,8 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
         return
     metadata.pop("stream_url",   None)
     metadata.pop("pelicula_url", None)
+
+    persist_sqlite = _meta_is_full_enough_for_persist(metadata)
 
     async with app.state.meta_cache_lock:
         app.state.meta_cache[cache_key] = metadata
@@ -3470,7 +3733,7 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
             app.state.meta_cache_dirty = False
             app.state.last_persist_save_ts = time.time()
 
-        if _meta_is_full_enough_for_persist(metadata):
+        if persist_sqlite:
             now = time.time()
             last_ts = float(getattr(app.state, "last_persist_save_ts", 0.0) or 0.0)
             if (now - last_ts) > 30.0:
@@ -3479,6 +3742,9 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
                 await _save_persistent_cache(to_save)
                 app.state.meta_cache_dirty = False
                 app.state.last_persist_save_ts = now
+
+    if persist_sqlite:
+        await asyncio.to_thread(_db_metadata_set, cache_key, dict(metadata))
 
 
 # ---------------------------------------------------------------------------
@@ -3492,6 +3758,7 @@ async def enrich_results_with_tmdb(
     catalog_mode: bool = False,
 ) -> list:
     request_cache: dict = {}
+    request_inflight: dict = {}
     semaphore     = asyncio.Semaphore(MAX_CONCURRENCY)
     new_counter   = {"n": 0}
     limit_new     = max_new if max_new is not None else len(results)
@@ -3529,80 +3796,65 @@ async def enrich_results_with_tmdb(
                 )
 
                 if (not meta) or need_repair:
-                    if new_counter["n"] >= limit_new:
-                        pelicula_url = r.get("stream_url") or ""
-                        thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
-                        archive_img = r.get("imagen_url") or _archive_thumb_from_stream_url(pelicula_url)
-                        yt    = _youtube_thumb_from_stream_url(pelicula_url)
-                        img_final = thumb or archive_img or yt or ""
-                        return {
-                            "titulo":                fallback_title or "Película",
-                            "imagen_url":            img_final,
-                            "pelicula_url":          pelicula_url,
-                            "descripcion":           "n/a",
-                            "fecha_lanzamiento":     "n/a",
-                            "duracion":              "n/a",
-                            "idioma_original":       "n/a",
-                            "popularidad":           0,
-                            "puntuacion":            0,
-                            "generos":               "n/a",
-                            "año":                   fallback_year_title or year or "n/a",
-                            "id":                    r.get("id"),
-                            "size":                  _nn_str(r.get("size"), "n/a"),
-                            "descripcion_detallada": "n/a",
-                        }
+                    async def _fetch_meta_once() -> dict:
+                        if new_counter["n"] >= limit_new:
+                            pelicula_url = r.get("stream_url") or ""
+                            thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
+                            archive_img = r.get("imagen_url") or _archive_thumb_from_stream_url(pelicula_url)
+                            yt = _youtube_thumb_from_stream_url(pelicula_url)
+                            img_final = thumb or archive_img or yt or ""
+                            return {
+                                "titulo":                fallback_title or "Película",
+                                "titulo_original":       fallback_title or "Película",
+                                "imagen_url":            img_final,
+                                "pelicula_url":          pelicula_url,
+                                "descripcion":           "n/a",
+                                "fecha_lanzamiento":     "n/a",
+                                "duracion":              "n/a",
+                                "idioma_original":       "n/a",
+                                "popularidad":           0,
+                                "puntuacion":            0,
+                                "generos":               "n/a",
+                                "año":                   fallback_year_title or year or "n/a",
+                                "id":                    r.get("id"),
+                                "size":                  _nn_str(r.get("size"), "n/a"),
+                                "descripcion_detallada": "n/a",
+                            }
 
-                    new_counter["n"] += 1
+                        new_counter["n"] += 1
+                        looks_like_tv = _looks_like_series_or_novela(f"{title_raw} {query_title}")
 
-                    kg = tmdb = tvmaze = archive = gemini_data = None
-                    looks_like_tv = _looks_like_series_or_novela(f"{title_raw} {query_title}")
+                        async with semaphore:
+                            resolved = await _resolve_complete_metadata(
+                                http,
+                                query_title=query_title,
+                                year=year,
+                                fallback_title=fallback_title,
+                                fallback_year=fallback_year_title or year,
+                                use_gemini=use_gemini,
+                                looks_like_tv=looks_like_tv,
+                            )
 
-                    async with semaphore:
-                        tmdb = await (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
-
-                        if not isinstance(tmdb, dict) and GOOGLE_KG_API_KEY:
-                            kg = await _google_kg_search(http, query_title, year)
-
-                        if not isinstance(tmdb, dict) and not isinstance(kg, dict):
-                            tvmaze = await _tvmaze_fetch(http, query_title, year)
-                            if isinstance(tvmaze, dict) and looks_like_tv:
-                                print(f"   📌 TVMaze priorizada por heurística TV/novela para '{query_title}'")
-
-                    meta = _merge_metadata_with_kg(
-                        kg, tmdb, tvmaze, archive,
-                        fallback_title=fallback_title,
-                        fallback_year=fallback_year_title or year,
-                    )
-
-                    if (
-                        use_gemini and GEMINI_API_KEY and
-                        not isinstance(tmdb, dict) and
-                        not isinstance(kg, dict) and
-                        not isinstance(tvmaze, dict)
-                    ):
-                        gemini_data = await _gemini_complete_metadata(
-                            http, fallback_title, year, meta
+                        debug_chain = " > ".join(resolved.get("_metadata_source_chain") or []) or "fallback_local"
+                        print(
+                            f"   ✅ Enriquecimiento → '{resolved.get('titulo', '?')}' "
+                            f"fuentes={debug_chain} "
+                            f"img={'✓' if resolved.get('imagen_url') else '✗'} "
+                            f"sinopsis={'✓' if resolved.get('sinopsis') else '✗'} "
+                            f"año={resolved.get('año', '?')}"
                         )
-                        if isinstance(gemini_data, dict):
-                            for _gk in [
-                                "titulo", "imagen_url", "sinopsis", "generos", "año",
-                                "idioma_original", "duracion", "fecha_lanzamiento",
-                                "descripcion_detallada", "puntuacion", "popularidad"
-                            ]:
-                                if not meta.get(_gk) and gemini_data.get(_gk):
-                                    meta[_gk] = gemini_data[_gk]
-                            meta["_meta_priority_version"] = METADATA_PRIORITY_VERSION
-                            meta["_metadata_source_chain"] = ["gemini"]
+                        await _meta_cache_set(ck, resolved)
+                        return resolved
 
-                    debug_chain = " > ".join(meta.get("_metadata_source_chain") or []) or "fallback_local"
-                    print(
-                        f"   ✅ Enriquecimiento → '{meta.get('titulo', '?')}' "
-                        f"fuentes={debug_chain} "
-                        f"img={'✓' if meta.get('imagen_url') else '✗'} "
-                        f"sinopsis={'✓' if meta.get('sinopsis') else '✗'} "
-                        f"año={meta.get('año', '?')}"
-                    )
-                    await _meta_cache_set(ck, meta)
+                    inflight = request_inflight.get(ck)
+                    if inflight is None:
+                        inflight = asyncio.create_task(_fetch_meta_once())
+                        request_inflight[ck] = inflight
+                    try:
+                        meta = await inflight
+                    finally:
+                        if request_inflight.get(ck) is inflight:
+                            request_inflight.pop(ck, None)
 
                 request_cache[ck] = meta
 
@@ -3781,6 +4033,61 @@ async def search(
     if _cached_results is not None:
         print(f"⚡ Caché SQLite hit → devolviendo {len(_cached_results)} resultado(s) sin consultar Telegram")
         return _cached_results
+
+    tmdb_gate_meta = None
+    tmdb_gate_required = _should_require_tmdb_validation(
+        effective_text,
+        genre=effective_genre,
+        canal=canal,
+        desde=effective_desde,
+        hasta=effective_hasta,
+    )
+
+    if tmdb_gate_required and effective_text:
+        gate_query_title, gate_year = _build_tmdb_query_from_title(effective_text.strip())
+        gate_query_title = (gate_query_title or effective_text or "").strip()
+        gate_year = gate_year or effective_year
+        gate_ck = _cache_key_from_query(gate_query_title, gate_year)
+
+        cached_gate_meta = await _meta_cache_get(gate_ck)
+        if isinstance(cached_gate_meta, dict) and cached_gate_meta.get("tmdb_id"):
+            tmdb_gate_meta = cached_gate_meta
+            print(
+                f"✅ Validación TMDb previa (cache) → '{tmdb_gate_meta.get('titulo') or gate_query_title}' "
+                f"id={tmdb_gate_meta.get('tmdb_id')}"
+            )
+        else:
+            gate_timeout = httpx.Timeout(connect=2.0, read=3.5, write=2.0, pool=1.0)
+            async with httpx.AsyncClient(timeout=gate_timeout) as gate_http:
+                seed_tmdb = await _tmdb_search_and_details(gate_http, gate_query_title, gate_year)
+                _, tmdb_status = await _ai_cache_get("tmdb", gate_ck)
+
+                if tmdb_status == "none":
+                    print(f"⛔ TMDb no encontró '{gate_query_title}'. Se cancela la búsqueda de reproducción para ahorrar recursos.")
+                    await asyncio.to_thread(_db_search_set, _search_cache_key, [])
+                    return []
+
+                if isinstance(seed_tmdb, dict):
+                    tmdb_gate_meta = await _resolve_complete_metadata(
+                        gate_http,
+                        query_title=gate_query_title,
+                        year=gate_year,
+                        fallback_title=gate_query_title,
+                        fallback_year=gate_year or effective_year,
+                        use_gemini=True,
+                        looks_like_tv=_looks_like_series_or_novela(effective_text.strip()),
+                        seed_tmdb=seed_tmdb,
+                    )
+                    await _meta_cache_set(gate_ck, tmdb_gate_meta)
+                    print(
+                        f"✅ Validación TMDb previa OK → '{tmdb_gate_meta.get('titulo') or gate_query_title}' "
+                        f"id={tmdb_gate_meta.get('tmdb_id')}"
+                    )
+                else:
+                    print(
+                        f"⚠️  Validación TMDb no concluyente para '{gate_query_title}' "
+                        f"(estado={tmdb_status or 'desconocido'}). Se mantiene el flujo actual."
+                    )
 
     try:
         def _dedupe_raw_results(items: list) -> list:
@@ -4188,8 +4495,8 @@ async def catalog():
                 print("⚠️  /catalog: pool vacío — background aún no completó primera actualización")
                 return []
 
-        # ✅ OPT: Muestra máxima de 15 resultados para respuesta rápida y menor carga
-        sample_size = min(15, len(pool))
+        # 📺 /catalog: Devuelve exactamente 3 películas aleatorias del pool
+        sample_size = min(3, len(pool))
         sample      = random.sample(pool, sample_size) if sample_size > 0 else []
 
         try:
@@ -4393,19 +4700,9 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
 
         thumb_data: bytes | None = None
 
-        # ✅ PRIORIDAD 1 — póster remoto (TMDb; si falta, miniatura de Archive.org)
-        if not thumb_data:
-            try:
-                tmdb_poster = await _fetch_tmdb_poster_bytes_for_message(message)
-                if tmdb_poster and len(tmdb_poster) > 200:
-                    thumb_data = tmdb_poster
-            except Exception as _tmdb_ex:
-                print(f"   ⚠️  Imagen remota no disponible para msg {message_id}: {_tmdb_ex}")
-
-        # ✅ PRIORIDAD 2 — miniatura nativa desde message.document.thumbs
-        # Intenta primero obtener la imagen completa (thumb=-1 = mayor resolución disponible),
-        # y si falla, usa el objeto PhotoSize de mayor resolución como fallback.
-        # Es SIEMPRE específica del video correcto → va PRIMERO para evitar mezclar thumbnails.
+        # ✅ PRIORIDAD 1 — miniatura nativa desde message.document.thumbs
+        # Siempre específica del video correcto → PRIMERA para garantizar coherencia miniatura↔video.
+        # Se usa un umbral mínimo de 5KB para descartar stubs vacíos (aparecen como 0KB en logs).
         if not thumb_data and message.document and message.document.thumbs:
             best = _get_best_native_thumb(message.document.thumbs)
             if best:
@@ -4415,9 +4712,11 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                         active_client.download_media(message.document, bytes, thumb=-1),
                         timeout=3.0,
                     )
-                    if raw and len(raw) > 200:
+                    if raw and len(raw) > 5000:  # 🔧 FIX: mínimo 5KB para filtrar stubs vacíos
                         thumb_data = raw
                         print(f"   📎 Miniatura ALTA RES (document thumb=-1) para msg {message_id} [{len(raw)//1024}KB]")
+                    elif raw:
+                        print(f"   ⚠️  Stub vacío descartado (document thumb=-1) msg {message_id} [{len(raw)} bytes]")
                 except Exception:
                     thumb_data = None
                 # Intento 2 (fallback): descargar usando el objeto PhotoSize de mayor resolución
@@ -4427,13 +4726,15 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                             active_client.download_media(message.document, bytes, thumb=best),
                             timeout=3.0,
                         )
-                        if raw and len(raw) > 200:
+                        if raw and len(raw) > 5000:  # 🔧 FIX: mínimo 5KB
                             thumb_data = raw
                             print(f"   📎 Miniatura nativa (document.thumbs best) para msg {message_id} [{len(raw)//1024}KB]")
+                        elif raw:
+                            print(f"   ⚠️  Stub vacío descartado (document.thumbs best) msg {message_id} [{len(raw)} bytes]")
                     except Exception:
                         thumb_data = None
 
-        # ✅ PRIORIDAD 3 — miniatura nativa desde message.video.thumbs
+        # ✅ PRIORIDAD 2 — miniatura nativa desde message.video.thumbs
         if not thumb_data:
             video_obj = getattr(message, "video", None)
             if video_obj and hasattr(video_obj, "thumbs") and video_obj.thumbs:
@@ -4445,9 +4746,11 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                             active_client.download_media(video_obj, bytes, thumb=-1),
                             timeout=3.0,
                         )
-                        if raw and len(raw) > 200:
+                        if raw and len(raw) > 5000:  # 🔧 FIX: mínimo 5KB
                             thumb_data = raw
                             print(f"   🎬 Miniatura ALTA RES (video thumb=-1) para msg {message_id} [{len(raw)//1024}KB]")
+                        elif raw:
+                            print(f"   ⚠️  Stub vacío descartado (video thumb=-1) msg {message_id} [{len(raw)} bytes]")
                     except Exception:
                         thumb_data = None
                     # Intento 2 (fallback): objeto PhotoSize
@@ -4457,13 +4760,15 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                                 active_client.download_media(video_obj, bytes, thumb=best),
                                 timeout=3.0,
                             )
-                            if raw and len(raw) > 200:
+                            if raw and len(raw) > 5000:  # 🔧 FIX: mínimo 5KB
                                 thumb_data = raw
                                 print(f"   🎬 Miniatura nativa (video.thumbs best) para msg {message_id} [{len(raw)//1024}KB]")
+                            elif raw:
+                                print(f"   ⚠️  Stub vacío descartado (video.thumbs best) msg {message_id} [{len(raw)} bytes]")
                         except Exception:
                             thumb_data = None
 
-        # ✅ PRIORIDAD 4 — miniatura desde message.media.thumbs (acceso directo al media)
+        # ✅ PRIORIDAD 3 — miniatura desde message.media.thumbs (acceso directo al media)
         if not thumb_data:
             media_obj = getattr(message, "media", None)
             media_thumbs = getattr(media_obj, "thumbs", None) if media_obj else None
@@ -4476,9 +4781,11 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                             active_client.download_media(media_obj, bytes, thumb=-1),
                             timeout=3.0,
                         )
-                        if raw and len(raw) > 200:
+                        if raw and len(raw) > 5000:  # 🔧 FIX: mínimo 5KB
                             thumb_data = raw
                             print(f"   🖼️  Miniatura ALTA RES (media thumb=-1) para msg {message_id} [{len(raw)//1024}KB]")
+                        elif raw:
+                            print(f"   ⚠️  Stub vacío descartado (media thumb=-1) msg {message_id} [{len(raw)} bytes]")
                     except Exception:
                         thumb_data = None
                     # Intento 2 (fallback): objeto PhotoSize
@@ -4488,11 +4795,26 @@ async def get_thumbnail(message_id: int, request: Request, ch: int = 0):
                                 active_client.download_media(media_obj, bytes, thumb=best),
                                 timeout=3.0,
                             )
-                            if raw and len(raw) > 200:
+                            if raw and len(raw) > 5000:  # 🔧 FIX: mínimo 5KB
                                 thumb_data = raw
                                 print(f"   🖼️  Miniatura nativa (media.thumbs best) para msg {message_id} [{len(raw)//1024}KB]")
+                            elif raw:
+                                print(f"   ⚠️  Stub vacío descartado (media.thumbs best) msg {message_id} [{len(raw)} bytes]")
                         except Exception:
                             thumb_data = None
+
+        # ✅ PRIORIDAD 4 — póster remoto (TMDb / Archive.org) como FALLBACK
+        # Se usa SOLO si no hay miniatura nativa disponible en el propio video,
+        # garantizando que primero siempre se intente la imagen correcta del archivo.
+        if not thumb_data:
+            try:
+                tmdb_poster = await _fetch_tmdb_poster_bytes_for_message(message)
+                if tmdb_poster and len(tmdb_poster) > 5000:
+                    thumb_data = tmdb_poster
+                elif tmdb_poster:
+                    print(f"   ⚠️  Póster TMDb descartado por tamaño insuficiente para msg {message_id} [{len(tmdb_poster)} bytes]")
+            except Exception as _tmdb_ex:
+                print(f"   ⚠️  Imagen remota no disponible para msg {message_id}: {_tmdb_ex}")
 
         # ✅ PRIORIDAD 5 — imagen completa desde message.photo (máxima calidad disponible)
         # download_media sin thumb descarga la versión original completa de la foto.
