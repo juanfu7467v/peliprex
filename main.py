@@ -68,7 +68,10 @@ INTERNET_ARCHIVE_MAX_CANDIDATES = max(1, min(8, int(os.getenv("INTERNET_ARCHIVE_
 GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
 
 # --- TMDB ---
-TMDB_API_KEY       = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_API_KEY       = os.getenv("TMDB_API_KEY",   "").strip()
+TMDB_API_KEY_2     = os.getenv("TMDB_API_KEY_2", "").strip()   # ✅ Clave de respaldo 2
+TMDB_API_KEY_3     = os.getenv("TMDB_API_KEY_3", "").strip()   # ✅ Clave de respaldo 3
+TMDB_API_KEY_4     = os.getenv("TMDB_API_KEY_4", "").strip()   # ✅ Clave de respaldo 4
 TMDB_API_BASE      = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w500"
 
@@ -256,6 +259,70 @@ _REQUIRED_CHANNELS = [
     -1001632627579,
     -1001632627579,
 ]
+
+
+# ---------------------------------------------------------------------------
+# 🔑 POOL DE CLAVES TMDB — Rotación automática en caso de error 429
+# ---------------------------------------------------------------------------
+class _TmdbKeyPool:
+    """
+    Gestiona múltiples claves de la API de TMDB.
+    Cuando una clave devuelve HTTP 429 (límite diario superado) se marca
+    como bloqueada y se rota automáticamente a la siguiente clave disponible.
+    El bloqueo temporal se levanta tras COOLDOWN_SECONDS para reintentar.
+    El proceso es completamente transparente: el usuario no ve ningún error.
+    """
+    COOLDOWN_SECONDS: int = 3600  # 1 hora de cooldown por clave bloqueada
+
+    def __init__(self, keys: list):
+        self._keys: list = [k for k in keys if k]  # filtrar claves vacías
+        self._blocked_until: dict = {}              # key → timestamp de desbloqueo
+
+    def _available(self) -> list:
+        """Devuelve claves no bloqueadas en orden de prioridad."""
+        now = time.time()
+        return [k for k in self._keys if now >= self._blocked_until.get(k, 0)]
+
+    def get_key(self):
+        """Obtiene la primera clave disponible, o None si todas están bloqueadas."""
+        available = self._available()
+        return available[0] if available else None
+
+    def get_next_key(self, current_key: str):
+        """Obtiene la siguiente clave disponible distinta a current_key."""
+        available = self._available()
+        others = [k for k in available if k != current_key]
+        return others[0] if others else None
+
+    def report_429(self, key: str) -> None:
+        """Marca una clave como bloqueada por límite de tasa (429)."""
+        if not key:
+            return
+        self._blocked_until[key] = time.time() + self.COOLDOWN_SECONDS
+        suffix = key[-6:] if len(key) >= 6 else key
+        print(
+            f"🔑 TMDB key ...{suffix} bloqueada por 429 — "
+            f"rotando a siguiente clave (cooldown {self.COOLDOWN_SECONDS}s)"
+        )
+
+    def has_keys(self) -> bool:
+        """Retorna True si hay al menos una clave disponible."""
+        return bool(self._available())
+
+    def __bool__(self) -> bool:
+        return self.has_keys()
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+
+# Instancia global del pool (se crea después de leer todas las variables de entorno)
+_tmdb_pool: _TmdbKeyPool = _TmdbKeyPool([
+    TMDB_API_KEY,
+    TMDB_API_KEY_2,
+    TMDB_API_KEY_3,
+    TMDB_API_KEY_4,
+])
 
 
 def _dedupe_channels(channels: list) -> list:
@@ -2651,14 +2718,14 @@ async def _google_kg_search(
 
 
 # ---------------------------------------------------------------------------
-# TMDB
+# TMDB  — usa el pool de claves con rotación automática en caso de 429
 # ---------------------------------------------------------------------------
 async def _tmdb_search_and_details(
     http,
     query_title: str,
     year,
 ):
-    if not TMDB_API_KEY:
+    if not _tmdb_pool:
         return None
 
     ck = _cache_key_from_query(query_title, year)
@@ -2667,7 +2734,9 @@ async def _tmdb_search_and_details(
         if cached_status == "ok" and isinstance(cached_data, dict):
             return cached_data
         if cached_status in ("none", "429"):
-            return None
+            # Si el caché dice 429 pero ahora hay otra clave disponible, ignorar caché
+            if cached_status == "none" or not _tmdb_pool:
+                return None
         if cached_status == "err" and cached_data is None:
             return None
 
@@ -2675,16 +2744,48 @@ async def _tmdb_search_and_details(
         await _ai_cache_set("tmdb", ck, None, "none")
         return None
 
+    # ——— Función interna de petición con reintentos de clave ———
+    async def _do_get(url: str, params: dict):
+        """
+        Realiza GET con la primera clave disponible.
+        Si recibe 429, rota a la siguiente clave y reintenta UNA vez.
+        """
+        key = _tmdb_pool.get_key()
+        if not key:
+            return None, None  # sin claves disponibles
+        params_with_key = dict(params, api_key=key)
+        r = await http.get(url, params=params_with_key)
+        if r.status_code == 429:
+            _tmdb_pool.report_429(key)
+            next_key = _tmdb_pool.get_next_key(key)
+            if next_key:
+                params_with_key = dict(params, api_key=next_key)
+                r = await http.get(url, params=params_with_key)
+                if r.status_code == 429:
+                    _tmdb_pool.report_429(next_key)
+                    # Intentar tercera clave si existe
+                    third_key = _tmdb_pool.get_next_key(next_key)
+                    if third_key and third_key != key:
+                        params_with_key = dict(params, api_key=third_key)
+                        r = await http.get(url, params=params_with_key)
+                        if r.status_code == 429:
+                            _tmdb_pool.report_429(third_key)
+                            return None, None
+                    else:
+                        return None, None
+            else:
+                return None, None
+        return r, params_with_key.get("api_key")
+
     try:
-        params = {
-            "api_key": TMDB_API_KEY,
+        base_params = {
             "query": query_title,
             "include_adult": "false",
             "language": "es-ES",
             "page": 1,
         }
-        r = await http.get(f"{TMDB_API_BASE}/search/multi", params=params)
-        if r.status_code == 429:
+        r, _used_key = await _do_get(f"{TMDB_API_BASE}/search/multi", base_params)
+        if r is None:
             await _ai_cache_set("tmdb", ck, None, "429")
             return None
         r.raise_for_status()
@@ -2712,10 +2813,10 @@ async def _tmdb_search_and_details(
             await _ai_cache_set("tmdb", ck, None, "none")
             return None
 
-        detail_params = {"api_key": TMDB_API_KEY, "language": "es-ES"}
+        detail_base = {"language": "es-ES"}
         if media_type == "movie":
-            d = await http.get(f"{TMDB_API_BASE}/movie/{tmdb_id}", params=detail_params)
-            if d.status_code == 429:
+            d, _ = await _do_get(f"{TMDB_API_BASE}/movie/{tmdb_id}", detail_base)
+            if d is None:
                 await _ai_cache_set("tmdb", ck, None, "429")
                 return None
             d.raise_for_status()
@@ -2732,8 +2833,8 @@ async def _tmdb_search_and_details(
             genres_list = details.get("genres") or []
             tagline = details.get("tagline")
         else:
-            d = await http.get(f"{TMDB_API_BASE}/tv/{tmdb_id}", params=detail_params)
-            if d.status_code == 429:
+            d, _ = await _do_get(f"{TMDB_API_BASE}/tv/{tmdb_id}", detail_base)
+            if d is None:
                 await _ai_cache_set("tmdb", ck, None, "429")
                 return None
             d.raise_for_status()
@@ -3558,7 +3659,7 @@ async def enrich_results_with_tmdb(
                     looks_like_tv = _looks_like_series_or_novela(f"{title_raw} {query_title}")
 
                     async with semaphore:
-                        tmdb = await (_tmdb_search_and_details(http, query_title, year) if TMDB_API_KEY else _noop())
+                        tmdb = await (_tmdb_search_and_details(http, query_title, year) if _tmdb_pool else _noop())
 
                         if not isinstance(tmdb, dict) and GOOGLE_KG_API_KEY:
                             kg = await _google_kg_search(http, query_title, year)
@@ -3847,9 +3948,54 @@ async def search(
         preferred_results_threshold = max(3, min(10, INTERNET_ARCHIVE_MAX_CANDIDATES + 2))
 
         if effective_text:
-            print("🟦 Buscando primero en Archive.org y resolver externo (paralelo)...")
-            archive_task = asyncio.create_task(archive_org_fallback(effective_text.strip()))
-            external_task = asyncio.create_task(external_stream_fallback(effective_text.strip()))
+            # ─────────────────────────────────────────────────────────────────
+            # 🔧 PASO 1: TMDB como validador inicial
+            # Se consulta TMDB primero para obtener el título oficial, el ID
+            # y el año. Con esos datos depurados se lanzan las búsquedas en
+            # fuentes adicionales, mejorando precisión y metadatos.
+            # ─────────────────────────────────────────────────────────────────
+            tmdb_validated_title = effective_text.strip()
+            tmdb_validated_year  = effective_year
+            tmdb_validation_meta = None
+
+            if _tmdb_pool:
+                try:
+                    _qt_init, _yr_init = _build_tmdb_query_from_title(effective_text.strip())
+                    _yr_init = _yr_init or effective_year
+                    _tmdb_timeout = httpx.Timeout(connect=2.0, read=3.5, write=2.0, pool=1.0)
+                    async with httpx.AsyncClient(timeout=_tmdb_timeout) as _http_val:
+                        tmdb_validation_meta = await asyncio.wait_for(
+                            _tmdb_search_and_details(_http_val, _qt_init, _yr_init),
+                            timeout=4.0,
+                        )
+                    if isinstance(tmdb_validation_meta, dict):
+                        _v_title = tmdb_validation_meta.get("titulo")
+                        _v_year  = tmdb_validation_meta.get("año")
+                        if _v_title:
+                            tmdb_validated_title = _v_title
+                        if _v_year:
+                            tmdb_validated_year = _v_year
+                        print(
+                            f"✅ TMDB validación → '{tmdb_validated_title}' "
+                            f"año={tmdb_validated_year} "
+                            f"id={tmdb_validation_meta.get('tmdb_id')}"
+                        )
+                    else:
+                        print(f"🔎 TMDB sin resultados para '{effective_text.strip()}' — usando título original")
+                except asyncio.TimeoutError:
+                    print("⚠️  TMDB validación timeout — usando título original")
+                except Exception as _tmdb_val_ex:
+                    print(f"⚠️  TMDB validación error: {_tmdb_val_ex}")
+
+            # ─────────────────────────────────────────────────────────────────
+            # 🔎 PASO 2: Búsqueda en paralelo con título validado por TMDB
+            # Archive.org y el resolver externo se consultan simultáneamente
+            # usando el título oficial obtenido en el paso anterior.
+            # ─────────────────────────────────────────────────────────────────
+            _search_term = tmdb_validated_title  # título depurado por TMDB
+            print(f"🟦 Búsqueda paralela en Archive.org y resolver externo con: '{_search_term}'...")
+            archive_task  = asyncio.create_task(archive_org_fallback(_search_term))
+            external_task = asyncio.create_task(external_stream_fallback(_search_term))
             archive_out, external_out = await asyncio.gather(
                 archive_task,
                 external_task,
@@ -4290,7 +4436,7 @@ async def _fetch_tmdb_poster_bytes_for_message(message) -> bytes | None:
 
     timeout = httpx.Timeout(connect=2.0, read=TMDB_THUMB_HTTP_TIMEOUT, write=2.0, pool=1.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-        if not meta_img and TMDB_API_KEY:
+        if not meta_img and _tmdb_pool:
             tmdb = await _tmdb_search_and_details(http, query_title, year)
             if isinstance(tmdb, dict):
                 meta_img = tmdb.get("imagen_url")
@@ -5142,7 +5288,7 @@ def _extract_external_stream_candidates(payload) -> list[dict]:
 
 
 async def external_stream_fallback(search_query: str) -> list:
-    if not EXTERNAL_STREAM_API_BASE or not TMDB_API_KEY:
+    if not EXTERNAL_STREAM_API_BASE or not _tmdb_pool:
         return []
 
     query_title, year = _build_tmdb_query_from_title(search_query or "")
