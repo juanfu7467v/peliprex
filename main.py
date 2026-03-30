@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
@@ -699,8 +700,14 @@ def _archive_identifier_from_stream_url(stream_url: str) -> str | None:
         if not stream_url:
             return None
         parsed = urlparse(stream_url)
-        host = (parsed.netloc or "").lower()
         path = parsed.path or ""
+
+        if "/archive-stream/" in path:
+            tail = path.split("/archive-stream/", 1)[1].strip("/")
+            identifier = tail.split("/", 1)[0].strip()
+            return identifier or None
+
+        host = (parsed.netloc or "").lower()
         if "archive.org" not in host:
             return None
         for marker in ("/details/", "/download/", "/metadata/", "/services/img/"):
@@ -3005,6 +3012,17 @@ def _archive_build_download_url(identifier: str, file_name: str) -> str | None:
 
 
 
+def _archive_build_stream_proxy_url(identifier: str, file_name: str) -> str | None:
+    ident = (identifier or "").strip()
+    name = (file_name or "").strip().lstrip("/")
+    if not ident or not name:
+        return None
+    return _build_public_url(
+        f"/archive-stream/{quote(ident, safe='')}?file={quote(name, safe='')}"
+    )
+
+
+
 def _archive_pick_best_video_file(files: list) -> dict | None:
     normalized_files = _archive_normalize_files_list(files)
     if not normalized_files:
@@ -3104,10 +3122,90 @@ def _archive_pick_best_video_file(files: list) -> dict | None:
     return best_mp4 or best_fallback
 
 
-async def _archive_org_search_and_details(http, query_title: str, year):
+async def _archive_build_result_from_doc(http, doc: dict, query_title: str, year):
+    try:
+        identifier = _archive_text(doc.get("identifier"))
+        if not identifier:
+            return None
+
+        metadata_resp = await http.get(f"{INTERNET_ARCHIVE_METADATA_BASE}/{quote(identifier, safe='')}")
+        metadata_resp.raise_for_status()
+        metadata_data = metadata_resp.json() or {}
+        files = metadata_data.get("files") or []
+        best_file = _archive_pick_best_video_file(files)
+        if not best_file:
+            return None
+
+        file_name = str(best_file.get("name") or "").strip()
+        if not file_name:
+            return None
+
+        archive_download_url = _archive_build_download_url(identifier, file_name)
+        stream_url = _archive_build_stream_proxy_url(identifier, file_name)
+        if not archive_download_url or not stream_url:
+            return None
+
+        metadata_root = metadata_data.get("metadata") or {}
+        title = _archive_text(metadata_root.get("title")) or _archive_text(doc.get("title")) or query_title
+        description = _archive_text(metadata_root.get("description"), max_len=650) or _archive_text(doc.get("description"), max_len=650)
+        year_out = _archive_extract_year(
+            metadata_root.get("year") or metadata_root.get("date") or doc.get("year") or doc.get("date")
+        ) or year
+        release_date = _archive_text(metadata_root.get("date") or doc.get("date"))
+        language = _archive_text(metadata_root.get("language") or metadata_root.get("languageSorter"))
+        subject = metadata_root.get("subject") or doc.get("subject")
+        if isinstance(subject, list):
+            generos = ", ".join(str(x).strip() for x in subject[:4] if str(x).strip()) or None
+        else:
+            generos = _archive_text(subject)
+        creator = _archive_text(metadata_root.get("creator") or doc.get("creator"))
+        runtime = _archive_text(metadata_root.get("runtime") or metadata_root.get("length"))
+
+        try:
+            downloads = int(float(doc.get("downloads") or 0))
+        except Exception:
+            downloads = 0
+        try:
+            size_bytes = int(str(best_file.get("size") or "0"))
+        except Exception:
+            size_bytes = 0
+
+        size_label = f"{round(size_bytes / (1024 * 1024), 2)} MB" if size_bytes > 0 else "n/a"
+        image_url = _archive_thumb_from_identifier(identifier)
+
+        print(
+            f"   🏛️ Archive.org → '{title}' año={year_out or '?'} "
+            f"img={'✓' if image_url else '✗'} archivo={'✓' if stream_url else '✗'}"
+        )
+        return {
+            "source":                "archive_org",
+            "archive_identifier":    identifier,
+            "archive_file_name":     file_name,
+            "archive_download_url":  archive_download_url,
+            "tmdb_id":               None,
+            "media_type":            "movie",
+            "titulo":                title,
+            "imagen_url":            image_url,
+            "sinopsis":              description,
+            "fecha_lanzamiento":     release_date,
+            "duracion":              runtime,
+            "idioma_original":       language,
+            "popularidad":           downloads or None,
+            "puntuacion":            None,
+            "generos":               generos,
+            "año":                   year_out,
+            "descripcion_detallada": creator,
+            "stream_url":            stream_url,
+            "size":                  size_label,
+        }
+    except Exception:
+        return None
+
+
+async def _archive_org_search_results(http, query_title: str, year, limit: int | None = None) -> list[dict]:
     query_title = (query_title or "").strip()
     if not query_title:
-        return None
+        return []
 
     try:
         docs = []
@@ -3127,7 +3225,7 @@ async def _archive_org_search_and_details(http, query_title: str, year):
                 break
 
         if not docs:
-            return None
+            return []
 
         ranked_docs = sorted(
             (doc for doc in docs if isinstance(doc, dict)),
@@ -3135,80 +3233,29 @@ async def _archive_org_search_and_details(http, query_title: str, year):
             reverse=True,
         )[:INTERNET_ARCHIVE_MAX_CANDIDATES]
 
+        max_results = max(1, min(INTERNET_ARCHIVE_MAX_CANDIDATES, int(limit or INTERNET_ARCHIVE_MAX_CANDIDATES)))
+        results = []
+        seen_identifiers = set()
         for doc in ranked_docs:
-            identifier = _archive_text(doc.get("identifier"))
-            if not identifier:
+            archive_result = await _archive_build_result_from_doc(http, doc, query_title, year)
+            if not isinstance(archive_result, dict):
                 continue
-
-            metadata_resp = await http.get(f"{INTERNET_ARCHIVE_METADATA_BASE}/{quote(identifier, safe='')}")
-            metadata_resp.raise_for_status()
-            metadata_data = metadata_resp.json() or {}
-            files = metadata_data.get("files") or []
-            best_file = _archive_pick_best_video_file(files)
-            if not best_file:
+            identifier = archive_result.get("archive_identifier")
+            if identifier in seen_identifiers:
                 continue
-
-            file_name = str(best_file.get("name") or "").strip()
-            if not file_name:
-                continue
-            stream_url = _archive_build_download_url(identifier, file_name)
-            if not stream_url:
-                continue
-
-            metadata_root = metadata_data.get("metadata") or {}
-            title = _archive_text(metadata_root.get("title")) or _archive_text(doc.get("title")) or query_title
-            description = _archive_text(metadata_root.get("description"), max_len=650) or _archive_text(doc.get("description"), max_len=650)
-            year_out = _archive_extract_year(
-                metadata_root.get("year") or metadata_root.get("date") or doc.get("year") or doc.get("date")
-            ) or year
-            release_date = _archive_text(metadata_root.get("date") or doc.get("date"))
-            language = _archive_text(metadata_root.get("language") or metadata_root.get("languageSorter"))
-            subject = metadata_root.get("subject") or doc.get("subject")
-            if isinstance(subject, list):
-                generos = ", ".join(str(x).strip() for x in subject[:4] if str(x).strip()) or None
-            else:
-                generos = _archive_text(subject)
-            creator = _archive_text(metadata_root.get("creator") or doc.get("creator"))
-            runtime = _archive_text(metadata_root.get("runtime") or metadata_root.get("length"))
-
-            try:
-                downloads = int(float(doc.get("downloads") or 0))
-            except Exception:
-                downloads = 0
-            try:
-                size_bytes = int(str(best_file.get("size") or "0"))
-            except Exception:
-                size_bytes = 0
-
-            size_label = f"{round(size_bytes / (1024 * 1024), 2)} MB" if size_bytes > 0 else "n/a"
-            image_url = _archive_thumb_from_identifier(identifier)
-
-            print(
-                f"   🏛️ Archive.org → '{title}' año={year_out or '?'} "
-                f"img={'✓' if image_url else '✗'} archivo={'✓' if stream_url else '✗'}"
-            )
-            return {
-                "source":                "archive_org",
-                "archive_identifier":    identifier,
-                "tmdb_id":               None,
-                "media_type":            "movie",
-                "titulo":                title,
-                "imagen_url":            image_url,
-                "sinopsis":              description,
-                "fecha_lanzamiento":     release_date,
-                "duracion":              runtime,
-                "idioma_original":       language,
-                "popularidad":           downloads or None,
-                "puntuacion":            None,
-                "generos":               generos,
-                "año":                   year_out,
-                "descripcion_detallada": creator,
-                "stream_url":            stream_url,
-                "size":                  size_label,
-            }
+            seen_identifiers.add(identifier)
+            results.append(archive_result)
+            if len(results) >= max_results:
+                break
+        return results
     except Exception as e:
         print(f"⚠️  Internet Archive error ({query_title}): {e}")
-        return None
+        return []
+
+
+async def _archive_org_search_and_details(http, query_title: str, year):
+    results = await _archive_org_search_results(http, query_title, year, limit=1)
+    return results[0] if results else None
 
 
 # ---------------------------------------------------------------------------
@@ -3736,6 +3783,99 @@ async def search(
         return _cached_results
 
     try:
+        def _dedupe_raw_results(items: list) -> list:
+            seen = set()
+            unique = []
+            for result in (items or []):
+                if not isinstance(result, dict):
+                    continue
+                msg_id = result.get("id")
+                stream_url = (result.get("stream_url") or result.get("pelicula_url") or result.get("url") or "").strip()
+                title_k = normalize_title(result.get("title") or result.get("titulo") or "")
+                source_k = normalize_title(result.get("source") or "")
+
+                if stream_url:
+                    key = f"url:{stream_url}"
+                elif msg_id:
+                    key = f"id:{source_k}:{msg_id}"
+                elif title_k:
+                    key = f"title:{source_k}:{title_k}"
+                else:
+                    key = f"raw:{id(result)}"
+
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(result)
+            return unique
+
+        async def _finalize_search_payload(raw_results: list, label: str) -> list:
+            if not raw_results:
+                return []
+            raw_results = _sort_results_by_saga_and_chapter(_dedupe_raw_results(raw_results))
+            try:
+                enriched_stage = await asyncio.wait_for(
+                    enrich_results_with_tmdb(raw_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
+                    timeout=4.0,
+                )
+            except asyncio.TimeoutError:
+                print(f"⚠️  /search {label} enrichment timeout")
+                enriched_stage = _format_results_without_apis(raw_results)
+
+            if any([effective_year, effective_genre, language, effective_desde, effective_hasta]):
+                enriched_stage = _apply_advanced_filters(
+                    enriched_stage,
+                    effective_year,
+                    effective_genre,
+                    language,
+                    effective_desde,
+                    effective_hasta,
+                )
+            return _to_peliculas_json_schema(enriched_stage)
+
+        async def _cache_final_schema_if_worth(final_schema: list) -> None:
+            _text_complete = (not effective_text) or (len((effective_text or "").strip()) >= 3)
+            _has_results   = bool(final_schema) and len(final_schema) >= 1
+            _worth_caching = _text_complete and _has_results and (
+                (effective_text and len(effective_text.strip()) >= 3) or
+                effective_year or effective_desde or effective_hasta
+            )
+            if _worth_caching:
+                await asyncio.to_thread(_db_search_set, _search_cache_key, final_schema)
+                print(f"💾 Caché SQLite guardada: {len(final_schema)} resultado(s) para clave '{_search_cache_key[:60]}'")
+
+        preferred_results = []
+        preferred_results_threshold = max(3, min(10, INTERNET_ARCHIVE_MAX_CANDIDATES + 2))
+
+        if effective_text:
+            print("🟦 Buscando primero en Archive.org y resolver externo (paralelo)...")
+            archive_task = asyncio.create_task(archive_org_fallback(effective_text.strip()))
+            external_task = asyncio.create_task(external_stream_fallback(effective_text.strip()))
+            archive_out, external_out = await asyncio.gather(
+                archive_task,
+                external_task,
+                return_exceptions=True,
+            )
+
+            if isinstance(archive_out, list):
+                preferred_results.extend(archive_out)
+            elif isinstance(archive_out, Exception):
+                print(f"⚠️  Archive.org fallback falló: {archive_out}")
+
+            if isinstance(external_out, list):
+                preferred_results.extend(external_out)
+            elif isinstance(external_out, Exception):
+                print(f"⚠️  Resolver externo fallback falló: {external_out}")
+
+            preferred_results = _sort_results_by_saga_and_chapter(_dedupe_raw_results(preferred_results))
+            if preferred_results:
+                print(f"🟦 Fuentes prioritarias → {len(preferred_results)} resultado(s)")
+                early_schema = await _finalize_search_payload(preferred_results, "fuentes prioritarias")
+                if len(early_schema) >= preferred_results_threshold:
+                    await _cache_final_schema_if_worth(early_schema)
+                    return early_schema
+            else:
+                print("🟦 Sin resultados en Archive.org / resolver externo. Continuando con Telegram...")
+
         if not getattr(app.state, "channels_ready", False):
             waited = 0.0
             while not getattr(app.state, "channels_ready", False) and waited < CHANNELS_READY_MAX_WAIT_SEARCH:
@@ -3986,51 +4126,18 @@ async def search(
 
         print(f"🎯 Resultados: {len(final_results)} únicos (de {len(all_results)} totales)")
 
-        if not final_results and effective_text:
-            print("🟦 Sin resultados en Telegram. Probando Internet Archive...")
-            archive_results = await archive_org_fallback(effective_text.strip())
-            if archive_results:
-                try:
-                    enriched = await asyncio.wait_for(
-                        enrich_results_with_tmdb(archive_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
-                        timeout=4.0,
-                    )
-                except asyncio.TimeoutError:
-                    print("⚠️  /search Internet Archive enrichment timeout")
-                    enriched = _format_results_without_apis(archive_results)
-                if any([effective_year, effective_genre, language, effective_desde, effective_hasta]):
-                    enriched = _apply_advanced_filters(enriched, effective_year, effective_genre, language, effective_desde, effective_hasta)
-                return _to_peliculas_json_schema(enriched)
+        if preferred_results:
+            final_results = _sort_results_by_saga_and_chapter(
+                _dedupe_raw_results(preferred_results + final_results)
+            )
 
-            print("🟦 Sin resultados en Internet Archive. Usando respaldo YouTube...")
+        if not final_results and effective_text:
+            print("🟦 Sin resultados en Telegram. Usando respaldo YouTube...")
             yt_results = await youtube_fallback(effective_text.strip())
             if yt_results:
-                try:
-                    enriched = await asyncio.wait_for(
-                        enrich_results_with_tmdb(yt_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
-                        timeout=4.0,
-                    )
-                except asyncio.TimeoutError:
-                    print("⚠️  /search YouTube enrichment timeout")
-                    enriched = _format_results_without_apis(yt_results)
-                if any([effective_year, effective_genre, language, effective_desde, effective_hasta]):
-                    enriched = _apply_advanced_filters(enriched, effective_year, effective_genre, language, effective_desde, effective_hasta)
-                return _to_peliculas_json_schema(enriched)
-
-            print("🟦 Sin resultados en YouTube. Probando resolver externo por TMDb...")
-            external_results = await external_stream_fallback(effective_text.strip())
-            if external_results:
-                try:
-                    enriched = await asyncio.wait_for(
-                        enrich_results_with_tmdb(external_results, max_new=MAX_ENRICH_NEW, use_gemini=True),
-                        timeout=4.0,
-                    )
-                except asyncio.TimeoutError:
-                    print("⚠️  /search resolver externo enrichment timeout")
-                    enriched = _format_results_without_apis(external_results)
-                if any([effective_year, effective_genre, language, effective_desde, effective_hasta]):
-                    enriched = _apply_advanced_filters(enriched, effective_year, effective_genre, language, effective_desde, effective_hasta)
-                return _to_peliculas_json_schema(enriched)
+                yt_schema = await _finalize_search_payload(yt_results, "YouTube")
+                await _cache_final_schema_if_worth(yt_schema)
+                return yt_schema
 
         try:
             enriched = await asyncio.wait_for(
@@ -4046,19 +4153,7 @@ async def search(
             print(f"🔎 Filtros avanzados aplicados → {len(enriched)} resultado(s)")
 
         final_schema = _to_peliculas_json_schema(enriched)
-
-        # ✅ ANTI-FLOOD: Guardar en caché SQLite SOLO si la búsqueda es completa y tiene resultados.
-        # Se evita cachear búsquedas parciales (usuario todavía escribiendo) o sin resultados reales.
-        _text_complete = (not effective_text) or (len((effective_text or "").strip()) >= 3)
-        _has_results   = bool(final_schema) and len(final_schema) >= 1
-        _worth_caching = _text_complete and _has_results and (
-            (effective_text and len(effective_text.strip()) >= 3) or
-            effective_year or effective_desde or effective_hasta
-        )
-        if _worth_caching:
-            await asyncio.to_thread(_db_search_set, _search_cache_key, final_schema)
-            print(f"💾 Caché SQLite guardada: {len(final_schema)} resultado(s) para clave '{_search_cache_key[:60]}'")
-
+        await _cache_final_schema_if_worth(final_schema)
         return final_schema
 
     except HTTPException:
@@ -4712,6 +4807,101 @@ async def stream_video(message_id: int, request: Request, ch: int = 0):
 
 
 # ---------------------------------------------------------------------------
+# ENDPOINT /archive-stream/{identifier}
+# Proxy de reproducción inline para Archive.org (evita descargas forzadas)
+# ---------------------------------------------------------------------------
+@app.get("/archive-stream/{identifier}")
+async def archive_stream_proxy(identifier: str, request: Request, file: str = Query(..., description="Archivo de Archive.org")):
+    ident = (identifier or "").strip()
+    file_name = (file or "").strip().lstrip("/")
+    if not ident or not file_name:
+        raise HTTPException(status_code=400, detail="Archivo de Archive.org inválido")
+
+    upstream_url = _archive_build_download_url(ident, file_name)
+    if not upstream_url:
+        raise HTTPException(status_code=400, detail="Archivo de Archive.org inválido")
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=4.0, read=None, write=10.0, pool=2.0),
+        follow_redirects=True,
+    )
+    upstream = None
+    try:
+        headers = {"Accept": "*/*"}
+        range_header = request.headers.get("range")
+        if range_header:
+            headers["Range"] = range_header
+
+        req = client.build_request("GET", upstream_url, headers=headers)
+        upstream = await client.send(req, stream=True)
+
+        if upstream.status_code in (404, 410):
+            raise HTTPException(status_code=404, detail="Archivo de Archive.org no encontrado")
+        if upstream.status_code == 416:
+            content_range = upstream.headers.get("content-range") or "bytes */*"
+            return Response(status_code=416, content=b"", headers={"Content-Range": content_range})
+        upstream.raise_for_status()
+
+        content_type = (upstream.headers.get("content-type") or "video/mp4").split(";", 1)[0].strip() or "video/mp4"
+        content_length = upstream.headers.get("content-length")
+        content_range = upstream.headers.get("content-range")
+        safe_filename = file_name.replace('"', "") or "video.mp4"
+        status_code = 206 if upstream.status_code == 206 or content_range else 200
+
+        response_headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": upstream.headers.get("accept-ranges") or "bytes",
+            "Cache-Control": "public, max-age=3600",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Disposition": f'inline; filename="{safe_filename}"',
+        }
+        if content_length:
+            response_headers["Content-Length"] = content_length
+        if content_range:
+            response_headers["Content-Range"] = content_range
+        if upstream.headers.get("etag"):
+            response_headers["ETag"] = upstream.headers.get("etag")
+        if upstream.headers.get("last-modified"):
+            response_headers["Last-Modified"] = upstream.headers.get("last-modified")
+
+        async def _close_streams():
+            with suppress(Exception):
+                if upstream is not None:
+                    await upstream.aclose()
+            with suppress(Exception):
+                await client.aclose()
+
+        async def _iterator():
+            async for chunk in upstream.aiter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+                if chunk:
+                    yield chunk
+
+        return StreamingResponse(
+            _iterator(),
+            status_code=status_code,
+            headers=response_headers,
+            media_type=content_type,
+            background=BackgroundTask(_close_streams),
+        )
+    except HTTPException:
+        if upstream is not None:
+            with suppress(Exception):
+                await upstream.aclose()
+        with suppress(Exception):
+            await client.aclose()
+        raise
+    except Exception as e:
+        print(f"⚠️  Error en /archive-stream/{identifier}: {e}")
+        if upstream is not None:
+            with suppress(Exception):
+                await upstream.aclose()
+        with suppress(Exception):
+            await client.aclose()
+        raise HTTPException(status_code=500, detail="Error de streaming remoto")
+
+
+# ---------------------------------------------------------------------------
 # INTERNET ARCHIVE + YOUTUBE FALLBACK (Telegram → Archive.org → YouTube)
 # ---------------------------------------------------------------------------
 def _parse_iso8601_duration_seconds(value: str) -> int | None:
@@ -5009,25 +5199,39 @@ async def external_stream_fallback(search_query: str) -> list:
             await _ai_cache_set("stream_api", ck, None, "none")
             return []
 
-        best = candidates[0]
-        result = {
-            "id":                f"external:{tmdb_id}:{best.get('provider') or 'resolver'}",
-            "title":             tmdb_meta.get("titulo") or query_title,
-            "size":              " · ".join(part for part in [best.get("quality"), best.get("provider")] if part and part != "n/a") or "n/a",
-            "stream_url":        best.get("url"),
-            "imagen_url":        tmdb_meta.get("imagen_url") or "",
-            "source":            "external_stream_api",
-            "tmdb_id":           tmdb_id,
-            "media_type":        media_type,
-            "external_provider": best.get("provider") or "external",
-            "quality":           best.get("quality") or "n/a",
-        }
+        results = []
+        seen_urls = set()
+        for idx, candidate in enumerate(candidates[:EXTERNAL_STREAM_API_MAX_RESULTS], start=1):
+            stream_url = (candidate.get("url") or "").strip()
+            if not stream_url or stream_url in seen_urls:
+                continue
+            seen_urls.add(stream_url)
+
+            provider = candidate.get("provider") or f"external-{idx}"
+            quality = candidate.get("quality") or "n/a"
+            results.append({
+                "id":                f"external:{tmdb_id}:{provider}:{idx}",
+                "title":             tmdb_meta.get("titulo") or query_title,
+                "size":              " · ".join(part for part in [quality, provider] if part and part != "n/a") or "n/a",
+                "stream_url":        stream_url,
+                "imagen_url":        tmdb_meta.get("imagen_url") or "",
+                "source":            "external_stream_api",
+                "tmdb_id":           tmdb_id,
+                "media_type":        media_type,
+                "external_provider": provider,
+                "quality":           quality,
+            })
+
+        if not results:
+            await _ai_cache_set("stream_api", ck, None, "none")
+            return []
+
         print(
-            f"🟪 Resolver externo OK: {result['title']} "
-            f"[{result.get('external_provider')}] {result.get('quality')}"
+            f"🟪 Resolver externo OK: {tmdb_meta.get('titulo') or query_title} "
+            f"({len(results)} stream(s))"
         )
-        await _ai_cache_set("stream_api", ck, [result], "ok")
-        return [result]
+        await _ai_cache_set("stream_api", ck, results, "ok")
+        return results
     except httpx.HTTPStatusError as e:
         code = getattr(getattr(e, "response", None), "status_code", None)
         await _ai_cache_set("stream_api", ck, None, "429" if code == 429 else "err")
@@ -5048,25 +5252,36 @@ async def archive_org_fallback(search_query: str) -> list:
     timeout = httpx.Timeout(connect=2.5, read=INTERNET_ARCHIVE_TIMEOUT_S, write=2.5, pool=1.0)
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-            archive_meta = await _archive_org_search_and_details(http, query_title, year)
-        if not isinstance(archive_meta, dict):
+            archive_items = await _archive_org_search_results(
+                http,
+                query_title,
+                year,
+                limit=INTERNET_ARCHIVE_MAX_CANDIDATES,
+            )
+        if not archive_items:
             return []
 
-        stream_url = archive_meta.get("stream_url")
-        if not stream_url:
-            return []
+        results = []
+        seen_urls = set()
+        for archive_meta in archive_items:
+            stream_url = archive_meta.get("stream_url")
+            if not stream_url or stream_url in seen_urls:
+                continue
+            seen_urls.add(stream_url)
+            results.append({
+                "id":                 archive_meta.get("archive_identifier") or query_title,
+                "title":              archive_meta.get("titulo") or query_title,
+                "size":               archive_meta.get("size") or "n/a",
+                "stream_url":         stream_url,
+                "imagen_url":         archive_meta.get("imagen_url") or _archive_thumb_from_stream_url(stream_url),
+                "source":             "archive_org",
+                "archive_identifier": archive_meta.get("archive_identifier"),
+                "archive_file_name":  archive_meta.get("archive_file_name"),
+            })
 
-        result = {
-            "id":                 archive_meta.get("archive_identifier") or query_title,
-            "title":              archive_meta.get("titulo") or query_title,
-            "size":               archive_meta.get("size") or "n/a",
-            "stream_url":         stream_url,
-            "imagen_url":         archive_meta.get("imagen_url") or _archive_thumb_from_stream_url(stream_url),
-            "source":             "archive_org",
-            "archive_identifier": archive_meta.get("archive_identifier"),
-        }
-        print(f"🟫 Internet Archive fallback OK: {result['title']}")
-        return [result]
+        if results:
+            print(f"🟫 Internet Archive fallback OK: {len(results)} resultado(s)")
+        return results
     except Exception as e:
         print(f"⚠️  Error usando Internet Archive fallback: {e}")
         return []
