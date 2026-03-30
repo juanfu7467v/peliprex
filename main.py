@@ -68,10 +68,7 @@ INTERNET_ARCHIVE_MAX_CANDIDATES = max(1, min(8, int(os.getenv("INTERNET_ARCHIVE_
 GOOGLE_KG_API_KEY  = os.getenv("GOOGLE_KG_API_KEY", "").strip()
 
 # --- TMDB ---
-TMDB_API_KEY       = os.getenv("TMDB_API_KEY",   "").strip()
-TMDB_API_KEY_2     = os.getenv("TMDB_API_KEY_2", "").strip()   # ✅ Clave de respaldo 2
-TMDB_API_KEY_3     = os.getenv("TMDB_API_KEY_3", "").strip()   # ✅ Clave de respaldo 3
-TMDB_API_KEY_4     = os.getenv("TMDB_API_KEY_4", "").strip()   # ✅ Clave de respaldo 4
+TMDB_API_KEY       = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_API_BASE      = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE    = "https://image.tmdb.org/t/p/w500"
 
@@ -261,70 +258,6 @@ _REQUIRED_CHANNELS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# 🔑 POOL DE CLAVES TMDB — Rotación automática en caso de error 429
-# ---------------------------------------------------------------------------
-class _TmdbKeyPool:
-    """
-    Gestiona múltiples claves de la API de TMDB.
-    Cuando una clave devuelve HTTP 429 (límite diario superado) se marca
-    como bloqueada y se rota automáticamente a la siguiente clave disponible.
-    El bloqueo temporal se levanta tras COOLDOWN_SECONDS para reintentar.
-    El proceso es completamente transparente: el usuario no ve ningún error.
-    """
-    COOLDOWN_SECONDS: int = 3600  # 1 hora de cooldown por clave bloqueada
-
-    def __init__(self, keys: list):
-        self._keys: list = [k for k in keys if k]  # filtrar claves vacías
-        self._blocked_until: dict = {}              # key → timestamp de desbloqueo
-
-    def _available(self) -> list:
-        """Devuelve claves no bloqueadas en orden de prioridad."""
-        now = time.time()
-        return [k for k in self._keys if now >= self._blocked_until.get(k, 0)]
-
-    def get_key(self):
-        """Obtiene la primera clave disponible, o None si todas están bloqueadas."""
-        available = self._available()
-        return available[0] if available else None
-
-    def get_next_key(self, current_key: str):
-        """Obtiene la siguiente clave disponible distinta a current_key."""
-        available = self._available()
-        others = [k for k in available if k != current_key]
-        return others[0] if others else None
-
-    def report_429(self, key: str) -> None:
-        """Marca una clave como bloqueada por límite de tasa (429)."""
-        if not key:
-            return
-        self._blocked_until[key] = time.time() + self.COOLDOWN_SECONDS
-        suffix = key[-6:] if len(key) >= 6 else key
-        print(
-            f"🔑 TMDB key ...{suffix} bloqueada por 429 — "
-            f"rotando a siguiente clave (cooldown {self.COOLDOWN_SECONDS}s)"
-        )
-
-    def has_keys(self) -> bool:
-        """Retorna True si hay al menos una clave disponible."""
-        return bool(self._available())
-
-    def __bool__(self) -> bool:
-        return self.has_keys()
-
-    def __len__(self) -> int:
-        return len(self._keys)
-
-
-# Instancia global del pool (se crea después de leer todas las variables de entorno)
-_tmdb_pool: _TmdbKeyPool = _TmdbKeyPool([
-    TMDB_API_KEY,
-    TMDB_API_KEY_2,
-    TMDB_API_KEY_3,
-    TMDB_API_KEY_4,
-])
-
-
 def _dedupe_channels(channels: list) -> list:
     seen, out = set(), []
     for ch in channels:
@@ -458,6 +391,71 @@ def _db_search_set(query_key: str, results: list) -> None:
         con.close()
     except Exception as _e:
         print(f"⚠️  Error guardando caché de búsqueda: {_e}")
+
+
+def _db_init_metadata_cache() -> None:
+    """Crea la tabla de metadatos enriquecidos en SQLite si no existe."""
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS metadata_cache (
+                query_key     TEXT PRIMARY KEY,
+                metadata_json TEXT NOT NULL,
+                updated_at    REAL NOT NULL,
+                is_complete   INTEGER NOT NULL DEFAULT 0,
+                tmdb_id       TEXT,
+                media_type    TEXT
+            )
+        """)
+        con.commit()
+        con.close()
+        print(f"✅ BD caché de metadatos inicializada: {DB_PATH}")
+    except Exception as _e:
+        print(f"⚠️  Error inicializando BD de metadatos: {_e}")
+
+
+def _db_metadata_get(query_key: str):
+    """Recupera metadatos enriquecidos desde SQLite."""
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = con.execute(
+            "SELECT metadata_json FROM metadata_cache WHERE query_key = ?",
+            (query_key,),
+        )
+        row = cur.fetchone()
+        con.close()
+        if row is None:
+            return None
+        data = json.loads(row[0])
+        return data if isinstance(data, dict) else None
+    except Exception as _e:
+        print(f"⚠️  Error leyendo caché de metadatos: {_e}")
+        return None
+
+
+def _db_metadata_set(query_key: str, metadata: dict) -> None:
+    """Guarda en SQLite únicamente metadatos suficientemente completos."""
+    if not query_key or not isinstance(metadata, dict):
+        return
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        con.execute(
+            """INSERT OR REPLACE INTO metadata_cache
+               (query_key, metadata_json, updated_at, is_complete, tmdb_id, media_type)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                query_key,
+                json.dumps(metadata, ensure_ascii=False),
+                time.time(),
+                1 if _meta_is_full_enough_for_persist(metadata) else 0,
+                str(metadata.get("tmdb_id") or "") or None,
+                str(metadata.get("media_type") or "") or None,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception as _e:
+        print(f"⚠️  Error guardando caché de metadatos: {_e}")
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +911,40 @@ def _meta_is_full_enough_for_persist(meta: dict) -> bool:
         return False
 
 
+def _meta_needs_quality_backfill(meta: dict) -> bool:
+    if not isinstance(meta, dict):
+        return True
+    required_keys = ("titulo", "titulo_original", "imagen_url", "sinopsis", "año")
+    for key in required_keys:
+        value = meta.get(key)
+        if key == "imagen_url":
+            if _is_placeholder_image(value) or not (isinstance(value, str) and value.strip()):
+                return True
+            continue
+        if value is None or str(value).strip() == "":
+            return True
+    return False
+
+
+def _should_require_tmdb_validation(text, genre=None, canal=None, desde=None, hasta=None) -> bool:
+    txt = normalize_title(text or "")
+    if not txt or genre or canal or desde or hasta:
+        return False
+
+    generic_terms = {
+        "accion", "anime", "animacion", "aventura", "comedia", "cristianas",
+        "documental", "drama", "dramas", "infantil", "infantiles", "novela",
+        "novelas", "pelicula", "peliculas", "religiosas", "serie", "series",
+        "suspenso", "terror", "thriller"
+    }
+    words = [w for w in txt.split() if w]
+    if not words:
+        return False
+    if len(words) <= 3 and any(w in generic_terms for w in words):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # ✅ HELPER: Obtener el mejor thumb nativo de Telegram de forma robusta
 # ---------------------------------------------------------------------------
@@ -1328,8 +1360,9 @@ async def lifespan(app: FastAPI):
     app.state.last_persist_save_ts = 0.0
     app.state.telegram_bootstrap_task = None
 
-    # ✅ Inicializar caché de búsquedas SQLite (anti-flood)
+    # ✅ Inicializar cachés SQLite persistentes
     _db_init_search_cache()
+    _db_init_metadata_cache()
     # ✅ SEPARACIÓN C: Inicializar caché de catálogo SQLite
     _db_init_catalog_cache()
 
@@ -2718,14 +2751,14 @@ async def _google_kg_search(
 
 
 # ---------------------------------------------------------------------------
-# TMDB  — usa el pool de claves con rotación automática en caso de 429
+# TMDB
 # ---------------------------------------------------------------------------
 async def _tmdb_search_and_details(
     http,
     query_title: str,
     year,
 ):
-    if not _tmdb_pool:
+    if not TMDB_API_KEY:
         return None
 
     ck = _cache_key_from_query(query_title, year)
@@ -2734,9 +2767,7 @@ async def _tmdb_search_and_details(
         if cached_status == "ok" and isinstance(cached_data, dict):
             return cached_data
         if cached_status in ("none", "429"):
-            # Si el caché dice 429 pero ahora hay otra clave disponible, ignorar caché
-            if cached_status == "none" or not _tmdb_pool:
-                return None
+            return None
         if cached_status == "err" and cached_data is None:
             return None
 
@@ -2744,48 +2775,16 @@ async def _tmdb_search_and_details(
         await _ai_cache_set("tmdb", ck, None, "none")
         return None
 
-    # ——— Función interna de petición con reintentos de clave ———
-    async def _do_get(url: str, params: dict):
-        """
-        Realiza GET con la primera clave disponible.
-        Si recibe 429, rota a la siguiente clave y reintenta UNA vez.
-        """
-        key = _tmdb_pool.get_key()
-        if not key:
-            return None, None  # sin claves disponibles
-        params_with_key = dict(params, api_key=key)
-        r = await http.get(url, params=params_with_key)
-        if r.status_code == 429:
-            _tmdb_pool.report_429(key)
-            next_key = _tmdb_pool.get_next_key(key)
-            if next_key:
-                params_with_key = dict(params, api_key=next_key)
-                r = await http.get(url, params=params_with_key)
-                if r.status_code == 429:
-                    _tmdb_pool.report_429(next_key)
-                    # Intentar tercera clave si existe
-                    third_key = _tmdb_pool.get_next_key(next_key)
-                    if third_key and third_key != key:
-                        params_with_key = dict(params, api_key=third_key)
-                        r = await http.get(url, params=params_with_key)
-                        if r.status_code == 429:
-                            _tmdb_pool.report_429(third_key)
-                            return None, None
-                    else:
-                        return None, None
-            else:
-                return None, None
-        return r, params_with_key.get("api_key")
-
     try:
-        base_params = {
+        params = {
+            "api_key": TMDB_API_KEY,
             "query": query_title,
             "include_adult": "false",
             "language": "es-ES",
             "page": 1,
         }
-        r, _used_key = await _do_get(f"{TMDB_API_BASE}/search/multi", base_params)
-        if r is None:
+        r = await http.get(f"{TMDB_API_BASE}/search/multi", params=params)
+        if r.status_code == 429:
             await _ai_cache_set("tmdb", ck, None, "429")
             return None
         r.raise_for_status()
@@ -2813,15 +2812,16 @@ async def _tmdb_search_and_details(
             await _ai_cache_set("tmdb", ck, None, "none")
             return None
 
-        detail_base = {"language": "es-ES"}
+        detail_params = {"api_key": TMDB_API_KEY, "language": "es-ES"}
         if media_type == "movie":
-            d, _ = await _do_get(f"{TMDB_API_BASE}/movie/{tmdb_id}", detail_base)
-            if d is None:
+            d = await http.get(f"{TMDB_API_BASE}/movie/{tmdb_id}", params=detail_params)
+            if d.status_code == 429:
                 await _ai_cache_set("tmdb", ck, None, "429")
                 return None
             d.raise_for_status()
             details = d.json()
             title = details.get("title") or details.get("original_title") or query_title
+            original_title = details.get("original_title") or details.get("title") or query_title
             poster_path = details.get("poster_path")
             backdrop_path = details.get("backdrop_path")
             overview = details.get("overview")
@@ -2833,13 +2833,14 @@ async def _tmdb_search_and_details(
             genres_list = details.get("genres") or []
             tagline = details.get("tagline")
         else:
-            d, _ = await _do_get(f"{TMDB_API_BASE}/tv/{tmdb_id}", detail_base)
-            if d is None:
+            d = await http.get(f"{TMDB_API_BASE}/tv/{tmdb_id}", params=detail_params)
+            if d.status_code == 429:
                 await _ai_cache_set("tmdb", ck, None, "429")
                 return None
             d.raise_for_status()
             details = d.json()
             title = details.get("name") or details.get("original_name") or query_title
+            original_title = details.get("original_name") or details.get("name") or query_title
             poster_path = details.get("poster_path")
             backdrop_path = details.get("backdrop_path")
             overview = details.get("overview")
@@ -2862,6 +2863,7 @@ async def _tmdb_search_and_details(
             "tmdb_id": tmdb_id,
             "media_type": media_type,
             "titulo": title,
+            "titulo_original": original_title,
             "imagen_url": image_url,
             "sinopsis": overview,
             "fecha_lanzamiento": release_date,
@@ -3528,6 +3530,7 @@ def _merge_metadata_with_kg(
         "tmdb_id":               tmdb_id,
         "media_type":            media_type,
         "titulo":                pick("titulo") or fallback_title or "Película",
+        "titulo_original":       pick("titulo_original") or pick("titulo") or fallback_title or "Película",
         "imagen_url":            pick_image(),
         "sinopsis":              pick("sinopsis"),
         "fecha_lanzamiento":     pick("fecha_lanzamiento"),
@@ -3548,8 +3551,76 @@ def _merge_metadata_with_kg(
 # ---------------------------------------------------------------------------
 async def _meta_cache_get(cache_key: str):
     meta_cache = getattr(app.state, "meta_cache", None)
-    if not isinstance(meta_cache, dict): return None
-    return meta_cache.get(cache_key)
+    if isinstance(meta_cache, dict):
+        meta = meta_cache.get(cache_key)
+        if isinstance(meta, dict):
+            return meta
+
+    meta = await asyncio.to_thread(_db_metadata_get, cache_key)
+    if isinstance(meta, dict) and isinstance(meta_cache, dict):
+        async with app.state.meta_cache_lock:
+            app.state.meta_cache[cache_key] = meta
+        return meta
+    return meta if isinstance(meta, dict) else None
+
+
+async def _resolve_complete_metadata(
+    http,
+    query_title: str,
+    year,
+    fallback_title: str,
+    fallback_year,
+    use_gemini: bool = False,
+    looks_like_tv: bool = False,
+    seed_tmdb=None,
+) -> dict:
+    kg = tvmaze = archive = gemini_data = None
+    tmdb = seed_tmdb if isinstance(seed_tmdb, dict) else None
+
+    if not isinstance(tmdb, dict) and TMDB_API_KEY:
+        tmdb = await _tmdb_search_and_details(http, query_title, year)
+
+    if GOOGLE_KG_API_KEY and ((not isinstance(tmdb, dict)) or _meta_needs_quality_backfill(tmdb)):
+        kg = await _google_kg_search(http, query_title, year)
+
+    if looks_like_tv and not isinstance(tmdb, dict) and not isinstance(kg, dict):
+        tvmaze = await _tvmaze_fetch(http, query_title, year)
+        if isinstance(tvmaze, dict):
+            print(f"   📌 TVMaze priorizada por heurística TV/novela para '{query_title}'")
+
+    meta = _merge_metadata_with_kg(
+        kg, tmdb, tvmaze, archive,
+        fallback_title=fallback_title,
+        fallback_year=fallback_year,
+    )
+
+    if use_gemini and GEMINI_API_KEY and _meta_needs_quality_backfill(meta):
+        gemini_data = await _gemini_complete_metadata(
+            http, fallback_title or query_title, year, meta
+        )
+        if isinstance(gemini_data, dict):
+            for _gk in [
+                "titulo", "titulo_original", "imagen_url", "sinopsis", "generos", "año",
+                "idioma_original", "duracion", "fecha_lanzamiento",
+                "descripcion_detallada", "puntuacion", "popularidad"
+            ]:
+                if not meta.get(_gk) and gemini_data.get(_gk):
+                    meta[_gk] = gemini_data[_gk]
+            chain = list(meta.get("_metadata_source_chain") or [])
+            if "gemini" not in chain:
+                chain.append("gemini")
+            meta["_metadata_source_chain"] = chain or ["gemini"]
+            meta["_meta_priority_version"] = METADATA_PRIORITY_VERSION
+
+    if not meta.get("titulo_original"):
+        meta["titulo_original"] = (
+            (tmdb.get("titulo_original") if isinstance(tmdb, dict) else None)
+            or meta.get("titulo")
+            or fallback_title
+            or "Película"
+        )
+
+    return meta
 
 
 async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
@@ -3557,6 +3628,8 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
         return
     metadata.pop("stream_url",   None)
     metadata.pop("pelicula_url", None)
+
+    persist_sqlite = _meta_is_full_enough_for_persist(metadata)
 
     async with app.state.meta_cache_lock:
         app.state.meta_cache[cache_key] = metadata
@@ -3571,7 +3644,7 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
             app.state.meta_cache_dirty = False
             app.state.last_persist_save_ts = time.time()
 
-        if _meta_is_full_enough_for_persist(metadata):
+        if persist_sqlite:
             now = time.time()
             last_ts = float(getattr(app.state, "last_persist_save_ts", 0.0) or 0.0)
             if (now - last_ts) > 30.0:
@@ -3580,6 +3653,9 @@ async def _meta_cache_set(cache_key: str, metadata: dict) -> None:
                 await _save_persistent_cache(to_save)
                 app.state.meta_cache_dirty = False
                 app.state.last_persist_save_ts = now
+
+    if persist_sqlite:
+        await asyncio.to_thread(_db_metadata_set, cache_key, dict(metadata))
 
 
 # ---------------------------------------------------------------------------
@@ -3593,6 +3669,7 @@ async def enrich_results_with_tmdb(
     catalog_mode: bool = False,
 ) -> list:
     request_cache: dict = {}
+    request_inflight: dict = {}
     semaphore     = asyncio.Semaphore(MAX_CONCURRENCY)
     new_counter   = {"n": 0}
     limit_new     = max_new if max_new is not None else len(results)
@@ -3630,80 +3707,65 @@ async def enrich_results_with_tmdb(
                 )
 
                 if (not meta) or need_repair:
-                    if new_counter["n"] >= limit_new:
-                        pelicula_url = r.get("stream_url") or ""
-                        thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
-                        archive_img = r.get("imagen_url") or _archive_thumb_from_stream_url(pelicula_url)
-                        yt    = _youtube_thumb_from_stream_url(pelicula_url)
-                        img_final = thumb or archive_img or yt or ""
-                        return {
-                            "titulo":                fallback_title or "Película",
-                            "imagen_url":            img_final,
-                            "pelicula_url":          pelicula_url,
-                            "descripcion":           "n/a",
-                            "fecha_lanzamiento":     "n/a",
-                            "duracion":              "n/a",
-                            "idioma_original":       "n/a",
-                            "popularidad":           0,
-                            "puntuacion":            0,
-                            "generos":               "n/a",
-                            "año":                   fallback_year_title or year or "n/a",
-                            "id":                    r.get("id"),
-                            "size":                  _nn_str(r.get("size"), "n/a"),
-                            "descripcion_detallada": "n/a",
-                        }
+                    async def _fetch_meta_once() -> dict:
+                        if new_counter["n"] >= limit_new:
+                            pelicula_url = r.get("stream_url") or ""
+                            thumb = _thumb_url_for_message(r.get("id"), pelicula_url)
+                            archive_img = r.get("imagen_url") or _archive_thumb_from_stream_url(pelicula_url)
+                            yt = _youtube_thumb_from_stream_url(pelicula_url)
+                            img_final = thumb or archive_img or yt or ""
+                            return {
+                                "titulo":                fallback_title or "Película",
+                                "titulo_original":       fallback_title or "Película",
+                                "imagen_url":            img_final,
+                                "pelicula_url":          pelicula_url,
+                                "descripcion":           "n/a",
+                                "fecha_lanzamiento":     "n/a",
+                                "duracion":              "n/a",
+                                "idioma_original":       "n/a",
+                                "popularidad":           0,
+                                "puntuacion":            0,
+                                "generos":               "n/a",
+                                "año":                   fallback_year_title or year or "n/a",
+                                "id":                    r.get("id"),
+                                "size":                  _nn_str(r.get("size"), "n/a"),
+                                "descripcion_detallada": "n/a",
+                            }
 
-                    new_counter["n"] += 1
+                        new_counter["n"] += 1
+                        looks_like_tv = _looks_like_series_or_novela(f"{title_raw} {query_title}")
 
-                    kg = tmdb = tvmaze = archive = gemini_data = None
-                    looks_like_tv = _looks_like_series_or_novela(f"{title_raw} {query_title}")
+                        async with semaphore:
+                            resolved = await _resolve_complete_metadata(
+                                http,
+                                query_title=query_title,
+                                year=year,
+                                fallback_title=fallback_title,
+                                fallback_year=fallback_year_title or year,
+                                use_gemini=use_gemini,
+                                looks_like_tv=looks_like_tv,
+                            )
 
-                    async with semaphore:
-                        tmdb = await (_tmdb_search_and_details(http, query_title, year) if _tmdb_pool else _noop())
-
-                        if not isinstance(tmdb, dict) and GOOGLE_KG_API_KEY:
-                            kg = await _google_kg_search(http, query_title, year)
-
-                        if not isinstance(tmdb, dict) and not isinstance(kg, dict):
-                            tvmaze = await _tvmaze_fetch(http, query_title, year)
-                            if isinstance(tvmaze, dict) and looks_like_tv:
-                                print(f"   📌 TVMaze priorizada por heurística TV/novela para '{query_title}'")
-
-                    meta = _merge_metadata_with_kg(
-                        kg, tmdb, tvmaze, archive,
-                        fallback_title=fallback_title,
-                        fallback_year=fallback_year_title or year,
-                    )
-
-                    if (
-                        use_gemini and GEMINI_API_KEY and
-                        not isinstance(tmdb, dict) and
-                        not isinstance(kg, dict) and
-                        not isinstance(tvmaze, dict)
-                    ):
-                        gemini_data = await _gemini_complete_metadata(
-                            http, fallback_title, year, meta
+                        debug_chain = " > ".join(resolved.get("_metadata_source_chain") or []) or "fallback_local"
+                        print(
+                            f"   ✅ Enriquecimiento → '{resolved.get('titulo', '?')}' "
+                            f"fuentes={debug_chain} "
+                            f"img={'✓' if resolved.get('imagen_url') else '✗'} "
+                            f"sinopsis={'✓' if resolved.get('sinopsis') else '✗'} "
+                            f"año={resolved.get('año', '?')}"
                         )
-                        if isinstance(gemini_data, dict):
-                            for _gk in [
-                                "titulo", "imagen_url", "sinopsis", "generos", "año",
-                                "idioma_original", "duracion", "fecha_lanzamiento",
-                                "descripcion_detallada", "puntuacion", "popularidad"
-                            ]:
-                                if not meta.get(_gk) and gemini_data.get(_gk):
-                                    meta[_gk] = gemini_data[_gk]
-                            meta["_meta_priority_version"] = METADATA_PRIORITY_VERSION
-                            meta["_metadata_source_chain"] = ["gemini"]
+                        await _meta_cache_set(ck, resolved)
+                        return resolved
 
-                    debug_chain = " > ".join(meta.get("_metadata_source_chain") or []) or "fallback_local"
-                    print(
-                        f"   ✅ Enriquecimiento → '{meta.get('titulo', '?')}' "
-                        f"fuentes={debug_chain} "
-                        f"img={'✓' if meta.get('imagen_url') else '✗'} "
-                        f"sinopsis={'✓' if meta.get('sinopsis') else '✗'} "
-                        f"año={meta.get('año', '?')}"
-                    )
-                    await _meta_cache_set(ck, meta)
+                    inflight = request_inflight.get(ck)
+                    if inflight is None:
+                        inflight = asyncio.create_task(_fetch_meta_once())
+                        request_inflight[ck] = inflight
+                    try:
+                        meta = await inflight
+                    finally:
+                        if request_inflight.get(ck) is inflight:
+                            request_inflight.pop(ck, None)
 
                 request_cache[ck] = meta
 
@@ -3883,6 +3945,61 @@ async def search(
         print(f"⚡ Caché SQLite hit → devolviendo {len(_cached_results)} resultado(s) sin consultar Telegram")
         return _cached_results
 
+    tmdb_gate_meta = None
+    tmdb_gate_required = _should_require_tmdb_validation(
+        effective_text,
+        genre=effective_genre,
+        canal=canal,
+        desde=effective_desde,
+        hasta=effective_hasta,
+    )
+
+    if tmdb_gate_required and effective_text:
+        gate_query_title, gate_year = _build_tmdb_query_from_title(effective_text.strip())
+        gate_query_title = (gate_query_title or effective_text or "").strip()
+        gate_year = gate_year or effective_year
+        gate_ck = _cache_key_from_query(gate_query_title, gate_year)
+
+        cached_gate_meta = await _meta_cache_get(gate_ck)
+        if isinstance(cached_gate_meta, dict) and cached_gate_meta.get("tmdb_id"):
+            tmdb_gate_meta = cached_gate_meta
+            print(
+                f"✅ Validación TMDb previa (cache) → '{tmdb_gate_meta.get('titulo') or gate_query_title}' "
+                f"id={tmdb_gate_meta.get('tmdb_id')}"
+            )
+        else:
+            gate_timeout = httpx.Timeout(connect=2.0, read=3.5, write=2.0, pool=1.0)
+            async with httpx.AsyncClient(timeout=gate_timeout) as gate_http:
+                seed_tmdb = await _tmdb_search_and_details(gate_http, gate_query_title, gate_year)
+                _, tmdb_status = await _ai_cache_get("tmdb", gate_ck)
+
+                if tmdb_status == "none":
+                    print(f"⛔ TMDb no encontró '{gate_query_title}'. Se cancela la búsqueda de reproducción para ahorrar recursos.")
+                    await asyncio.to_thread(_db_search_set, _search_cache_key, [])
+                    return []
+
+                if isinstance(seed_tmdb, dict):
+                    tmdb_gate_meta = await _resolve_complete_metadata(
+                        gate_http,
+                        query_title=gate_query_title,
+                        year=gate_year,
+                        fallback_title=gate_query_title,
+                        fallback_year=gate_year or effective_year,
+                        use_gemini=True,
+                        looks_like_tv=_looks_like_series_or_novela(effective_text.strip()),
+                        seed_tmdb=seed_tmdb,
+                    )
+                    await _meta_cache_set(gate_ck, tmdb_gate_meta)
+                    print(
+                        f"✅ Validación TMDb previa OK → '{tmdb_gate_meta.get('titulo') or gate_query_title}' "
+                        f"id={tmdb_gate_meta.get('tmdb_id')}"
+                    )
+                else:
+                    print(
+                        f"⚠️  Validación TMDb no concluyente para '{gate_query_title}' "
+                        f"(estado={tmdb_status or 'desconocido'}). Se mantiene el flujo actual."
+                    )
+
     try:
         def _dedupe_raw_results(items: list) -> list:
             seen = set()
@@ -3948,54 +4065,9 @@ async def search(
         preferred_results_threshold = max(3, min(10, INTERNET_ARCHIVE_MAX_CANDIDATES + 2))
 
         if effective_text:
-            # ─────────────────────────────────────────────────────────────────
-            # 🔧 PASO 1: TMDB como validador inicial
-            # Se consulta TMDB primero para obtener el título oficial, el ID
-            # y el año. Con esos datos depurados se lanzan las búsquedas en
-            # fuentes adicionales, mejorando precisión y metadatos.
-            # ─────────────────────────────────────────────────────────────────
-            tmdb_validated_title = effective_text.strip()
-            tmdb_validated_year  = effective_year
-            tmdb_validation_meta = None
-
-            if _tmdb_pool:
-                try:
-                    _qt_init, _yr_init = _build_tmdb_query_from_title(effective_text.strip())
-                    _yr_init = _yr_init or effective_year
-                    _tmdb_timeout = httpx.Timeout(connect=2.0, read=3.5, write=2.0, pool=1.0)
-                    async with httpx.AsyncClient(timeout=_tmdb_timeout) as _http_val:
-                        tmdb_validation_meta = await asyncio.wait_for(
-                            _tmdb_search_and_details(_http_val, _qt_init, _yr_init),
-                            timeout=4.0,
-                        )
-                    if isinstance(tmdb_validation_meta, dict):
-                        _v_title = tmdb_validation_meta.get("titulo")
-                        _v_year  = tmdb_validation_meta.get("año")
-                        if _v_title:
-                            tmdb_validated_title = _v_title
-                        if _v_year:
-                            tmdb_validated_year = _v_year
-                        print(
-                            f"✅ TMDB validación → '{tmdb_validated_title}' "
-                            f"año={tmdb_validated_year} "
-                            f"id={tmdb_validation_meta.get('tmdb_id')}"
-                        )
-                    else:
-                        print(f"🔎 TMDB sin resultados para '{effective_text.strip()}' — usando título original")
-                except asyncio.TimeoutError:
-                    print("⚠️  TMDB validación timeout — usando título original")
-                except Exception as _tmdb_val_ex:
-                    print(f"⚠️  TMDB validación error: {_tmdb_val_ex}")
-
-            # ─────────────────────────────────────────────────────────────────
-            # 🔎 PASO 2: Búsqueda en paralelo con título validado por TMDB
-            # Archive.org y el resolver externo se consultan simultáneamente
-            # usando el título oficial obtenido en el paso anterior.
-            # ─────────────────────────────────────────────────────────────────
-            _search_term = tmdb_validated_title  # título depurado por TMDB
-            print(f"🟦 Búsqueda paralela en Archive.org y resolver externo con: '{_search_term}'...")
-            archive_task  = asyncio.create_task(archive_org_fallback(_search_term))
-            external_task = asyncio.create_task(external_stream_fallback(_search_term))
+            print("🟦 Buscando primero en Archive.org y resolver externo (paralelo)...")
+            archive_task = asyncio.create_task(archive_org_fallback(effective_text.strip()))
+            external_task = asyncio.create_task(external_stream_fallback(effective_text.strip()))
             archive_out, external_out = await asyncio.gather(
                 archive_task,
                 external_task,
@@ -4436,7 +4508,7 @@ async def _fetch_tmdb_poster_bytes_for_message(message) -> bytes | None:
 
     timeout = httpx.Timeout(connect=2.0, read=TMDB_THUMB_HTTP_TIMEOUT, write=2.0, pool=1.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-        if not meta_img and _tmdb_pool:
+        if not meta_img and TMDB_API_KEY:
             tmdb = await _tmdb_search_and_details(http, query_title, year)
             if isinstance(tmdb, dict):
                 meta_img = tmdb.get("imagen_url")
@@ -5288,7 +5360,7 @@ def _extract_external_stream_candidates(payload) -> list[dict]:
 
 
 async def external_stream_fallback(search_query: str) -> list:
-    if not EXTERNAL_STREAM_API_BASE or not _tmdb_pool:
+    if not EXTERNAL_STREAM_API_BASE or not TMDB_API_KEY:
         return []
 
     query_title, year = _build_tmdb_query_from_title(search_query or "")
