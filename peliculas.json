@@ -5330,5 +5330,44 @@
     "puntuacion": "n/a",
     "generos": "n/a",
     "año": "n/a"
+  },
+  {
+    "titulo": "Love You Seven Times Cap",
+    "imagen_url": "https://peliprex.masitaprex.com/thumb/21161?ch=29",
+    "pelicula_url": "https://peliprex.masitaprex.com/stream/21161?ch=29",
+    "descripcion": "n/a",
+    "fecha_lanzamiento": "n/a",
+    "duracion": "n/a",
+    "idioma_original": "n/a",
+    "popularidad": "n/a",
+    "puntuacion": "n/a",
+    "generos": "n/a",
+    "año": "n/a"
+  },
+  {
+    "titulo": "Dead Rising: Watchtower",
+    "imagen_url": "https://image.tmdb.org/t/p/w780/95gMn5GwR6rPHmmHfDyEs0pO2U7.jpg",
+    "pelicula_url": "https://peliprex.masitaprex.com/stream/107?ch=24",
+    "descripcion": "La historia nos traslada a un mundo infectado por zombis y como un grupo de personas tratará de hacer frente a la infección buscando el origen del brote. Sin embargo, todo hace indicar que una conspiración del gobierno está detrás de todo. Adaptación al cine de la serie de videojuegos de Capcom.",
+    "fecha_lanzamiento": "2015-03-27",
+    "duracion": "125 minutos",
+    "idioma_original": "EN",
+    "popularidad": "5.1",
+    "puntuacion": "5.2",
+    "generos": "Terror, Ciencia ficción, Acción",
+    "año": "2015"
+  },
+  {
+    "titulo": "Espías con disfraz",
+    "imagen_url": "https://image.tmdb.org/t/p/w780/j2xcicPNXzNex47EYOfw45Dl1o0.jpg",
+    "pelicula_url": "https://peliprex.masitaprex.com/stream/352?ch=37",
+    "descripcion": "Puede decirse que el superespía Lance Sterling y el científico Walter Beckett no tienen nada que ver entre sí: Lance es relajado, educado y caballeroso. Walter lo opuesto. Lo que le falta a Walter de habilidades sociales lo compensa con una dosis extra de ingenio e inventiva, con los que crea fascinantes artilugios que Lance usa en sus épicas misiones. Pero cuando los acontecimientos sorprenden con un giro inesperado, Walter y Lance tendrán que confiar el uno en el otro… Y todo el mundo estará en peligro.",
+    "fecha_lanzamiento": "2019-12-04",
+    "duracion": "102 minutos",
+    "idioma_original": "EN",
+    "popularidad": "6.3",
+    "puntuacion": "7.6",
+    "generos": "Animación, Acción, Aventura, Comedia, Familia",
+    "año": "2019"
   }
 ]
