@@ -72,4 +72,4 @@ EXPOSE 8080
 # Comando final: 
 # Lanzamos Python (Streaming) en segundo plano usando el puerto interno 8001 para que no choque con Node.
 # Luego entramos a la carpeta de Node y ejecutamos el servidor principal en el puerto 8080.
-CMD ["sh", "-c", "PORT=8001 python3 /app/streaming/main.py & cd /app/backend && npm run start"]
+CMD ["sh", "-c", "python3 /app/streaming/main.py --port 8081 & cd /app/backend && npm run start"]
