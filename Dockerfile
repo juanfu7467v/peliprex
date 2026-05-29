@@ -1,4 +1,3 @@
-
 # ==========================================
 # 1. ENTORNO BASE HÍBRIDO (Node.js 22 + Python 3.11)
 # ==========================================
@@ -37,7 +36,7 @@ RUN npm install -g pm2
 FROM base AS node_build
 WORKDIR /app/backend
 COPY backend/package.json ./
-RUN npm install --production
+RUN npm install --omit=dev
 COPY backend/ ./
 
 # ==========================================
@@ -55,7 +54,11 @@ COPY --from=node_build /app/backend ./backend
 # Configuración e instalación de dependencias de Python (Streaming)
 WORKDIR /app/streaming
 COPY streaming/requirements.txt ./
-# Instalamos dependencias directamente en el sistema de la imagen final para simplicidad con PM2
+
+# Solución a PEP 668: Crear un entorno virtual e instalar las dependencias ahí dentro
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 COPY streaming/ ./
