@@ -5330,5 +5330,44 @@
     "puntuacion": "n/a",
     "generos": "n/a",
     "año": "n/a"
+  },
+  {
+    "titulo": "Lluvia de albóndigas 2",
+    "imagen_url": "https://image.tmdb.org/t/p/w780/wLnAUHnQXacLZs1PJnkq0ns0u2y.jpg",
+    "pelicula_url": "https://peliprex-31wrsa.fly.dev/stream/589?ch=38",
+    "descripcion": "Flint ya ha conseguido lo que perseguía desde siempre: ser un reconocido investigador admirado por todos. Después de crear su máquina que creaba comida a partir de agua ('Lluvia de albóndigas 1'), el director de la prestigiosa compañía The Live Corp Company y gran investigador, Chester V, ha contratado a Flint para que forme parte de su equipo, formado por los mejores investigadores del mundo. El protagonista está lleno de alegría, pero muy a su pesar descubrirá que el invento que creó está dando resultados inesperados y altamente peligrosos. A partir de los restos de comida que caían del cielo se han creado bestias mutantes de todo tipo (cocodrilos, arañas, chimpacés…) que ponen en peligro la seguridad de los humanos. Flint contará con la ayuda de todos sus amigos para poner fin a esta pesadilla.",
+    "fecha_lanzamiento": "2013-09-26",
+    "duracion": "95 minutos",
+    "idioma_original": "EN",
+    "popularidad": "4.4",
+    "puntuacion": "6.5",
+    "generos": "Animación, Familia, Comedia",
+    "año": "2013"
+  },
+  {
+    "titulo": "Doctor en Casa",
+    "imagen_url": "https://peliprex-31wrsa.fly.dev/thumb/5895?ch=40",
+    "pelicula_url": "https://peliprex-31wrsa.fly.dev/stream/5895?ch=40",
+    "descripcion": "Doctor en Casa es un programa de televisión chileno, presentado por el Dr. Claudio Aldunate. Es parecido a Doctor in the House y Un doctor en mi casa.\nSe estrenó el 1 de agosto de 2011.​",
+    "fecha_lanzamiento": "n/a",
+    "duracion": "n/a",
+    "idioma_original": "n/a",
+    "popularidad": "n/a",
+    "puntuacion": "n/a",
+    "generos": "n/a",
+    "año": "n/a"
+  },
+  {
+    "titulo": "Avatar: Fuego y ceniza",
+    "imagen_url": "https://image.tmdb.org/t/p/w500/4n1U0Mwn7djux6VKNYDRWPgS2x6.jpg",
+    "pelicula_url": "https://peliprex-31wrsa.fly.dev/stream/111?ch=13",
+    "descripcion": "Jake Sully y Neytiri enfrentan una nueva amenaza en Pandora: los Ash People, una tribu Na'vi violenta y sedienta de poder, liderada por la implacable Varang. Tras la devastadora guerra contra la RDA y la pérdida de su hijo mayor, la familia de Jake deberá luchar por su supervivencia y el futuro de Pandora en un conflicto que llevará a los personajes a sus límites emocionales y físicos. Con nuevos y antiguos aliados, esta épica visual y emocional redefine el destino de un mundo al borde del abismo.",
+    "fecha_lanzamiento": "2025-12-17",
+    "duracion": "197 minutos",
+    "idioma_original": "EN",
+    "popularidad": "307.6",
+    "puntuacion": "7.3",
+    "generos": "Ciencia ficción, Aventura, Fantasía",
+    "año": "2025"
   }
 ]
