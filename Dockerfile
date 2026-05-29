@@ -62,7 +62,7 @@ COPY streaming/ ./
 
 # Volvemos a la raíz para la configuración de PM2
 WORKDIR /app
-COPY ecosystem.config.js .
+COPY ecosystem.config.js ./ecosystem.config.js
 
 # Exponemos el puerto 8080 (Backend) y 8081 (Streaming)
 EXPOSE 8080

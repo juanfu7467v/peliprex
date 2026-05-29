@@ -6,8 +6,6 @@ __pycache__
 .env
 .envrc
 .venv
-Dockerfile
-fly.toml
-README.md
-ecosystem.config.js
+# Dockerfile y fly.toml pueden ser ignorados si se pasan explícitamente, pero mejor no arriesgar
+# ecosystem.config.js NO debe estar aquí porque el Dockerfile lo necesita
 supervisord.conf
