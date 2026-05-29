@@ -9,4 +9,5 @@ __pycache__
 Dockerfile
 fly.toml
 README.md
+ecosystem.config.js
 supervisord.conf

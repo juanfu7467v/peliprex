@@ -1,3 +1,4 @@
+
 # ==========================================
 # 1. ENTORNO BASE HÍBRIDO (Node.js 22 + Python 3.11)
 # ==========================================
@@ -11,7 +12,7 @@ ENV NODE_ENV="production"
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Instalación de dependencias del sistema indispensables para ambos (Herramientas de compilación + FFmpeg)
+# Instalación de dependencias del sistema indispensables para ambos
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     node-gyp \
@@ -27,9 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Crear directorio de datos para la caché persistente que requiere Python
-RUN mkdir -p /data && chmod 777 /data
-
+# Instalar PM2 globalmente
+RUN npm install -g pm2
 
 # ==========================================
 # 2. CONSTRUCCIÓN Y DEPENDENCIAS DE NODE.JS (Backend)
@@ -37,9 +37,8 @@ RUN mkdir -p /data && chmod 777 /data
 FROM base AS node_build
 WORKDIR /app/backend
 COPY backend/package.json ./
-RUN npm install
+RUN npm install --production
 COPY backend/ ./
-
 
 # ==========================================
 # 3. ENTORNO FINAL DE EJECUCIÓN (Híbrido)
@@ -47,29 +46,27 @@ COPY backend/ ./
 FROM base AS final
 WORKDIR /app
 
-# Copiamos el backend de Node preparado en la etapa anterior
+# Crear directorio de datos para la caché persistente
+RUN mkdir -p /data && chmod 777 /data
+
+# Copiamos el backend de Node preparado
 COPY --from=node_build /app/backend ./backend
 
 # Configuración e instalación de dependencias de Python (Streaming)
 WORKDIR /app/streaming
 COPY streaming/requirements.txt ./
-# Creamos un entorno virtual para aislar las librerías de Python de manera segura
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Instalamos dependencias directamente en el sistema de la imagen final para simplicidad con PM2
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 COPY streaming/ ./
 
-
-# ==========================================
-# 4. CONFIGURACIÓN DE RED Y PROCESOS
-# ==========================================
+# Volvemos a la raíz para la configuración de PM2
 WORKDIR /app
+COPY ecosystem.config.js .
 
-# Exponemos el puerto 8080 que es el que tu actual fly.toml usa para dar la cara a internet (Node.js)
+# Exponemos el puerto 8080 (Backend) y 8081 (Streaming)
 EXPOSE 8080
+EXPOSE 8081
 
-# Comando final: 
-# Lanzamos Python (Streaming) en segundo plano usando el puerto interno 8001 para que no choque con Node.
-# Luego entramos a la carpeta de Node y ejecutamos el servidor principal en el puerto 8080.
-CMD ["sh", "-c", "python3 /app/streaming/main.py --port 8081 & cd /app/backend && npm run start"]
+# Comando final: Iniciar con PM2 para gestión robusta de procesos
+CMD ["pm2-runtime", "start", "ecosystem.config.js"]
