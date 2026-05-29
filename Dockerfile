@@ -1,61 +1,75 @@
+# ==========================================
+# 1. ENTORNO BASE HÍBRIDO (Node.js 22 + Python 3.11)
+# ==========================================
+FROM node:22.21.1-slim AS base
 
-# Etapa 1: Construir el backend (Node.js)
-FROM node:22.21.1-slim AS backend_builder
-WORKDIR /app/backend
-COPY backend/package.json backend/package-lock.json ./ # Copiar solo los archivos de dependencias
-RUN npm install --production
+LABEL fly_launch_runtime="Node.js + Python Streaming"
+WORKDIR /app
+ENV NODE_ENV="production"
 
-# Etapa 2: Construir el servicio de streaming (Python)
-FROM python:3.11-slim AS streaming_builder
-WORKDIR /app/streaming
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
-# Instalar dependencias del sistema para Pillow y ffmpeg
+# Evitar archivos .pyc y forzar logs en tiempo real para Python
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Instalación de dependencias del sistema indispensables para ambos (Herramientas de compilación + FFmpeg)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    node-gyp \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-venv \
     gcc \
     g++ \
-    python3-dev \
     libjpeg-dev \
     zlib1g-dev \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-COPY streaming/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Etapa 3: Imagen final (unificada)
-FROM debian:bookworm-slim
-
-# Instalar Node.js y Python en la imagen final
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    nodejs \
-    npm \
-    python3 \
-    python3-pip \
-    ffmpeg \
-    # Dependencias de Pillow para runtime
-    libjpeg62-turbo \
-    zlib1g \
-    # Para el proceso de arranque (supervisord)
-    supervisor \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Copiar el backend construido
-COPY --from=backend_builder /app/backend /app/backend
-
-# Copiar el streaming construido
-COPY --from=streaming_builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY streaming /app/streaming
-
-# Crear el directorio /data para persistencia
+# Crear directorio de datos para la caché persistente que requiere Python
 RUN mkdir -p /data && chmod 777 /data
 
-# Configurar supervisord para ejecutar ambos servicios
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Exponer los puertos
+# ==========================================
+# 2. CONSTRUCCIÓN Y DEPENDENCIAS DE NODE.JS (Backend)
+# ==========================================
+FROM base AS node_build
+WORKDIR /app/backend
+COPY backend/package.json ./
+RUN npm install
+COPY backend/ ./
+
+
+# ==========================================
+# 3. ENTORNO FINAL DE EJECUCIÓN (Híbrido)
+# ==========================================
+FROM base AS final
+WORKDIR /app
+
+# Copiamos el backend de Node preparado en la etapa anterior
+COPY --from=node_build /app/backend ./backend
+
+# Configuración e instalación de dependencias de Python (Streaming)
+WORKDIR /app/streaming
+COPY streaming/requirements.txt ./
+# Creamos un entorno virtual para aislar las librerías de Python de manera segura
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+COPY streaming/ ./
+
+
+# ==========================================
+# 4. CONFIGURACIÓN DE RED Y PROCESOS
+# ==========================================
+WORKDIR /app
+
+# Exponemos el puerto 8080 que es el que tu actual fly.toml usa para dar la cara a internet (Node.js)
 EXPOSE 8080
-EXPOSE 8081
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+# Comando final: 
+# Lanzamos Python (Streaming) en segundo plano usando el puerto interno 8001 para que no choque con Node.
+# Luego entramos a la carpeta de Node y ejecutamos el servidor principal en el puerto 8080.
+CMD ["sh", "-c", "PORT=8001 python3 /app/streaming/main.py & cd /app/backend && npm run start"]
