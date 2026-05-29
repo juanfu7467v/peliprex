@@ -22,7 +22,7 @@ const PELIS_FILE_NAME = "peliculas.json"; // 🆕 Nombre del archivo de películ
 // Las URLs de esta API son temporales (expiran). Por eso:
 // - Se guardan los IDs, no las URLs, en historial/favoritos.
 // - Se refresca el catálogo cada 2 horas para mantener URLs válidas en memoria.
-const EXTERNAL_API_BASE = "https://peliprex-31wrsa.fly.dev";
+const EXTERNAL_API_BASE = "http://127.0.0.1:8081";
 const EXTERNAL_API_URL = `${EXTERNAL_API_BASE}/catalog`;
 const EXTERNAL_API_SEARCH = `${EXTERNAL_API_BASE}/search`;
 const EXTERNAL_API_REFRESH_MS = 2 * 60 * 60 * 1000; // Refrescar cada 2 horas
