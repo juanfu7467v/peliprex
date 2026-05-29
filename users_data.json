@@ -1,0 +1,20 @@
+{
+  "users": {
+    "miguel.hd@gmail.com": {
+      "email": "miguel.hd@gmail.com",
+      "tipoPlan": "creditos",
+      "credits": 0,
+      "favorites": [],
+      "history": [
+        {
+          "titulo": "winchester",
+          "pelicula_url": "https://drive.google.com/file/d/1pZbdv1Fv8Uzs9V51HghqizrgUunE1fBu/preview",
+          "imagen_url": "https://1.bp.blogspot.com/-zTJC-F4BZu4/XSZWd7lxZ7I/AAAAAAAAHpU/zJiIgfTVPLA92usfSWcoW_8wygXee_9FACLcBGAs/s200/winchester.jpg",
+          "fecha": "2026-05-29T15:48:08.001Z"
+        }
+      ],
+      "resume": {},
+      "lastActivityTimestamp": "2026-05-29T15:48:07.998Z"
+    }
+  }
+}
