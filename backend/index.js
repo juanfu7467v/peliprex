@@ -1,62 +1,49 @@
 // index.js — API completa de Películas con sistema de usuarios + MaguisTV style
 // ¡MEJORADO con Respaldo en GitHub para Historial y Favoritos!
 // ¡MEJORADO con integración de API externa Peliprex para ampliar el catálogo!
+// ¡MEJORADO con Proxy/Pasarela hacia Python (streaming, /search, /catalog, etc.)!
 
 import express from "express";
 import cors from "cors";
 import fs from "fs";
 import fetch from "node-fetch";
+import http from "http";
 import path from "path";
 
 const app = express();
 app.use(cors());
 
 // ------------------- GITHUB CONFIGURACIÓN DE RESPALDO -------------------
-// ¡ASEGÚRATE de configurar las variables de entorno GITHUB_TOKEN y GITHUB_REPO!
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_REPO = process.env.GITHUB_REPO; // Formato: 'usuario/nombre-del-repositorio'
+const GITHUB_REPO = process.env.GITHUB_REPO;
 const BACKUP_FILE_NAME = "users_data.json";
-const PELIS_FILE_NAME = "peliculas.json"; // 🆕 Nombre del archivo de películas en GitHub
+const PELIS_FILE_NAME = "peliculas.json";
 
 // ------------------- 🆕 API EXTERNA PELIPREX -------------------
-// Las URLs de esta API son temporales (expiran). Por eso:
-// - Se guardan los IDs, no las URLs, en historial/favoritos.
-// - Se refresca el catálogo cada 2 horas para mantener URLs válidas en memoria.
 const EXTERNAL_API_BASE = "http://127.0.0.1:8081";
 const EXTERNAL_API_URL = `${EXTERNAL_API_BASE}/catalog`;
 const EXTERNAL_API_SEARCH = `${EXTERNAL_API_BASE}/search`;
-const EXTERNAL_API_REFRESH_MS = 2 * 60 * 60 * 1000; // Refrescar cada 2 horas
+const EXTERNAL_API_REFRESH_MS = 2 * 60 * 60 * 1000;
+const EXTERNAL_API_TIMEOUT_MS = 120_000;
 
-// ⏱️ Tiempo máximo de espera para la API externa.
-// La API puede tardar varios segundos bajo carga — se espera TODO el tiempo necesario.
-// Si responde [] significa que no hay resultados (válido). Solo se corta si supera este límite.
-const EXTERNAL_API_TIMEOUT_MS = 120_000; // 2 minutos — espera generosa para alta carga
-
-// 📂 Archivos locales (Mantenidos)
+// 📂 Archivos locales
 const PELIS_FILE = path.join(process.cwd(), "peliculas.json");
 const USERS_FILE = path.join(process.cwd(), BACKUP_FILE_NAME);
 
 // ------------------- 🆕 "LO MÁS VISTO HOY" -------------------
-const VISTO_HOY_FILE_NAME = "visto_hoy.json";           // Archivo GitHub
-const VISTO_HOY_RESET_MS  = 12 * 60 * 60 * 1000;        // 12 horas en ms
+const VISTO_HOY_FILE_NAME = "visto_hoy.json";
+const VISTO_HOY_RESET_MS  = 12 * 60 * 60 * 1000;
 
-/**
- * Almacén en memoria de vistas del día actual.
- * Clave: pelicula_url limpia (local) o "api:<api_id>" (externa).
- * Valor: { titulo, imagen_url, pelicula_url|null, api_id|null, count, lastSeen }
- */
 let vistosHoy = {};
-let vistosHoyResetAt = Date.now(); // Marca de cuándo empezó el periodo actual
+let vistosHoyResetAt = Date.now();
 
 // ------------------- FUNCIONES AUXILIARES -------------------
 
-/** Limpia la URL de la película eliminando la duplicidad '/prepreview' para corregir a '/preview'. */
 function cleanPeliculaUrl(url) {
   if (!url) return url;
   return url.replace(/\/prepreview([?#]|$)/, '/preview$1');
 }
 
-/** Devuelve un array con elementos aleatorios y desordenados. */
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -65,16 +52,6 @@ function shuffleArray(array) {
     return array;
 }
 
-/**
- * 🛡️ Fetch resiliente con timeout mediante AbortController.
- *
- * COMPORTAMIENTO IMPORTANTE:
- * - Si la API responde con [] → resultado válido (sin películas). Se retorna inmediatamente.
- * - Si la API aún no ha respondido → se sigue esperando. NO se interpreta como fallo.
- * - Solo se cancela si supera EXTERNAL_API_TIMEOUT_MS (2 minutos) sin ninguna respuesta.
- * - Si hay error de red, timeout o 502/504 → devuelve { ok: false } sin lanzar excepción.
- * - El llamador decide qué hacer con la respuesta.
- */
 async function fetchWithTimeout(url, options = {}, timeoutMs = EXTERNAL_API_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -84,24 +61,12 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = EXTERNAL_API_TIME
     return resp;
   } catch (err) {
     clearTimeout(timer);
-    // AbortError = timeout superado; FetchError = red caída
     const reason = err.name === "AbortError" ? `timeout (>${timeoutMs / 1000}s sin respuesta)` : err.message;
     console.warn(`⚠️ [API Externa] Petición fallida silenciosamente: ${reason}`);
-    // Devolvemos un objeto "falso" con ok:false para que el llamador lo trate igual que un 5xx
     return { ok: false, status: 0, _timedOut: true };
   }
 }
 
-/**
- * 🛡️ Realiza una búsqueda resiliente en la API externa Peliprex.
- * Acepta parámetros: q, genre, year.
- *
- * COMPORTAMIENTO:
- * - Espera la respuesta completa de la API, sin importar cuánto tarde (hasta 2 minutos).
- * - Si la API responde [] → no hay resultados, se devuelve [] correctamente.
- * - Si la API devuelve 502, 504 o supera el timeout → devuelve [] silenciosamente.
- * - En ningún caso se corta la espera antes de recibir una respuesta válida.
- */
 async function fetchExternalSearch(params = {}) {
   try {
     const url = new URL(EXTERNAL_API_SEARCH);
@@ -112,37 +77,28 @@ async function fetchExternalSearch(params = {}) {
     console.log(`🔍 [API Externa] Consultando búsqueda: ${url.toString()} — esperando respuesta...`);
     const resp = await fetchWithTimeout(url.toString());
 
-    // 502, 504 u otro error HTTP → fallo silencioso, usar solo datos locales
     if (!resp.ok) {
       if (resp.status === 502 || resp.status === 504) {
         console.warn(`⚠️ [API Externa] Error ${resp.status} en búsqueda — usando solo resultados locales.`);
       } else if (resp.status !== 0) {
         console.warn(`⚠️ [API Externa] HTTP ${resp.status} en búsqueda — usando solo resultados locales.`);
       }
-      // status 0 = timeout ya logueado por fetchWithTimeout
       return [];
     }
 
     const data = await resp.json();
-    // Array vacío [] es una respuesta válida: significa "sin resultados"
     if (!Array.isArray(data)) {
       console.warn(`⚠️ [API Externa] Respuesta inesperada (no es array) en búsqueda.`);
       return [];
     }
     console.log(`✅ [API Externa] Búsqueda respondió con ${data.length} resultado(s).`);
-    // Marcar cada resultado como proveniente de la API externa
     return data.map(p => ({ ...p, _fromExternalApi: true }));
   } catch (err) {
-    // Captura cualquier error inesperado (p.ej. JSON malformado)
     console.warn(`⚠️ [API Externa] Error inesperado en búsqueda: ${err.message} — usando solo resultados locales.`);
     return [];
   }
 }
 
-/**
- * Combina resultados locales y externos eliminando duplicados por id o titulo.
- * Los resultados externos ya vienen marcados con _fromExternalApi: true.
- */
 function mergeResults(localResults, externalResults) {
   const combined = [...localResults];
   const localIds = new Set(localResults.map(p => String(p.id)).filter(Boolean));
@@ -151,7 +107,6 @@ function mergeResults(localResults, externalResults) {
   for (const ext of externalResults) {
     const extId = ext.id ? String(ext.id) : null;
     const extTitle = (ext.titulo || "").toLowerCase();
-    // Evitar duplicados por id o por título exacto
     if (extId && localIds.has(extId)) continue;
     if (localTitles.has(extTitle)) continue;
     combined.push(ext);
@@ -159,18 +114,6 @@ function mergeResults(localResults, externalResults) {
   return combined;
 }
 
-
-/**
- * 💾 Fusiona las películas externas nuevas en localPeliculas y las persiste en peliculas.json
- * tanto en disco local como en GitHub.
- *
- * COMPORTAMIENTO:
- * - Solo agrega películas que NO existan ya en localPeliculas (por id o por título exacto).
- * - Antes de guardar, elimina el campo _fromExternalApi para que queden como películas locales.
- * - Si no hay películas nuevas, no escribe el archivo (evita escrituras innecesarias).
- * - Actualiza localPeliculas en memoria para que las búsquedas locales las incluyan de inmediato.
- * - Tras guardar en disco, dispara el respaldo en GitHub de forma asíncrona (fire-and-forget).
- */
 function mergeExternalIntoPeliculasFile(externalMovies) {
   try {
     if (!Array.isArray(externalMovies) || externalMovies.length === 0) return;
@@ -185,7 +128,6 @@ function mergeExternalIntoPeliculasFile(externalMovies) {
       if (existingTitles.has(title))       return false;
       return true;
     }).map(p => {
-      // Guardar sin el marcador interno _fromExternalApi
       const { _fromExternalApi, ...rest } = p;
       return rest;
     });
@@ -195,16 +137,13 @@ function mergeExternalIntoPeliculasFile(externalMovies) {
       return;
     }
 
-    // Actualizar la lista en memoria
     localPeliculas = [...localPeliculas, ...nuevas];
 
-    // Persistir en disco local
     const content = JSON.stringify(localPeliculas, null, 2);
     fs.writeFileSync(PELIS_FILE, content, "utf8");
 
     console.log(`💾 [peliculas.json] ${nuevas.length} película(s) nueva(s) guardadas localmente. Total local: ${localPeliculas.length}`);
 
-    // 🆕 Guardar también en GitHub de forma asíncrona (fire-and-forget)
     savePeliculasToGitHub(content)
       .then(ok => {
         if (ok) console.log(`✅ [peliculas.json] Respaldo en GitHub completado (${localPeliculas.length} películas).`);
@@ -218,7 +157,6 @@ function mergeExternalIntoPeliculasFile(externalMovies) {
 
 // ------------------- FUNCIONES DE GITHUB -------------------
 
-/** Obtiene el SHA de la última versión del archivo en GitHub, necesario para actualizar. */
 async function getFileSha(filePath) {
   if (!GITHUB_TOKEN || !GITHUB_REPO) return null;
   const url = `https://api.github.com/repos/${GITHUB_REPO}/contents/${filePath}`;
@@ -244,7 +182,6 @@ async function getFileSha(filePath) {
   }
 }
 
-/** Guarda los datos de usuario en GitHub. */
 async function saveUsersDataToGitHub(content) {
   if (!GITHUB_TOKEN || !GITHUB_REPO) {
     console.log("⚠️ GitHub no configurado (Faltan GITHUB_TOKEN o GITHUB_REPO). Solo guardado local.");
@@ -286,10 +223,6 @@ async function saveUsersDataToGitHub(content) {
   }
 }
 
-/**
- * 🆕 Guarda el catálogo de películas (peliculas.json) en GitHub.
- * Usa las mismas variables de entorno GITHUB_TOKEN y GITHUB_REPO que users_data.json.
- */
 async function savePeliculasToGitHub(content) {
   if (!GITHUB_TOKEN || !GITHUB_REPO) {
     console.log("⚠️ GitHub no configurado (Faltan GITHUB_TOKEN o GITHUB_REPO). Solo guardado local de películas.");
@@ -333,10 +266,6 @@ async function savePeliculasToGitHub(content) {
 
 // ------------------- 🆕 FUNCIONES DE "LO MÁS VISTO HOY" -------------------
 
-/**
- * Registra o incrementa la vista de una película en el contador del día.
- * Se llama cada vez que se agrega una entrada al historial de cualquier usuario.
- */
 function registrarVistaHoy({ titulo, imagen_url, pelicula_url, api_id }) {
   const key = api_id ? `api:${api_id}` : (pelicula_url || titulo);
   if (!key) return;
@@ -358,18 +287,12 @@ function registrarVistaHoy({ titulo, imagen_url, pelicula_url, api_id }) {
   }
 }
 
-/**
- * Devuelve el array de películas más vistas hoy, ordenadas de mayor a menor vistas.
- */
 function getVistosHoyArray() {
   return Object.values(vistosHoy)
     .filter(v => v.count >= 1)
     .sort((a, b) => b.count - a.count);
 }
 
-/**
- * Guarda el snapshot actual de "visto hoy" en GitHub como visto_hoy.json.
- */
 async function saveVistosHoyToGitHub() {
   if (!GITHUB_TOKEN || !GITHUB_REPO) return false;
   try {
@@ -406,10 +329,6 @@ async function saveVistosHoyToGitHub() {
   }
 }
 
-/**
- * Carga el snapshot de "visto hoy" desde GitHub al arrancar.
- * Si tiene mas de 12 horas, se descarta (datos expirados).
- */
 async function loadVistosHoyFromGitHub() {
   if (!GITHUB_TOKEN || !GITHUB_REPO) return;
   try {
@@ -452,12 +371,6 @@ async function loadVistosHoyFromGitHub() {
   }
 }
 
-/**
- * Reset automatico cada 12 horas:
- * 1. Guarda snapshot en GitHub.
- * 2. Limpia el contador en memoria.
- * 3. Restablece la marca de tiempo del nuevo periodo.
- */
 setInterval(async () => {
   console.log("Reseteando conteo de 'Lo mas visto hoy' (12 horas cumplidas)...");
   await saveVistosHoyToGitHub();
@@ -467,7 +380,6 @@ setInterval(async () => {
 }, VISTO_HOY_RESET_MS);
 
 
-/** Carga los datos de usuario desde GitHub al iniciar el servidor. */
 async function loadUsersDataFromGitHub() {
   if (!GITHUB_TOKEN || !GITHUB_REPO) return false;
 
@@ -517,15 +429,6 @@ try {
 // ------------------- 🆕 CARGAR PELÍCULAS DE API EXTERNA (PELIPREX) -------------------
 let externalApiMovies = [];
 
-/**
- * 🛡️ Carga y refresca las películas desde la API externa Peliprex de forma resiliente.
- *
- * COMPORTAMIENTO:
- * - Espera la respuesta completa (hasta 2 minutos). No se corta antes.
- * - Si la API responde [] → catálogo externo vacío. Válido, se actualiza en memoria.
- * - Si la API falla (502, 504, timeout real) → se mantiene la caché anterior sin romper el servidor.
- * - Marca cada película con _fromExternalApi: true.
- */
 async function loadExternalApiMovies() {
   try {
     console.log("📡 Cargando películas desde API externa Peliprex — esperando respuesta...");
@@ -537,7 +440,6 @@ async function loadExternalApiMovies() {
       } else if (resp.status !== 0) {
         console.warn(`⚠️ [API Externa] HTTP ${resp.status} al cargar catálogo — manteniendo caché anterior.`);
       }
-      // status 0 = timeout ya logueado por fetchWithTimeout
       return externalApiMovies;
     }
 
@@ -546,26 +448,20 @@ async function loadExternalApiMovies() {
       console.warn(`⚠️ [API Externa] Respuesta inesperada al cargar catálogo (no es array) — manteniendo caché anterior.`);
       return externalApiMovies;
     }
-    // Marcar cada película como proveniente de la API externa
     externalApiMovies = data.map(p => ({ ...p, _fromExternalApi: true }));
-    // 💾 Guardar automáticamente las películas nuevas en peliculas.json (local + GitHub)
     mergeExternalIntoPeliculasFile(externalApiMovies);
-    // Reconstruir el catálogo combinado con las URLs frescas
     peliculas = [...localPeliculas, ...externalApiMovies];
     console.log(`✅ Cargadas ${externalApiMovies.length} películas desde API externa Peliprex`);
     console.log(`📚 Catálogo total actualizado: ${peliculas.length} películas`);
     return externalApiMovies;
   } catch (err) {
     console.warn(`⚠️ [API Externa] Error inesperado al cargar catálogo: ${err.message} — manteniendo caché anterior.`);
-    // En caso de error, devolver la caché actual sin romper el servidor
     return externalApiMovies;
   }
 }
 
-// Catálogo combinado: comienza con las locales, las externas se añaden al arrancar.
 let peliculas = [...localPeliculas];
 
-// Refresco periódico del catálogo externo para renovar las URLs que expiran.
 setInterval(async () => {
   console.log("🔄 Refrescando catálogo de API externa Peliprex (renovando URLs expiradas)...");
   await loadExternalApiMovies();
@@ -618,9 +514,8 @@ function saveUser(email, userObj) {
 }
 
 // ------------------- CONTROL DE INACTIVIDAD DEL SERVIDOR -------------------
-// 🔧 Aumentado a 3 minutos para reducir reinicios en frío en Fly.io
 let ultimaPeticion = Date.now();
-const TIEMPO_INACTIVIDAD = 3 * 60 * 1000; // 3 minutos
+const TIEMPO_INACTIVIDAD = 3 * 60 * 1000;
 
 setInterval(async () => {
   if (Date.now() - ultimaPeticion >= TIEMPO_INACTIVIDAD) {
@@ -637,7 +532,7 @@ setInterval(async () => {
 
     process.exit(0);
   }
-}, 60 * 1000); // Verificar cada 1 minuto
+}, 60 * 1000);
 
 app.use((req, res, next) => {
   ultimaPeticion = Date.now();
@@ -646,10 +541,6 @@ app.use((req, res, next) => {
 
 
 // ------------------- TAREA PROGRAMADA: ELIMINACIÓN DE ACTIVIDAD CADA 24 HRS -------------------
-/**
- * Tarea programada para limpiar historial y resumen de películas
- * que tienen más de 24 horas de la última actividad/latido.
- */
 const MS_IN_24_HOURS = 24 * 60 * 60 * 1000;
 
 setInterval(() => {
@@ -662,7 +553,6 @@ setInterval(() => {
         const user = data.users[email];
         let userActivityModified = false;
 
-        // --- Limpieza de Historial ---
         const historyLengthBefore = user.history.length;
         user.history = user.history.filter(h => {
             const historyDate = new Date(h.fecha).getTime();
@@ -673,7 +563,6 @@ setInterval(() => {
             userActivityModified = true;
         }
 
-        // --- Limpieza de Resumen de Reproducción ---
         const resumeKeysBefore = Object.keys(user.resume).length;
         const newResume = {};
         for (const url in user.resume) {
@@ -706,6 +595,109 @@ setInterval(() => {
 }, MS_IN_24_HOURS);
 
 
+// =============================================================================
+// 🆕 PROXY/PASARELA HACIA PYTHON (puerto 8081)
+// =============================================================================
+// Estas rutas capturan las peticiones antes de que lleguen a las rutas de Express
+// y las redirigen directamente al servidor Python interno (FastAPI en :8081).
+//
+// Rutas cubiertas:
+//   /stream/:id          → streaming de video desde Telegram
+//   /archive-stream/:id  → proxy de streaming desde Archive.org
+//   /thumb/:id           → miniaturas de mensajes
+//   /ytthumb/:id         → proxy de thumbnails de YouTube
+//   /search              → búsqueda avanzada con Telegram + TMDB + Archive
+//   /catalog             → catálogo aleatorio desde canales Telegram
+//   /health              → health check del servicio Python
+//
+// El pipe es bidireccional: headers, body y status code se transmiten tal cual.
+// =============================================================================
+
+/**
+ * Construye la URL de destino en Python a partir de la URL de Express,
+ * preservando la ruta completa (path) y la query string.
+ */
+function buildPythonUrl(req) {
+  const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+  return `http://127.0.0.1:8081${req.path}${query}`;
+}
+
+/**
+ * Middleware genérico de proxy hacia Python.
+ * Hace pipe completo de la respuesta (streaming, binario y JSON incluidos).
+ */
+function proxyToPython(req, res) {
+  const targetUrl = buildPythonUrl(req);
+  console.log(`🔀 [Proxy→Python] ${req.method} ${req.path} → ${targetUrl}`);
+
+  // Construir los headers que enviamos a Python (reenviar los del cliente)
+  const proxyHeaders = {};
+  const forwardHeaders = ["range", "accept", "accept-encoding", "cache-control", "user-agent", "referer", "origin"];
+  for (const h of forwardHeaders) {
+    if (req.headers[h]) proxyHeaders[h] = req.headers[h];
+  }
+
+  const options = {
+    hostname: "127.0.0.1",
+    port: 8081,
+    path: `${req.path}${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`,
+    method: req.method,
+    headers: proxyHeaders,
+  };
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    // Reenviar status y headers de Python al cliente original
+    res.status(proxyRes.statusCode);
+
+    // Headers seguros para reenviar al cliente
+    const passHeaders = [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "cache-control",
+      "etag",
+      "last-modified",
+      "x-accel-buffering",
+      "content-disposition",
+    ];
+    for (const h of passHeaders) {
+      if (proxyRes.headers[h]) res.setHeader(h, proxyRes.headers[h]);
+    }
+
+    // Pipe directo del cuerpo de la respuesta (soporta streaming binario)
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (err) => {
+    console.error(`❌ [Proxy→Python] Error en ${req.path}: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(502).json({ error: "Servicio Python no disponible temporalmente. Reintenta en unos segundos." });
+    }
+  });
+
+  // Si la petición del cliente tiene body (POST, PUT), hacer pipe también
+  req.pipe(proxyReq);
+}
+
+// --- Rutas de streaming y recursos desde Python ---
+app.get("/stream/:messageId",        proxyToPython);
+app.get("/archive-stream/:identifier", proxyToPython);
+app.get("/thumb/:messageId",         proxyToPython);
+app.get("/ytthumb/:videoId",         proxyToPython);
+
+// --- Rutas de catálogo y búsqueda desde Python ---
+app.get("/search",                   proxyToPython);
+app.get("/catalog",                  proxyToPython);
+
+// --- Health check de Python ---
+app.get("/health",                   proxyToPython);
+
+// =============================================================================
+// FIN PROXY/PASARELA
+// =============================================================================
+
+
 // ------------------- RUTAS PRINCIPALES -------------------
 app.get("/", (req, res) => {
   res.json({
@@ -717,14 +709,10 @@ app.get("/", (req, res) => {
 
 app.get("/peliculas", (req, res) => res.json(peliculas));
 
-// 🔎 Búsqueda por nombre/título — combina peliculas.json + API externa en paralelo
-// 🛡️ Resiliente: espera la respuesta completa de la API externa antes de responder.
-// Si la API externa falla definitivamente, devuelve solo resultados locales sin error.
 app.get("/peliculas/:titulo", async (req, res) => {
   const tituloRaw = decodeURIComponent(req.params.titulo || "");
   const titulo = tituloRaw.toLowerCase();
 
-  // Buscar en local y en API externa en paralelo
   const [externalResults] = await Promise.all([
     fetchExternalSearch({ q: tituloRaw })
   ]);
@@ -747,13 +735,9 @@ app.get("/peliculas/:titulo", async (req, res) => {
   });
 });
 
-// 🔎 Búsqueda avanzada — combina peliculas.json + API externa
-// 🛡️ Resiliente: espera la respuesta completa de la API externa antes de responder.
-// Si la API externa falla definitivamente, devuelve solo resultados locales sin error.
 app.get("/buscar", async (req, res) => {
   const { año, genero, idioma, desde, hasta, q } = req.query;
 
-  // --- Búsqueda local ---
   let localResultados = localPeliculas;
 
   if (q) {
@@ -779,16 +763,13 @@ app.get("/buscar", async (req, res) => {
         parseInt(p.año) <= parseInt(hasta)
     );
 
-  // --- Construir parámetros para la API externa ---
   const externalParams = {};
   if (q)      externalParams.q     = q;
   if (genero) externalParams.genre = genero;
   if (año)    externalParams.year  = año;
-  // Para búsqueda por palabra clave sin q, usar genero o año como query
   if (!q && genero) externalParams.q = genero;
   if (!q && !genero && desde) externalParams.q = desde;
 
-  // --- Esperar la respuesta completa de la API externa antes de responder al usuario ---
   const externalResults = await fetchExternalSearch(externalParams);
 
   const combinado = mergeResults(localResultados, externalResults);
@@ -805,12 +786,10 @@ app.get("/buscar", async (req, res) => {
   });
 });
 
-// 🆕 ENDPOINT: Búsqueda por Categoría (Género) — solo peliculas.json (sin API externa)
 app.get("/peliculas/categoria/:genero", (req, res) => {
     const generoRaw = decodeURIComponent(req.params.genero || "");
     const generoBuscado = generoRaw.toLowerCase();
 
-    // Filtrar únicamente desde peliculas.json (sin llamada a API externa)
     const resultados = localPeliculas.filter(p =>
         (p.generos || "").toLowerCase().includes(generoBuscado)
     );
@@ -831,17 +810,6 @@ app.get("/peliculas/categoria/:genero", (req, res) => {
     });
 });
 
-
-// ------------------- 🆕 ENDPOINT: /nuevo — Catálogo completo de API externa -------------------
-/**
- * Obtiene y sirve el catálogo completo de la API externa tal como llega.
- *
- * COMPORTAMIENTO:
- * - Espera la respuesta completa (hasta 2 minutos). No se corta antes de recibir respuesta.
- * - Si la API responde [] → se devuelve [] al usuario (respuesta válida, sin resultados).
- * - Si la API falla o supera el timeout → responde con error 503 claro.
- * GET /nuevo
- */
 app.get("/nuevo", async (req, res) => {
   try {
     console.log(`📡 [/nuevo] Consultando API externa — esperando respuesta completa...`);
@@ -859,24 +827,6 @@ app.get("/nuevo", async (req, res) => {
   }
 });
 
-
-// ------------------- 🆕 ENDPOINT: /vistohoy — Lo más visto hoy -------------------
-/**
- * Devuelve las películas más vistas en las últimas 12 horas,
- * ordenadas de mayor a menor número de vistas.
- *
- * Respuesta:
- *  {
- *    fuente: "vistohoy",
- *    periodoDesde: <ISO>,
- *    generadoEn: <ISO>,
- *    total: <n>,
- *    resultados: [ { titulo, imagen_url, pelicula_url|null, api_id|null, count, lastSeen }, ... ]
- *  }
- *
- * GET /vistohoy
- * GET /vistohoy?limit=20   (opcional, por defecto devuelve todos)
- */
 app.get("/vistohoy", (req, res) => {
   const limit = req.query.limit ? parseInt(req.query.limit) : undefined;
   let resultados = getVistosHoyArray();
@@ -890,40 +840,18 @@ app.get("/vistohoy", (req, res) => {
   });
 });
 
-
-
-// ------------------- 🆕 ENDPOINT: /sugerencias — "También podría gustarte" -------------------
-/**
- * Devuelve hasta 15 películas relacionadas con la película que el usuario está viendo.
- *
- * LÓGICA EN CAPAS:
- *   1. Películas que comparten palabras clave del título (ej. "Rambo" → busca "Rambo" en todos los títulos).
- *   2. Si hay menos de 15, completa con películas del mismo género (excluye la actual y las ya añadidas).
- *   3. Si aún faltan, rellena con películas aleatorias del catálogo combinado.
- *   La película actual siempre queda excluida del resultado.
- *
- * Parámetros:
- *   titulo  (requerido) — título de la película que se está viendo
- *   generos (opcional)  — géneros de la película (ej. "accion,aventura"), para el fallback
- *   id      (opcional)  — id de la película actual, para excluirla con precisión
- *   limit   (opcional)  — cantidad de sugerencias a devolver (por defecto 15)
- *
- * Uso: GET /sugerencias?titulo=Rambo&generos=accion,aventura&id=123
- */
 app.get("/sugerencias", (req, res) => {
   const tituloRaw  = (req.query.titulo  || "").trim();
   const generosRaw = (req.query.generos || "").trim();
   const idActual   = req.query.id ? String(req.query.id) : null;
-  const limit      = Math.min(parseInt(req.query.limit) || 15, 50); // máximo 50
+  const limit      = Math.min(parseInt(req.query.limit) || 15, 50);
 
   if (!tituloRaw) {
     return res.status(400).json({ error: "Falta el parámetro 'titulo'." });
   }
 
-  // Catálogo disponible en este momento (local + externas en caché)
   const catalogo = peliculas;
 
-  // ── Helper: excluir la película actual por id o por título exacto ──
   const tituloNorm = tituloRaw.toLowerCase();
   function esLaMisma(p) {
     if (idActual && p.id && String(p.id) === idActual) return true;
@@ -931,8 +859,6 @@ app.get("/sugerencias", (req, res) => {
     return false;
   }
 
-  // ── CAPA 1: películas que contienen palabras del título actual ──
-  // Se extraen palabras de 4+ letras para evitar artículos ("los", "las", "the"…)
   const palabrasClave = tituloNorm
     .split(/\s+/)
     .filter(w => w.length >= 4);
@@ -947,7 +873,6 @@ app.get("/sugerencias", (req, res) => {
     });
   }
 
-  // ── CAPA 2: fallback por género(s) ──
   const generosActuales = generosRaw
     .split(/[,|/]/)
     .map(g => g.trim().toLowerCase())
@@ -964,12 +889,10 @@ app.get("/sugerencias", (req, res) => {
       return generosActuales.some(g => genP.includes(g));
     });
 
-    // Mezclar para variedad y añadir los que faltan
     shuffleArray(porGenero);
     relacionadas = [...relacionadas, ...porGenero].slice(0, limit);
   }
 
-  // ── CAPA 3: relleno aleatorio si todavía hay huecos ──
   if (relacionadas.length < limit) {
     const yaIncluidas = new Set(relacionadas.map(p => p.id ? String(p.id) : (p.titulo || "").toLowerCase()));
 
@@ -983,7 +906,6 @@ app.get("/sugerencias", (req, res) => {
     relacionadas = [...relacionadas, ...resto].slice(0, limit);
   }
 
-  // ── Mezclar la capa 1 para no mostrar siempre el mismo orden ──
   shuffleArray(relacionadas);
   const resultados = relacionadas.slice(0, limit);
 
@@ -996,18 +918,6 @@ app.get("/sugerencias", (req, res) => {
   });
 });
 
-
-// ------------------- 🆕 ENDPOINT: Obtener URL Fresca por ID (API Externa) -------------------
-/**
- * Obtiene una URL de reproducción actualizada para películas de la API externa Peliprex.
- * Las URLs expiran después de algunas horas. Este endpoint las renueva usando el ID estable.
- *
- * COMPORTAMIENTO:
- * - Espera la respuesta completa de la API (hasta 2 minutos). No se corta antes.
- * - Si la API responde, busca el ID y devuelve la URL fresca inmediatamente.
- * - Si la API falla, responde con error 503 claro.
- * Uso: GET /pelicula/url?id=<id_de_la_pelicula>
- */
 app.get("/pelicula/url", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "Falta parámetro id" });
@@ -1057,13 +967,10 @@ app.get("/user/setplan", (req, res) => {
   res.json({ ok: true, user });
 });
 
-// Favoritos
-// Acepta api_id para películas de API externa (no guarda pelicula_url que expira)
 app.get("/user/add_favorite", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   const { titulo, imagen_url, pelicula_url: raw_pelicula_url, api_id } = req.query;
 
-  // Para películas locales se limpia la URL; para externas se usa el api_id
   const pelicula_url = api_id ? null : cleanPeliculaUrl(raw_pelicula_url);
 
   if (!email || !titulo || (!pelicula_url && !api_id))
@@ -1072,7 +979,6 @@ app.get("/user/add_favorite", (req, res) => {
   const user = getOrCreateUser(email);
 
   if (api_id) {
-    // Película de API externa: guardar por api_id, NO guardar pelicula_url (expira)
     if (!user.favorites.some(f => String(f.api_id) === String(api_id))) {
       user.favorites.unshift({
         titulo,
@@ -1084,7 +990,6 @@ app.get("/user/add_favorite", (req, res) => {
       saveUser(email, user);
     }
   } else {
-    // Película local: comportamiento original sin cambios
     if (!user.favorites.some(f => f.pelicula_url === pelicula_url)) {
       user.favorites.unshift({ titulo, imagen_url, pelicula_url, addedAt: new Date().toISOString() });
       saveUser(email, user);
@@ -1101,7 +1006,6 @@ app.get("/user/favorites", (req, res) => {
   res.json({ total: user.favorites.length, favorites: user.favorites });
 });
 
-// ELIMINAR TODOS LOS FAVORITOS
 app.get("/user/favorites/clear", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   if (!email) return res.status(400).json({ error: "Falta email" });
@@ -1115,11 +1019,9 @@ app.get("/user/favorites/clear", (req, res) => {
   res.json({ ok: true, message: "Lista de favoritos eliminada." });
 });
 
-// ELIMINAR UNA PELÍCULA DE FAVORITOS
-// Acepta api_id para eliminar películas de API externa
 app.get("/user/favorites/remove", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
-  const api_id = req.query.api_id; // Para películas de API externa
+  const api_id = req.query.api_id;
   const raw_pelicula_url = req.query.pelicula_url;
   const pelicula_url = api_id ? null : cleanPeliculaUrl(raw_pelicula_url);
 
@@ -1132,10 +1034,8 @@ app.get("/user/favorites/remove", (req, res) => {
   const initialLength = user.favorites.length;
 
   if (api_id) {
-    // Remover por api_id (películas de API externa)
     user.favorites = user.favorites.filter(f => String(f.api_id) !== String(api_id));
   } else {
-    // Comportamiento original: remover por pelicula_url
     user.favorites = user.favorites.filter(f => f.pelicula_url !== pelicula_url);
   }
 
@@ -1146,14 +1046,10 @@ app.get("/user/favorites/remove", (req, res) => {
   res.status(404).json({ ok: false, message: "Película no encontrada en favoritos." });
 });
 
-// Historial
-// Acepta api_id para películas de API externa (no guarda pelicula_url que expira)
-// ✅ FIX: Si la película ya existe en el historial, se mueve al inicio (sin duplicar).
 app.get("/user/add_history", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   const { titulo, pelicula_url: raw_pelicula_url, imagen_url, api_id } = req.query;
 
-  // Para películas locales se limpia la URL; para externas se usa el api_id
   const pelicula_url = api_id ? null : cleanPeliculaUrl(raw_pelicula_url);
 
   if (!email || !titulo || (!pelicula_url && !api_id))
@@ -1162,8 +1058,6 @@ app.get("/user/add_history", (req, res) => {
   const user = getOrCreateUser(email);
 
   if (api_id) {
-    // Película de API externa: guardar por api_id, NO guardar pelicula_url (expira)
-    // Si ya existe, eliminarla de su posición actual para luego agregarla al inicio
     user.history = user.history.filter(h => String(h.api_id) !== String(api_id));
     user.history.unshift({
       titulo,
@@ -1173,7 +1067,6 @@ app.get("/user/add_history", (req, res) => {
       fecha: new Date().toISOString()
     });
   } else {
-    // Película local: si ya existe, eliminarla antes de reinsertar al inicio
     user.history = user.history.filter(h => h.pelicula_url !== pelicula_url);
     user.history.unshift({ titulo, pelicula_url, imagen_url, fecha: new Date().toISOString() });
   }
@@ -1181,7 +1074,6 @@ app.get("/user/add_history", (req, res) => {
   if (user.history.length > 200) user.history = user.history.slice(0, 200);
   saveUser(email, user);
 
-  // ✅ Registrar vista en "Lo más visto hoy"
   registrarVistaHoy({ titulo, imagen_url, pelicula_url, api_id });
 
   res.json({ ok: true, total: user.history.length });
@@ -1194,7 +1086,6 @@ app.get("/user/history", (req, res) => {
   res.json({ total: user.history.length, history: user.history });
 });
 
-// ELIMINAR TODO EL HISTORIAL
 app.get("/user/history/clear", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   if (!email) return res.status(400).json({ error: "Falta email" });
@@ -1208,11 +1099,9 @@ app.get("/user/history/clear", (req, res) => {
   res.json({ ok: true, message: "Historial de películas eliminado." });
 });
 
-// ELIMINAR UNA PELÍCULA DEL HISTORIAL
-// Acepta api_id para eliminar películas de API externa
 app.get("/user/history/remove", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
-  const api_id = req.query.api_id; // Para películas de API externa
+  const api_id = req.query.api_id;
   const raw_pelicula_url = req.query.pelicula_url;
   const pelicula_url = api_id ? null : cleanPeliculaUrl(raw_pelicula_url);
 
@@ -1225,10 +1114,8 @@ app.get("/user/history/remove", (req, res) => {
   const initialLength = user.history.length;
 
   if (api_id) {
-    // Remover por api_id (películas de API externa)
     user.history = user.history.filter(h => String(h.api_id) !== String(api_id));
   } else {
-    // Comportamiento original: remover por pelicula_url
     user.history = user.history.filter(h => h.pelicula_url !== pelicula_url);
   }
 
@@ -1242,25 +1129,20 @@ app.get("/user/history/remove", (req, res) => {
 
 // ------------------- NUEVOS ENDPOINTS -------------------
 
-// 🔁 Refrescar historial (uno o todos)
 app.get("/user/history/refresh", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   const user = getOrCreateUser(email);
   if (!user) return res.status(400).json({ error: "Usuario no encontrado" });
-  // Sin servicio de respaldo externo activo, se devuelve el historial actual sin cambios.
   res.json({ ok: true, refreshed: user.history });
 });
 
-// 🔁 Refrescar favoritos (uno o todos)
 app.get("/user/favorites/refresh", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   const user = getOrCreateUser(email);
   if (!user) return res.status(400).json({ error: "Usuario no encontrado" });
-  // Sin servicio de respaldo externo activo, se devuelve la lista actual sin cambios.
   res.json({ ok: true, refreshed: user.favorites });
 });
 
-// 📊 Perfil con estadísticas
 app.get("/user/profile", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   const user = getOrCreateUser(email);
@@ -1279,7 +1161,6 @@ app.get("/user/profile", (req, res) => {
   res.json({ perfil });
 });
 
-// 🧾 Actividad combinada
 app.get("/user/activity", (req, res) => {
   const email = (req.query.email || "").toLowerCase();
   const user = getOrCreateUser(email);
@@ -1314,20 +1195,14 @@ app.get("/user/activity", (req, res) => {
 
 // ------------------- ENDPOINTS DE SEGUIMIENTO DE STREAMING (LATIDOS) -------------------
 
-/**
- * Sistema de seguimiento de latidos (heartbeat) para el progreso de streaming.
- * Acepta api_id para películas de API externa.
- * La clave del resumen será 'api:<id>' para externas o la URL para locales.
- */
 app.get("/user/heartbeat", (req, res) => {
     const email = (req.query.email || "").toLowerCase();
     const raw_pelicula_url = req.query.pelicula_url;
-    const api_id = req.query.api_id; // Para películas de API externa
+    const api_id = req.query.api_id;
     const currentTime = parseInt(req.query.currentTime);
     const totalDuration = parseInt(req.query.totalDuration);
     const titulo = req.query.titulo;
 
-    // La clave del resumen: URL limpia (local) o 'api:id' (externa)
     const pelicula_url = api_id ? null : cleanPeliculaUrl(raw_pelicula_url);
     const key = api_id ? `api:${api_id}` : pelicula_url;
 
@@ -1363,17 +1238,11 @@ app.get("/user/heartbeat", (req, res) => {
     });
 });
 
-/**
- * Endpoint para verificar si una película ha sido vista y consumir 1 crédito.
- * Acepta api_id para películas de API externa.
- * Usa la misma clave que heartbeat para localizar el resumen.
- */
 app.get("/user/consume_credit", (req, res) => {
     const email = (req.query.email || "").toLowerCase();
     const raw_pelicula_url = req.query.pelicula_url;
-    const api_id = req.query.api_id; // Para películas de API externa
+    const api_id = req.query.api_id;
 
-    // La clave debe coincidir exactamente con la usada en heartbeat
     const pelicula_url = api_id ? null : cleanPeliculaUrl(raw_pelicula_url);
     const key = api_id ? `api:${api_id}` : pelicula_url;
 
@@ -1431,44 +1300,28 @@ app.get("/user/consume_credit", (req, res) => {
 });
 
 
-// ------------------- INICIAR SERVIDOR (NO BLOQUEANTE — FIX PM05) -------------------
-/**
- * ✅ Arranque no bloqueante para Fly.io — elimina el error PM05.
- *
- * ORDEN CORRECTO:
- *   1. app.listen() abre el puerto INMEDIATAMENTE → Fly.io lo detecta en < 1 segundo.
- *   2. Las tareas pesadas (GitHub + API externa) se lanzan en segundo plano
- *      con setImmediate + .then()/.catch(), SIN ningún await que bloquee
- *      el hilo principal.
- *
- * El catálogo local (peliculas.json) ya está disponible desde el primer
- * instante como respaldo, por lo que la API responde de forma correcta
- * incluso antes de que termine la sincronización en segundo plano.
- */
+// ------------------- INICIAR SERVIDOR -------------------
 const PORT = process.env.PORT || 8080;
 
-// 1️⃣ Abrir el puerto de inmediato — Fly.io lo detecta en < 1 segundo
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Servidor corriendo en http://0.0.0.0:${PORT}`);
   console.log(`📚 Catálogo local disponible de inmediato: ${localPeliculas.length} películas`);
+  console.log(`🔀 Proxy/Pasarela activo: /stream, /archive-stream, /thumb, /ytthumb, /search, /catalog, /health → Python :8081`);
   console.log(`⏳ Sincronizando datos en segundo plano (GitHub + API externa)...`);
 });
 
-// 2️⃣ Cargar datos de GitHub en segundo plano (sin bloquear el arranque)
 setImmediate(() => {
   loadUsersDataFromGitHub()
     .then(() => console.log("✅ [Background] Datos de usuario sincronizados desde GitHub."))
     .catch(err => console.error("❌ [Background] Error al cargar datos de GitHub:", err.message));
 });
 
-// 3️⃣ Cargar películas de API externa en segundo plano (sin bloquear el arranque)
 setImmediate(() => {
   loadExternalApiMovies()
     .then(() => console.log("✅ [Background] Catálogo externo Peliprex cargado correctamente."))
     .catch(err => console.error("❌ [Background] Error al cargar catálogo externo:", err.message));
 });
 
-// 4️⃣ Cargar "Lo más visto hoy" desde GitHub en segundo plano
 setImmediate(() => {
   loadVistosHoyFromGitHub()
     .then(() => console.log("✅ [Background] Datos de 'Lo más visto hoy' sincronizados desde GitHub."))
