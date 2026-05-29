@@ -1,17 +1,21 @@
 module.exports = {
   apps : [{
     name: "backend",
-    script: "backend/index.js",
+    script: "index.js",
+    cwd: "/app/backend",
     watch: false,
+    exec_mode: "fork",
     env: {
       "PORT": 8080,
       "NODE_ENV": "production"
     }
   }, {
     name: "streaming",
-    script: "streaming/main.py",
+    script: "main.py",
+    cwd: "/app/streaming",
     interpreter: "/opt/venv/bin/python3",
     watch: false,
+    exec_mode: "fork",
     env: {
       "PORT": 8081,
       "PYTHONUNBUFFERED": "1",
