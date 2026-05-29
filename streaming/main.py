@@ -50,7 +50,7 @@ PUBLIC_URL         = os.getenv("PUBLIC_URL", "").rstrip('/')
 CHANNEL_IDENTIFIER = None  # Sin canal principal prioritario
 
 # --- PUERTO INTERNO ---
-INTERNAL_PORT = int(os.getenv("PORT", 8080))
+INTERNAL_PORT = int(os.getenv("STREAMING_PORT", 8081))
 
 # --- YOUTUBE BACKUP ---
 YOUTUBE_API_KEY               = os.getenv("YOUTUBE_API_KEY", "").strip()

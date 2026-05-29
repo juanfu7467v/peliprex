@@ -1,39 +1,19 @@
-app = 'peliprex-31wrsa'
-primary_region = 'iad'
+
+app = "peliprex-31wrsa"
+primary_region = "scl"
 
 [build]
+  builder = "paketobuildpacks/builder-jammy-base"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
-  processes = ['app']
+  max_machines_running = 1
+  processes = ["app"]
 
-  [http_service.http_options]
-    idle_timeout = 300
-
-  [http_service.concurrency]
-    type = 'requests'
-    soft_limit = 20
-    hard_limit = 25
-
-[[http_service.checks]]
-  grace_period = '180s'
-  interval = '15s'
-  timeout = '5s'
-  method = 'GET'
-  path = '/health'
-
-  [http_service.checks.headers]
-    X-Forwarded-Proto = 'https'
-
-[mounts]
-  source = 'peliprex_data'
-  destination = '/data'
-
-[[vm]]
-  cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 512
+[[mounts]]
+  source = "peliprex_data"
+  destination = "/data"

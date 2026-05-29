@@ -1,0 +1,12 @@
+
+.git
+.gitignore
+node_modules
+__pycache__
+.env
+.envrc
+.venv
+Dockerfile
+fly.toml
+README.md
+supervisord.conf
