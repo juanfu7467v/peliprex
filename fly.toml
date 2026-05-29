@@ -1,9 +1,8 @@
-
 app = "peliprex-31wrsa"
 primary_region = "scl"
 
 [build]
-  builder = "paketobuildpacks/builder-jammy-base"
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 8080
