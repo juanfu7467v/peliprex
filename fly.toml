@@ -1,7 +1,16 @@
+# fly.toml app configuration file generated for peliprex-31wrsa on 2026-05-30T00:14:19Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'peliprex-31wrsa'
 primary_region = 'iad'
 
 [build]
+
+[[mounts]]
+  source = 'peliprex_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
@@ -11,27 +20,23 @@ primary_region = 'iad'
   min_machines_running = 0
   processes = ['app']
 
+  [http_service.concurrency]
+    type = 'requests'
+    hard_limit = 25
+    soft_limit = 20
+
   [http_service.http_options]
     idle_timeout = 300
 
-  [http_service.concurrency]
-    type = 'requests'
-    soft_limit = 20
-    hard_limit = 25
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '3m0s'
+    method = 'GET'
+    path = '/health'
 
-[[http_service.checks]]
-  grace_period = '180s'
-  interval = '15s'
-  timeout = '5s'
-  method = 'GET'
-  path = '/health'
-
-  [http_service.checks.headers]
-    X-Forwarded-Proto = 'https'
-
-[mounts]
-  source = 'peliprex_data'
-  destination = '/data'
+    [http_service.checks.headers]
+      X-Forwarded-Proto = 'https'
 
 [[vm]]
   cpu_kind = 'shared'
